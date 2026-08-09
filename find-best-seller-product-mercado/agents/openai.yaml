@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mercado 爆款查找"
+  short_description: "按商品链接查找 Mercado Libre 同类爆款并整理销量与评价"
+  default_prompt: "Use $find-best-seller-product-mercado with a Mercado Libre product URL to find up to 15 similar best sellers and report the required metrics."
