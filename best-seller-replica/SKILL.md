@@ -1,9 +1,9 @@
 ---
-name: viral-replica
-description: Recreate viral fashion product compositions from a source product URL and a target product URL by downloading the source garment images and every image of the target page's currently selected main SKU, matching camera angles, and using api-image to transfer only the source clothing onto each target model. Use for 爆款复刻, 爆款构图复刻, 商品图换装, MercadoLibre or mercaduo clothing transfer, 主 SKU 全图换衣, and requests requiring exactly one edited output for every target main-SKU image with the generated images saved separately.
+name: best-seller-replica
+description: Recreate best-selling fashion product compositions from a source product URL and a target product URL by downloading the source garment images and every image of the target page's currently selected main SKU, matching camera angles, and using api-image to transfer only the source clothing onto each target model. Use for 爆款复刻, 爆款构图复刻, 商品图换装, MercadoLibre or mercaduo clothing transfer, 主 SKU 全图换衣, and requests requiring exactly one edited output for every target main-SKU image with the generated images saved separately.
 ---
 
-# Viral Replica
+# Best Seller Replica
 
 Transfer the clothing worn in the source listing onto every model image of the target listing. Preserve the target model and scene. Produce exactly as many edited images as there are verified target main-SKU images.
 
@@ -26,7 +26,7 @@ Require:
 Create a new task directory in the current workspace. Never reuse or overwrite a previous task directory.
 
 ```text
-viral-replica-<target-id>-<timestamp>/
+best-seller-replica-<target-id>-<timestamp>/
 ├── source_original/
 ├── target_main_sku/
 ├── generated_images/
