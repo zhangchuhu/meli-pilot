@@ -1,0 +1,4 @@
+interface:
+  display_name: "SHEIN 爆款查找"
+  short_description: "从 Mercado 商品链接筛选 SHEIN 同类爆款"
+  default_prompt: "Use $find-best-seller-product-shein to analyze this Mercado Libre fashion URL and return up to 15 verified SHEIN best sellers."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mercado Libre 爆款标题"
+  short_description: "根据商品链接或图片生成十个墨西哥站高转化商品标题"
+  default_prompt: "Use $general-title to analyze this product link or image and generate 10 Mercado Libre México titles."
