@@ -33,7 +33,8 @@ Routing rule:
 4. Read the active provider settings from the user's root files.
    - Read `auth.json` and use `OPENAI_API_KEY`.
    - Read `config.toml`, then use `model_provider` and `[model_providers.<name>].base_url`.
-   - Never hardcode a provider URL or API key into the skill.
+   - If the active provider has no configured `base_url`, default to `https://api.openai.com/v1`.
+   - Never hardcode an API key into the skill.
    - Default to the root files above. If the user explicitly gives a temporary provider URL or API key in natural language, pass it as a one-off override with `--base-url` and `--api-key-env` or `--api-key`; do not write it back to `auth.json`, `config.toml`, README, logs, or generated files.
    - Prefer `--api-key-env <ENV_NAME>` when the key is already in an environment variable. Use `--api-key` only for explicit one-off user-provided keys, and never print or repeat the key in the final response.
 5. Decide the intent and input image roles.
@@ -314,7 +315,7 @@ Follow the current official GPT Image rules for `gpt-image-2`:
 
 ## Failure Rules
 
-- Raise explicit errors when `OPENAI_API_KEY`, `model_provider`, or `base_url` cannot be found.
+- Raise an explicit error when `OPENAI_API_KEY` cannot be found. If `base_url` is not configured, use `https://api.openai.com/v1`.
 - Allow temporary Provider overrides with `--base-url`, `--api-key-env`, or `--api-key`; do not persist them unless explicitly requested.
 - Raise explicit errors when both `--api-key` and `--api-key-env` are provided, when the named environment variable is empty, or when `--base-url` is not an HTTP(S) URL.
 - Raise explicit errors when `size` violates the official GPT Image constraints or `quality` is unsupported.

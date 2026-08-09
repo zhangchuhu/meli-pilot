@@ -9,6 +9,7 @@ from pathlib import Path
 AUTH_FILE_NAME = "auth.json"
 CONFIG_FILE_NAME = "config.toml"
 KEY_FIELD = "OPENAI_API_KEY"
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
 
 @dataclass(frozen=True)
@@ -57,17 +58,16 @@ def load_provider_config(
 
     base_url = base_url_override
     if base_url is None:
-        config = load_toml(codex_home / CONFIG_FILE_NAME)
-        provider_name = config.get("model_provider")
-        if not provider_name:
-            raise ValueError(f"model_provider is missing in {codex_home / CONFIG_FILE_NAME}")
-        providers = config.get("model_providers", {})
-        provider = providers.get(provider_name)
-        if not isinstance(provider, dict):
-            raise ValueError(f"Provider '{provider_name}' is missing in {codex_home / CONFIG_FILE_NAME}")
-        base_url = provider.get("base_url")
-    if not isinstance(base_url, str) or not base_url.strip():
-        raise ValueError("base_url is missing in config or --base-url.")
+        config_path = codex_home / CONFIG_FILE_NAME
+        if config_path.exists():
+            config = load_toml(config_path)
+            provider_name = config.get("model_provider")
+            providers = config.get("model_providers", {})
+            provider = providers.get(provider_name) if isinstance(providers, dict) else None
+            if isinstance(provider, dict):
+                base_url = provider.get("base_url")
+        if not isinstance(base_url, str) or not base_url.strip():
+            base_url = DEFAULT_BASE_URL
     return ProviderConfig(api_key=api_key, base_url=normalize_base_url(base_url), codex_home=codex_home)
 
 

@@ -45,7 +45,7 @@ git clone <repo-url> "$env:CODEX_HOME\skills\api-image"
 
 - API Key
 - 当前 Provider
-- Provider 的 `base_url`
+- Provider 的 `base_url`（未配置时默认使用 `https://api.openai.com/v1`）
 
 这个仓库不会、也不应该保存你的 API Key。
 
