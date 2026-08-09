@@ -1,0 +1,4 @@
+interface:
+  display_name: "服装批量改色"
+  short_description: "提取参考服装颜色并批量改色商品图，保持模特与场景不变"
+  default_prompt: "Use $change-color-skill with two product links to transfer the clothing color from link 1 to every main-SKU image from link 2 and save the results in a separate folder."

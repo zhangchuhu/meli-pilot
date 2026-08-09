@@ -1,0 +1,4 @@
+interface:
+  display_name: "Viral Replica"
+  short_description: "批量复刻商品构图并精准换装，独立保存目标主SKU全部成品图"
+  default_prompt: "Use $viral-replica with a source product URL and a target product URL to generate one clothing-transfer image for every main-SKU target image."
