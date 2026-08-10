@@ -134,7 +134,13 @@ number of files in target_main_sku = N
 number of look-*.png files in generated_images = N
 ```
 
-### 8. Deliver
+### 8. Save locally, clean up the browser, and deliver
+
+Complete these actions in order:
+
+1. Confirm that the entire task directory is inside the current workspace and that all accepted final images are saved in its `generated_images/` folder. Resolve the task directory, `generated_images/`, and final contact sheet to absolute local paths before closing the browser.
+2. Finalize and clean up all browser pages according to the browser-control skill. Close or release source, target, download, search, and other working tabs unless the user explicitly asked to keep one. Treat browser finalization as the last browser action; do not make another browser call afterward.
+3. Send the completed output in the final response. Provide a clickable local link to the finished `generated_images/` folder and render the final contact sheet inline. If the interface cannot render the contact sheet, provide its clickable absolute local path instead.
 
 Report:
 
@@ -145,9 +151,7 @@ Report:
 - any angle inference used
 - a concise core edit prompt
 
-Show the contact sheet when the interface supports local image rendering. Do not expose API keys.
-
-After browser work, finalize tabs according to the browser-control skill.
+Do not report completion until the files are saved locally and browser cleanup is complete. Do not expose API keys.
 
 ## Failure handling
 
