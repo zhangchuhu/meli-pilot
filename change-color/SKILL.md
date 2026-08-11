@@ -1,6 +1,6 @@
 ---
 name: change-color
-description: Extract a representative clothing RGB/HEX color from a user-provided target image, recolor the clothing in every gallery image of a product link's currently selected main SKU while preserving models and scenes, and save only the finished images in a separate folder. Use for Mercado Libre or similar fashion product links paired with a local target-color image.
+description: Extract a representative clothing RGB/HEX color from a user-provided target image, use imagegen to recolor the clothing in every gallery image of a product link's currently selected main SKU while preserving models and scenes, and save only the finished images in a separate folder. Use for Mercado Libre or similar fashion product links paired with a local target-color image.
 ---
 
 # Change Clothing Color
@@ -19,9 +19,10 @@ Return the representative color as `RGB(r, g, b)` and `#RRGGBB`, plus a clean fo
 3. Open `product_link` in the user-requested browser, or the available browser selected for that URL. Identify the currently selected color/main SKU and its gallery count.
 4. Collect the highest-resolution URL for every image in that gallery. Exclude recommendations, reviews, videos, variant thumbnails from another color, and unrelated products.
 5. Download the originals into a temporary work folder in source order as `source_01`, `source_02`, and so on.
-6. Recolor one source image first and validate it. Then process the complete batch with the same destination RGB/HEX.
-7. Compare every result with its corresponding source. Retry failures with a tighter garment mask.
-8. Put only approved images in a new output folder and report the color, count, and absolute folder path.
+6. Read and follow `$imagegen`. Recolor one source image with its default built-in `image_gen` edit mode and validate it as the calibration result.
+7. Process the remaining sources serially with one separate built-in call per image and the same destination RGB/HEX.
+8. Compare every result with its corresponding source. Retry only failed images with tighter garment-boundary and preservation instructions.
+9. Put only approved images in a new output folder and report the color, count, and absolute folder path.
 
 ## Extract the Target Color
 
@@ -41,15 +42,20 @@ python scripts/extract_target_color.py target.webp \
 
 ## Recoloring
 
-Use the available provider-based raster image-editing skill. For every source image:
+Use `$imagegen` in its default built-in tool mode. Treat each recolor as a `precise-object-edit`. Do not use its CLI/API fallback unless the user explicitly requests that fallback after being told it requires `OPENAI_API_KEY`.
 
-- Pass the gallery image as the edit target.
-- State the extracted RGB and HEX explicitly; the target image is not required after extraction.
-- Use a garment mask whenever practical.
+For every source image:
+
+- Inspect the local gallery image with `view_image` so it is visible in conversation context, then pass it as the edit target.
+- Inspect the generated color swatch with `view_image` and label it as a color-only reference. State the extracted RGB and HEX explicitly.
 - Change only the garment color. Preserve fabric luminance, folds, seams, texture, highlights, and shadows.
 - Preserve the exact model, face, hair, skin, body, hands, pose, accessories, footwear, garment cut and construction, background, text, camera angle, framing, lighting, and composition.
 - Do not add, remove, beautify, restyle, or reconstruct anything.
-- Generate one image per source and never use one generated result as the next edit target.
+- Invoke the built-in `image_gen` tool exactly once for this source. Do not use one call or an `n` parameter to stand in for multiple distinct gallery edits.
+- Inspect the returned image. Copy or move an accepted result from the imagegen default location under `$CODEX_HOME/generated_images/` into the task output folder as `product_XX_recolored.png`. Never leave an accepted project deliverable only under `$CODEX_HOME`.
+- Never use one generated result as the next edit target.
+
+Do not invent unsupported built-in tool parameters for destination path, model, quality, dimensions, or masks. Preserve the source aspect ratio and framing through explicit prompt constraints.
 
 For very dark destination colors, map source luminance into a dark tonal range with enough contrast to retain fabric detail; do not fill with solid black.
 
@@ -75,7 +81,7 @@ change-color-output-YYYYMMDD-HHMMSS/
   ...
 ```
 
-Keep downloads, masks, swatches, previews, and failed attempts outside this folder. Use lossless PNG unless requested otherwise.
+Keep downloads, swatches, previews, and failed attempts outside this folder. Use lossless PNG unless requested otherwise.
 
 Report:
 
@@ -85,6 +91,8 @@ Report:
 - Any image for which exact preservation cannot be guaranteed
 
 Finalize browser tabs after collecting the gallery resources.
+
+If the built-in image tool fails temporarily, preserve accepted outputs and retry only the failed source once with the same inputs and a more explicit invariant. If the built-in tool is unavailable, explain that imagegen offers a CLI fallback requiring `OPENAI_API_KEY`; proceed only after the user explicitly requests it. Never silently switch to an API or CLI workflow.
 
 ## Resource
 
