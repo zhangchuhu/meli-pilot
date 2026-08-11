@@ -16,7 +16,7 @@ If this source angle is missing, infer only structurally consistent [SIDE OR BAC
 Remove every visible remnant of the target's original clothing. Do not change the person or scene. No extra limbs, altered hands, new jewelry, new props, or new accessories.
 ```
 
-Save the filled prompt as exactly one non-empty line when passing it through `--prompt-file`.
+Use the filled prompt for exactly one built-in `image_gen` edit call for the corresponding target. Keep the target as Image 1 and label every additional reference by role.
 
 ## Infographic variant
 
