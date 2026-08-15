@@ -1,0 +1,4 @@
+interface:
+  display_name: "Doubao Image Generation"
+  short_description: "Generate and edit images with Doubao Seedream"
+  default_prompt: "Use $doubao-imagegen to generate or edit an image with the Doubao Seedream API."
