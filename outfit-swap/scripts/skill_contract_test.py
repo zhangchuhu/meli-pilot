@@ -23,7 +23,6 @@ REFERENCE_FILES = (
 )
 RUNTIME_SCRIPTS = (
     "scripts/task_state.py",
-    "scripts/run_lock.py",
     "scripts/image_qc.py",
     "scripts/safe_edit.py",
 )
@@ -162,6 +161,27 @@ class SkillContractTest(unittest.TestCase):
         for script in RUNTIME_SCRIPTS:
             self.assertIn(script, self.skill)
 
+    def test_run_lock_feature_is_absent(self) -> None:
+        runtime_sources = {
+            "SKILL.md": self.skill,
+            **{
+                f"references/{name}": source
+                for name, source in self.references.items()
+            },
+            **{
+                script: read_required(SKILL_ROOT / script)
+                for script in RUNTIME_SCRIPTS
+            },
+        }
+        pattern = re.compile(r"(?i)(?:run[_ -]?lock|运行锁)")
+        findings = [
+            name for name, source in runtime_sources.items()
+            if pattern.search(source)
+        ]
+        self.assertEqual(findings, [])
+        self.assertFalse((SKILL_ROOT / "scripts" / "run_lock.py").exists())
+        self.assertFalse((SKILL_ROOT / "scripts" / "run_lock_test.py").exists())
+
     def test_edit_contract_pins_tool_and_image_roles(self) -> None:
         self.assertIn("doubao_imagegen.py edit", self.all_markdown)
         self.assertIn("--retry-failed", self.all_markdown)
@@ -239,7 +259,7 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("reject any resolver result containing `record_id`", base)
         self.assertIn("Reject Base-only, record-share, BaseApp, Wiki", base)
         self.assertIn("While `has_more` is true", base)
-        self.assertIn("Never mutate schema before the holder reports ready", base)
+        self.assertIn("Immediately before creating absent `处理明细`, repeat", base)
         self.assertIn(
             '{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]]}',
             base,
@@ -257,9 +277,8 @@ class SkillContractTest(unittest.TestCase):
             base,
         )
         self.assertLess(
-            self.skill.index("scripts/run_lock.py hold"),
-            self.skill.index("field-create"),
-            "the long-lived holder must be ready before schema mutation",
+            base.index("lark-cli base +field-list"),
+            base.index("lark-cli base +field-create"),
         )
 
     def test_early_record_stops_always_persist_terminal_failure(self) -> None:

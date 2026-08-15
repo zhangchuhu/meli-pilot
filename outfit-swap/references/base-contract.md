@@ -1,6 +1,6 @@
 # Feishu Base contract
 
-Use `lark-cli` exclusively for Base operations and always authenticate as the user. The input must be one exact table URL that resolves directly to both a `base_token` and `table_id`. Resolve the URL before starting the lock holder, then reject any resolver result containing `record_id`: record-share scope is not table scope. Reject Base-only, record-share, BaseApp, Wiki, indirect, or otherwise ambiguous links, and never guess or broaden a table.
+Use `lark-cli` exclusively for Base operations and always authenticate as the user. The input must be one exact table URL that resolves directly to both a `base_token` and `table_id`. Resolve and validate the URL before any mutation, then reject any resolver result containing `record_id`: record-share scope is not table scope. Reject Base-only, record-share, BaseApp, Wiki, indirect, or otherwise ambiguous links, and never guess or broaden a table.
 
 ## Required fields
 
@@ -22,15 +22,13 @@ Resolve the URL read-only:
 lark-cli base +url-resolve --url '<table-url>' --as user
 ```
 
-After accepting exactly one table identity, launch `scripts/run_lock.py hold` in a long-lived process/session. Wait for its one-line ready JSON, retain its `lock_file` and `run_id`, and keep that process alive for the entire run. Its canonical per-user root is `~/.codex/state/outfit-swap/locks`; callers cannot choose a workspace-local root. Never mutate schema before the holder reports ready.
-
-Under that held lock, enumerate every field page. Start at offset zero, request 200, and advance the offset by the returned item count until a page contains fewer than 200 items:
+After accepting exactly one table identity, enumerate every field page. Start at offset zero, request 200, and advance the offset by the returned item count until a page contains fewer than 200 items:
 
 ```bash
 lark-cli base +field-list --base-token '<base-token>' --table-id '<table-id>' --limit 200 --offset '<offset>' --as user
 ```
 
-Only when the complete locked field listing proves `处理明细` absent, recheck absence under the same lock and create it once:
+Immediately before creating absent `处理明细`, repeat the complete absence check, then create it once:
 
 ```bash
 lark-cli base +field-create --base-token '<base-token>' --table-id '<table-id>' --json '{"name":"处理明细","type":"text","style":{"type":"plain"}}' --as user

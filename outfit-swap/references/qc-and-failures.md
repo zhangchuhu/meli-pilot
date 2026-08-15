@@ -62,7 +62,7 @@ These are the only record-error codes. A rejected target attempt uses `failure`,
 
 ### Global preflight failure
 
-An invalid table URL, schema mismatch, missing dependency/key, or occupied local lock stops the entire run before generation. Leave every record status unchanged and incur no image cost.
+An invalid table URL, schema mismatch, or missing dependency/key stops the entire run before generation. Leave every record status unchanged and incur no image cost.
 
 ### Record data failure
 
@@ -83,5 +83,3 @@ If a later target is rejected on all three attempts, record that target failure 
 ### External call failure
 
 A Doubao tool/API failure, attachment-upload failure, or critical Base-write failure stops the entire run immediately. Mark the current record `失败` when Base remains writable. Persist an already-inspected bitmap with `accept-local` before upload; after restart, reconcile its validated identity and drain `scripts/task_state.py uploads` before calibration or generation. If Feishu cannot be updated, retain local artifacts and manifest state for recovery and leave later records untouched.
-
-Always release an owned lock on normal and handled abnormal exits through the holder's authenticated control request. The permanent mutation guard serializes inspection/reclaim/release. Reclaim a same-machine lock only when the control channel is absent and its PID plus OS process-start identity prove the holder is gone or the PID was reused; timeouts and ambiguous identity fail closed. Elapsed time alone never overrides a live holder.
