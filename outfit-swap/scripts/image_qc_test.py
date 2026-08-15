@@ -83,6 +83,26 @@ class AcceptedOutputPromotionTest(unittest.TestCase):
 
 
 class RasterContentContractTest(unittest.TestCase):
+    def test_single_frame_heif_content_with_jpg_suffix_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mislabeled.jpg"
+            path.write_bytes(b"single-frame heif placeholder")
+            info = image_qc.ImageInfo(
+                path, 64, 64, "hevc", path.stat().st_size,
+                format_name="mov,mp4,m4a,3gp,3g2,mj2",
+                major_brand="heic", frame_count=1,
+            )
+            with (
+                patch.object(image_qc, "probe_image", return_value=info),
+                patch.object(
+                    image_qc, "_run",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ),
+            ):
+                validated = image_qc.validate_image(path)
+
+            self.assertEqual(validated.codec_name, "hevc")
+
     def test_multi_frame_heif_probe_is_rejected_without_optional_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "video.heic"
@@ -120,6 +140,43 @@ class ImageValidationTest(unittest.TestCase):
         info = image_qc.validate_image(path)
         self.assertEqual((info.width, info.height, info.pixels), (64, 64, 4096))
         self.assertEqual(info.codec_name, "png")
+
+    def test_supported_png_content_with_jpg_suffix_passes(self) -> None:
+        path = self.root / "mislabeled.jpg"
+        write_png(path, 64, 64)
+
+        info = image_qc.validate_image(path)
+
+        self.assertEqual((info.width, info.height), (64, 64))
+        self.assertEqual(info.codec_name, "png")
+
+    def test_every_supported_ordinary_static_codec_ignores_suffix(self) -> None:
+        mismatches = (
+            ("mjpeg", ".png"),
+            ("png", ".jpg"),
+            ("webp", ".bmp"),
+            ("bmp", ".tif"),
+            ("tiff", ".gif"),
+            ("gif", ".jpeg"),
+        )
+        for codec_name, suffix in mismatches:
+            with self.subTest(codec_name=codec_name, suffix=suffix):
+                path = self.root / f"{codec_name}{suffix}"
+                path.write_bytes(b"static raster placeholder")
+                info = image_qc.ImageInfo(
+                    path, 64, 64, codec_name, path.stat().st_size,
+                    format_name=f"{codec_name}_pipe", frame_count=1,
+                )
+                with (
+                    patch.object(image_qc, "probe_image", return_value=info),
+                    patch.object(
+                        image_qc, "_run",
+                        return_value=subprocess.CompletedProcess([], 0, "", ""),
+                    ),
+                ):
+                    validated = image_qc.validate_image(path)
+
+                self.assertEqual(validated.codec_name, codec_name)
 
     def test_non_file_is_rejected_before_probe(self) -> None:
         with self.assertRaisesRegex(image_qc.ImageQCError, "not a file"):
@@ -175,24 +232,26 @@ class ImageValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(image_qc.ImageQCError, "unsupported raster content"):
             image_qc.validate_image(disguised)
 
-    def test_raw_hevc_stream_renamed_as_heic_is_rejected(self) -> None:
-        disguised = self.root / "video.heic"
-        disguised.write_bytes(b"raw hevc placeholder")
-        info = image_qc.ImageInfo(
-            disguised, 64, 64, "hevc", disguised.stat().st_size,
-            format_name="hevc",
-        )
-        with (
-            patch.object(image_qc, "probe_image", return_value=info),
-            patch.object(
-                image_qc, "_run",
-                return_value=subprocess.CompletedProcess([], 0, "", ""),
-            ),
-        ):
-            with self.assertRaisesRegex(
-                image_qc.ImageQCError, "unsupported raster content",
-            ):
-                image_qc.validate_image(disguised)
+    def test_raw_hevc_stream_with_supported_suffix_is_rejected(self) -> None:
+        for suffix in (".heic", ".jpg"):
+            with self.subTest(suffix=suffix):
+                disguised = self.root / f"video{suffix}"
+                disguised.write_bytes(b"raw hevc placeholder")
+                info = image_qc.ImageInfo(
+                    disguised, 64, 64, "hevc", disguised.stat().st_size,
+                    format_name="hevc",
+                )
+                with (
+                    patch.object(image_qc, "probe_image", return_value=info),
+                    patch.object(
+                        image_qc, "_run",
+                        return_value=subprocess.CompletedProcess([], 0, "", ""),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        image_qc.ImageQCError, "unsupported raster content",
+                    ):
+                        image_qc.validate_image(disguised)
 
     @unittest.skipUnless(LIBX265_AVAILABLE, "ffmpeg libx265 encoder is unavailable")
     def test_branded_multi_frame_heic_video_is_rejected(self) -> None:

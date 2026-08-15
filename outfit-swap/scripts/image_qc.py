@@ -40,22 +40,13 @@ SUPPORTED_INPUT_SUFFIXES = frozenset({
     ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
     ".heic", ".heif",
 })
-RASTER_CODECS_BY_SUFFIX = {
-    ".jpg": frozenset({"mjpeg"}),
-    ".jpeg": frozenset({"mjpeg"}),
-    ".png": frozenset({"png"}),
-    ".webp": frozenset({"webp"}),
-    ".bmp": frozenset({"bmp"}),
-    ".tif": frozenset({"tiff"}),
-    ".tiff": frozenset({"tiff"}),
-    ".gif": frozenset({"gif"}),
-    ".heic": frozenset({"hevc", "av1"}),
-    ".heif": frozenset({"hevc", "av1"}),
-}
+SUPPORTED_RASTER_CODECS = frozenset({
+    "mjpeg", "png", "webp", "bmp", "tiff", "gif",
+})
+HEIF_CODECS = frozenset({"hevc", "av1"})
 VIDEO_CONTAINER_NAMES = frozenset({
     "avi", "flv", "matroska", "mov", "mp4", "mpeg", "mpegts", "ogg", "webm",
 })
-HEIF_SUFFIXES = frozenset({".heic", ".heif"})
 HEIF_MAJOR_BRANDS = frozenset({
     "avif", "avis", "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm",
     "hevs", "mif1", "msf1",
@@ -220,17 +211,17 @@ def validate_image(path: str | Path) -> ImageInfo:
         raise ImageQCError(f"image exceeds 30 MiB: {image_path}")
 
     info = probe_image(image_path)
-    allowed_codecs = RASTER_CODECS_BY_SUFFIX[suffix]
     format_names = set(info.format_name.split(","))
     video_container = bool(format_names & VIDEO_CONTAINER_NAMES)
     valid_heif_container = (
-        suffix in HEIF_SUFFIXES
+        info.codec_name in HEIF_CODECS
         and info.major_brand in HEIF_MAJOR_BRANDS
         and info.frame_count == 1
     )
-    if (info.codec_name not in allowed_codecs
-            or suffix in HEIF_SUFFIXES and not valid_heif_container
-            or video_container and suffix not in HEIF_SUFFIXES):
+    supported_raster_content = (
+        info.codec_name in SUPPORTED_RASTER_CODECS or valid_heif_container
+    )
+    if not supported_raster_content or video_container and not valid_heif_container:
         raise ImageQCError(f"unsupported raster content: {image_path}")
     if info.width <= MIN_SIDE or info.height <= MIN_SIDE:
         raise ImageQCError(f"image sides must be greater than 14 pixels: {image_path}")
