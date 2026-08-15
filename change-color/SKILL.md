@@ -1,6 +1,6 @@
 ---
 name: change-color
-description: Extract a representative clothing RGB/HEX color from a user-provided target image, use imagegen to recolor the clothing in every gallery image of a product link's currently selected main SKU while preserving models and scenes, and save only the finished images in a separate folder. Use for Mercado Libre or similar fashion product links paired with a local target-color image.
+description: Extract a representative clothing RGB/HEX color from a user-provided target image, use the ImageEye Chrome extension to download and filter the product page's currently selected main-SKU gallery, use imagegen to recolor only those verified gallery images while preserving models and scenes, and save only the finished images in a separate folder. Use for Mercado Libre or similar fashion product links paired with a local target-color image.
 ---
 
 # Change Clothing Color
@@ -16,12 +16,12 @@ Return the representative color as `RGB(r, g, b)` and `#RRGGBB`, plus a clean fo
 
 1. Inspect `target_color_image` and identify broad, well-lit garment interiors. If several garment colors are present and the intended color is ambiguous, ask the user which garment to sample.
 2. Run `scripts/extract_target_color.py` with one or more normalized garment sample rectangles. Visually verify its swatch against the target garment.
-3. Open `product_link` in the user-requested browser, or the available browser selected for that URL. Identify the currently selected color/main SKU and its gallery count.
-4. Collect the highest-resolution URL for every image in that gallery. Exclude recommendations, reviews, videos, variant thumbnails from another color, and unrelated products.
-5. Download the originals into a temporary work folder in source order as `source_01`, `source_02`, and so on.
+3. Open `product_link` in Chrome and identify the currently selected color/main SKU, garment construction, and visible gallery order. Do not switch variants.
+4. Use the installed ImageEye Chrome extension to collect and download page-image candidates into a temporary candidate folder. Follow **ImageEye Gallery Acquisition** below; do not substitute raw page-assets inventory, search results, an API, or guessed CDN URLs.
+5. Filter the candidates against the visible product gallery. Keep only verified images of the currently selected main SKU, then copy them in gallery order into the work folder as `source_01`, `source_02`, and so on. Record a keep/exclude manifest before generation.
 6. Read and follow `$imagegen`. Recolor one source image with its default built-in `image_gen` edit mode and validate it as the calibration result.
 7. Process the remaining sources serially with one separate built-in call per image and the same destination RGB/HEX.
-8. Compare every result with its corresponding source. Retry only failed images with tighter garment-boundary and preservation instructions.
+8. Compare every successfully generated result with its corresponding source. If generation succeeded but visual validation fails, retry that image only with tighter garment-boundary and preservation instructions. If the `image_gen` call itself fails, stop immediately and return the error as described under Failure Handling.
 9. Put only approved images in a new output folder and report the color, count, and absolute folder path.
 
 ## Extract the Target Color
@@ -40,9 +40,37 @@ python scripts/extract_target_color.py target.webp \
 - Prefer several small interior rectangles over one large box crossing garment edges.
 - Treat the result as the garment base color. Preserve tonal variation in the output instead of painting flat RGB.
 
+## ImageEye Gallery Acquisition
+
+ImageEye in Chrome is the required acquisition surface for product images.
+
+1. Confirm Chrome displays the requested product ID and the intended currently selected color/main SKU. Expand or step through the product gallery so every gallery image has been rendered at least once.
+2. Open ImageEye from the Chrome extensions toolbar on that product tab. If ImageEye is missing, disabled, cannot inspect the tab, or Chrome asks for unapproved extension access, stop before generation and report the exact blocker. Do not install an extension or grant new permissions without user confirmation.
+3. In ImageEye, refresh or rescan after the gallery has been rendered. Before selecting or downloading anything, set all three filters exactly as follows:
+   - `Size = Large`
+   - `Layout = Tall` (the ImageEye label corresponding to the user's `layout=tail` rule)
+   - `Type = WEBP`
+4. Verify the ImageEye result view shows all three active filters. If any filter is unavailable or cannot be confirmed, stop before generation and report which filter failed. Do not silently broaden the filter set.
+5. Select candidates only from the filtered result view. Prefer the highest-resolution copy when duplicates remain. Download candidates into `change-color-work-YYYYMMDD-HHMMSS/imageeye-candidates/`; never download directly into the final output folder.
+6. Treat the filtered ImageEye download as an untrusted candidate pool, not as the gallery itself. These filters reduce noise but do not prove SKU membership; results may still include recommendations, ads, reviews, variant images, and unrelated products.
+7. Inspect every candidate with `view_image` and compare it with the visible product gallery. Create `gallery-manifest.tsv` with `gallery_index`, `candidate_filename`, `decision`, and `reason`.
+
+Keep a candidate only when all of these are true:
+
+- It depicts the same garment type, cut, construction, and component set as the product's currently selected main SKU.
+- Its garment color or print matches the currently selected variant. Exclude different-color variant thumbnails even when construction matches.
+- It appears in the product's own gallery in the same visible order. A visually similar recommendation is not enough.
+- It is a full gallery asset or an informational collage or size chart belonging to that SKU, not a thumbnail, icon, review image, video poster, ad, or recommendation.
+- It is sufficiently large and clear for editing. For duplicate resolutions of the same image, keep only the highest-resolution copy.
+- Its downloaded file is WEBP and it came from the simultaneously active ImageEye filters `Large + Tall + WEBP`.
+
+Exclude and record the reason for every candidate that fails any rule. Do not accept JPG, PNG, SVG, square, landscape, small, or medium ImageEye results outside the required filter set. Deduplicate by visual content, not filename alone. Compare retained membership with the product's visible tall WEBP gallery assets; do not require excluded videos or non-tall/non-WEBP gallery assets to appear in this filtered batch. If membership cannot be reconciled confidently, stop before `image_gen`, preserve the candidate folder and manifest, and report the mismatch. Never fill gaps with recommendations, other colors, similar products, search images, or inferred CDN variants.
+
+Copy only retained candidates to the work folder in visible gallery order as `source_01`, `source_02`, and so on. Finalize the Chrome product and ImageEye pages after the gallery resources and manifest are safely local.
+
 ## Recoloring
 
-Use `$imagegen` in its default built-in tool mode. Treat each recolor as a `precise-object-edit`. Do not use its CLI/API fallback unless the user explicitly requests that fallback after being told it requires `OPENAI_API_KEY`.
+Use `$imagegen` in its default built-in tool mode. Treat each recolor as a `precise-object-edit`. This skill has no fallback image generator: never invoke `$api-image`, an image API, the imagegen CLI, or another raster-editing tool when built-in `image_gen` fails.
 
 For every source image:
 
@@ -90,9 +118,19 @@ Report:
 - Absolute clickable output-folder path
 - Any image for which exact preservation cannot be guaranteed
 
-Finalize browser tabs after collecting the gallery resources.
+Finalize Chrome product and ImageEye pages after collecting and verifying the gallery resources.
 
-If the built-in image tool fails temporarily, preserve accepted outputs and retry only the failed source once with the same inputs and a more explicit invariant. If the built-in tool is unavailable, explain that imagegen offers a CLI fallback requiring `OPENAI_API_KEY`; proceed only after the user explicitly requests it. Never silently switch to an API or CLI workflow.
+## Failure Handling
+
+Distinguish an unsuccessful tool call from a successful image that fails visual quality control:
+
+- If Chrome or ImageEye cannot confirm the simultaneous filters `Size=Large`, `Layout=Tall`, and `Type=WEBP`, or cannot produce a confidently verified current-main-SKU gallery from those filtered results, stop before generation. Report active filters, candidate count, retained count, expected eligible gallery count when known, and the exact blocker or mismatch. Do not call `image_gen`.
+
+- If built-in `image_gen` returns an error, times out, is unavailable, or produces no usable output, stop the generation workflow immediately. Do not retry that call and do not process later source images.
+- Never call `$api-image`, an image API, the imagegen CLI, or any other image generator as a fallback, even if credentials or those tools are available.
+- Preserve already accepted local outputs, clean up browser pages, and report that the batch is incomplete.
+- Return the exact affected source filename/index and the provider/tool error message. Do not replace the error with a guessed diagnosis and do not claim completion.
+- A retry is allowed only when `image_gen` successfully returned an image but that image fails the visual validation rules above. Such a retry must still use built-in `image_gen` and must change only the relevant preservation or garment-boundary instruction.
 
 ## Resource
 

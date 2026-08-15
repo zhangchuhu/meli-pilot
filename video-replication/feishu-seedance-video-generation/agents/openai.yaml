@@ -1,0 +1,4 @@
+interface:
+  display_name: "飞书分镜生成 Seedance 视频"
+  short_description: "读取飞书 Base 分镜并调用 Seedance 2.5 生成视频"
+  default_prompt: "使用 $feishu-seedance-video-generation 读取指定飞书 Base 分镜并生成视频。"

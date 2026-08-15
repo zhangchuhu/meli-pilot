@@ -1,4 +1,4 @@
 interface:
   display_name: "服装批量改色"
-  short_description: "从目标图片提取服装颜色，批量改色商品主 SKU 全部图片"
-  default_prompt: "Use $change-color with a product link and a local target-color image to recolor every main-SKU gallery image and save the results in a separate folder."
+  short_description: "用 ImageEye 筛选主 SKU 图库并批量改色"
+  default_prompt: "Use $change-color with a product link and a local target-color image. Download candidates through the ImageEye Chrome extension, retain only the verified current-main-SKU gallery, recolor each retained image, and save the results separately."

@@ -1,0 +1,87 @@
+{
+  "manifest_version": "v1",
+  "format": "ndjson",
+  "base_token": "ItFGbmgZXaAZZgs5rYDcA9zundg",
+  "table_id": "tblbjoPoalwehSRo",
+  "rev": 61,
+  "timezone": "Asia/Shanghai",
+  "query_context": {
+    "field_scope": "selected_fields",
+    "record_scope": "all_records"
+  },
+  "requested_limit": 2000,
+  "records_count": 8,
+  "page_count": 1,
+  "has_more": false,
+  "record_file": "/Users/hugo_1/Workspace/PythonProject/video-replication/seedance_output/task_status.ndjson",
+  "record_file_size_bytes": 1444,
+  "manifest_file": "/Users/hugo_1/Workspace/PythonProject/video-replication/seedance_output/task_status.manifest.json",
+  "columns": {
+    "Seedance任务ID": {
+      "field_id": "fldkNLCh86",
+      "field_type": "text",
+      "physical_type": "string|null",
+      "stats": {
+        "null_count": 3,
+        "max_length": 24
+      },
+      "example": "cgt-20260815010356-zcs2q"
+    },
+    "Seedance状态": {
+      "field_id": "fld6Jeszqx",
+      "field_type": "text",
+      "physical_type": "string|null",
+      "stats": {
+        "null_count": 3,
+        "max_length": 9
+      },
+      "example": "running"
+    },
+    "Seedance生成视频": {
+      "field_id": "fldJ0g5zhi",
+      "field_type": "attachment",
+      "physical_type": "array<struct<file_token string, size number, name string>>",
+      "stats": {
+        "empty_count": 7,
+        "max_length": 3,
+        "avg_length": 0.375
+      },
+      "example": [
+        {
+          "file_token": "Q4bJbrC03ol5mUxM20ac5Uuynhe",
+          "name": "rec27ZbPCy4gH3_cgt-20260815010356-zcs2q.mp4",
+          "size": 2697264
+        },
+        {
+          "file_token": "L837b2ANAodvcBxL0eRcPoWqncc",
+          "name": "rec27ZbPCy4gH3_cgt-20260815010356-zcs2q.mp4",
+          "size": 2697264
+        },
+        {
+          "file_token": "Yq5Jbiu15oMZ5Dxvr6WcwATfn8c",
+          "name": "rec27ZbPCy4gH3_cgt-20260815010620-4svl5.mp4",
+          "size": 2462638
+        }
+      ]
+    },
+    "record_id": {
+      "physical_type": "string",
+      "stats": {
+        "max_length": 14
+      },
+      "example": "rec27ZbPCy4gH3"
+    },
+    "镜头序号": {
+      "field_id": "fldITQmris",
+      "field_type": "number",
+      "physical_type": "number|null",
+      "stats": {
+        "null_count": 3,
+        "min": 1,
+        "max": 5,
+        "avg": 3
+      },
+      "example": 1
+    }
+  }
+}
