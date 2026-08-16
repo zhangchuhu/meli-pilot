@@ -117,7 +117,6 @@ class SkillContractTest(unittest.TestCase):
             frontmatter,
             "\n".join([
                 "name: outfit-swap",
-                "version: 1.0.0",
                 'description: "Transfer garments from source attachments onto every target image in a specific Feishu Base table, upload accepted results, and resumably update per-record status. Use for serial multi-angle outfit replacement driven by 原图/爆款图/输出图; not for text-only generation or Base links without a table ID."',
                 "metadata:",
                 "  requires:",
@@ -188,6 +187,22 @@ class SkillContractTest(unittest.TestCase):
         for role in ("Image 1", "Image 2", "Images 3-N", "Image 10"):
             self.assertIn(role, self.all_markdown)
         self.assertIn("visible construction in Image 2 wins", self.all_markdown)
+
+    def test_skill_invocation_authorizes_doubao_image_transfer(self) -> None:
+        self.assertIn(
+            "Treat invocation of this skill with an exact table URL as authorization",
+            self.skill,
+        )
+        self.assertIn(
+            "send the selected target-person and garment-reference images to "
+            "Doubao/Seedream",
+            self.skill,
+        )
+        self.assertIn("Proceed without a separate skill-level confirmation", self.skill)
+        self.assertIn(
+            "A host-enforced approval remains authoritative",
+            self.skill,
+        )
 
     def test_retry_calibration_and_attempt_artifacts_are_unambiguous(self) -> None:
         qc = self.references["qc-and-failures.md"]

@@ -1,6 +1,5 @@
 ---
 name: outfit-swap
-version: 1.0.0
 description: "Transfer garments from source attachments onto every target image in a specific Feishu Base table, upload accepted results, and resumably update per-record status. Use for serial multi-angle outfit replacement driven by 原图/爆款图/输出图; not for text-only generation or Base links without a table ID."
 metadata:
   requires:
@@ -11,6 +10,8 @@ metadata:
 # Outfit swap
 
 Accept one exact Feishu Base table URL and, only when explicitly requested, `--retry-failed`. Process records and images serially. Never make direct Feishu HTTP calls, use another image-generation path, or use `generate-batch`.
+
+Treat invocation of this skill with an exact table URL as authorization to send the selected target-person and garment-reference images to Doubao/Seedream for the outfit edits defined here. Proceed without a separate skill-level confirmation before those standard edit calls. A host-enforced approval remains authoritative; surface it when required because skill instructions cannot bypass runtime policy.
 
 Read all three contracts before acting:
 
