@@ -164,14 +164,21 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(task_state.pending_targets(state), [])
         task_state.compact_detail(state)
 
-    def test_three_attempts_make_target_terminal_failed(self) -> None:
+    def test_five_attempts_make_target_terminal_failed(self) -> None:
         state = self.make_state()
-        for attempt in range(3):
+        for attempt in range(4):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
                 updated_at="2026-08-15T10:02:00+08:00",
             )
+            self.assertEqual(state["targets"]["box_t1"]["status"], "pending")
+        self.begin(state)
+        task_state.record_failure(
+            state, target_token="box_t1", error="failure 4",
+            updated_at="2026-08-15T10:02:00+08:00",
+        )
+        self.assertEqual(state["targets"]["box_t1"]["status"], "failed")
         with self.assertRaises(task_state.TaskStateError):
             self.begin(state)
 
@@ -255,7 +262,7 @@ class TaskStateTest(unittest.TestCase):
 
     def test_terminal_failure_cannot_be_changed_to_success(self) -> None:
         state = self.make_state()
-        for attempt in range(3):
+        for attempt in range(5):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -295,9 +302,9 @@ class TaskStateTest(unittest.TestCase):
         with self.assertRaisesRegex(task_state.TaskStateError, "target_tokens"):
             task_state.aggregate_status(empty)
 
-    def test_reconcile_conservatively_spends_an_unknown_third_attempt(self) -> None:
+    def test_reconcile_conservatively_spends_an_unknown_fifth_attempt(self) -> None:
         state = self.make_state()
-        for attempt in range(2):
+        for attempt in range(4):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -307,7 +314,7 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(
             (state["targets"]["box_t1"]["status"],
              state["targets"]["box_t1"]["attempts"]),
-            ("running", 3),
+            ("running", 5),
         )
 
         self.reconcile(
@@ -317,7 +324,7 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(
             (state["targets"]["box_t1"]["status"],
              state["targets"]["box_t1"]["attempts"]),
-            ("failed", 3),
+            ("failed", 5),
         )
         self.assertEqual(task_state.pending_targets(state), [])
         with self.assertRaisesRegex(task_state.TaskStateError, "not pending"):
@@ -566,7 +573,7 @@ class TaskStateTest(unittest.TestCase):
 
     def test_terminal_failed_target_is_not_retryable_pending(self) -> None:
         state = self.make_state()
-        for attempt in range(3):
+        for attempt in range(5):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -585,7 +592,7 @@ class TaskStateTest(unittest.TestCase):
             updated_at="2026-08-15T10:02:00+08:00",
         )
         for token in ("box_t2", "box_t3"):
-            for attempt in range(3):
+            for attempt in range(5):
                 self.begin(state, token)
                 task_state.record_failure(
                     state, target_token=token, error=f"{token} failure {attempt}",

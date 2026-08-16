@@ -24,7 +24,7 @@ For every initialized record, run `scripts/image_qc.py empty-contact-sheet` to c
 4. Process every other pending target serially in original attachment order.
 5. If no pending ordinary target remains, skip calibration and process any pending details, flat lays, or infographics serially. This includes retries where an earlier ordinary calibration target is already a valid current success.
 
-Every target has three attempts in the current source identity and explicit retry cycle: one initial edit plus at most two one-change corrections. A user-authorized later `--retry-failed` cycle starts a fresh budget for current non-success targets. Inspect the returned bitmap after every attempt; never infer acceptance from a successful command.
+Every target has five attempts in the current source identity and explicit retry cycle: one initial edit plus at most four one-change corrections. A user-authorized later `--retry-failed` cycle starts a fresh budget for current non-success targets. Inspect attempts one through four and apply the normal rejection conditions. For attempt five, accept the fifth complete decodable bitmap after `scripts/image_qc.py` validation and continue through promotion, durable local acceptance, upload, and success. Do not apply visual rejection conditions to attempt five. A missing, incomplete, corrupt, or undecodable fifth artifact is not eligible for forced acceptance and follows the external-call or record-data failure contract.
 
 ## Rejection conditions
 
@@ -40,7 +40,7 @@ Reject an output when any of these occur:
 - a multi-model grid changes only one cell when all clothing instances were required to change
 - visible text or infographic layout changes materially
 
-Record each attempt through `scripts/task_state.py`. Accept only after direct inspection confirms both garment fidelity and all target-preservation invariants.
+Record each attempt through `scripts/task_state.py`. For attempts one through four, accept only after direct inspection confirms both garment fidelity and all target-preservation invariants. Attempt five uses the forced-acceptance rule above.
 
 ## Failure classes
 
@@ -70,15 +70,9 @@ Missing source/target attachments, a corrupt image, or invalid image constraints
 
 Persist the `record-error` state, compact and summarize it, and write terminal `任务状态: 失败` plus `处理明细` before continuing, even when current targets remain pending. This terminal Base write is required for every record-level stop.
 
-### Calibration exhaustion
+### Fifth-attempt forced acceptance
 
-If calibration is rejected on all three attempts, mark the record `失败`, skip all remaining targets in that record, and continue with the next record.
-
-Before continuing, compact and summarize the manifest and write terminal `任务状态: 失败` plus `处理明细`. This terminal Base write is required even though skipped targets remain pending.
-
-### Later visual exhaustion
-
-If a later target is rejected on all three attempts, record that target failure and continue processing the other targets in the same record so accepted work is preserved. Finish the record as `失败`.
+Visual rejection cannot exhaust calibration or a later target: when attempts one through four are rejected, generate attempt five with the latest one-change correction and accept its complete decodable bitmap directly. Continue the record after its upload succeeds. Only a missing, incomplete, corrupt, or undecodable fifth artifact can prevent this forced acceptance, and it follows the applicable external-call or record-data failure rule.
 
 ### External call failure
 

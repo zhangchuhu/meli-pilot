@@ -210,10 +210,13 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("first pending ordinary single-model target", qc)
         self.assertIn("If no pending ordinary target remains, skip calibration", qc)
         self.assertIn("attempt-<ordered-index>-<target-token-digest>-<artifact-ordinal>.png", edit)
-        self.assertIn("monotonic artifact ordinal is independent of the three-attempt budget", edit)
-        self.assertIn("`-04.png` and higher", edit)
+        self.assertIn("monotonic artifact ordinal is independent of the five-attempt budget", edit)
+        self.assertIn("`-06.png` and higher", edit)
         self.assertIn("Never pass the deterministic `look-…png` path to Doubao", edit)
         self.assertIn("scripts/image_qc.py promote-output", edit)
+        self.assertIn("five attempts", qc)
+        self.assertIn("accept the fifth complete decodable bitmap", qc)
+        self.assertIn("Do not apply visual rejection conditions to attempt five", qc)
 
     def test_paid_artifacts_and_pending_uploads_resume_before_generation(self) -> None:
         self.assertIn("--resumable-artifacts-json", self.skill)
@@ -340,8 +343,7 @@ class SkillContractTest(unittest.TestCase):
         for failure_class in (
             "Global preflight failure",
             "Record data failure",
-            "Calibration exhaustion",
-            "Later visual exhaustion",
+            "Fifth-attempt forced acceptance",
             "External call failure",
         ):
             self.assertIn(failure_class, qc)
