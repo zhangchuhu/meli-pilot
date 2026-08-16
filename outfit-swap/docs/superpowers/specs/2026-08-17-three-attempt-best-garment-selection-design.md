@@ -37,6 +37,14 @@ Missing, partial, corrupt, or undecodable artifacts never participate. Attempts 
 - Preserve the current state schema. Identify the current cycle by the contiguous history suffix whose attempt numbers are `1`, `2`, `3`; explicit retry and source-identity reset begin a new suffix at attempt one.
 - Reconciliation continues to revalidate active and accepted-local artifacts before any new paid call. A recovered third attempt follows the same comparison rule without repeating the call.
 
+### Existing five-attempt state compatibility
+
+- Separate the new-call budget (`3`) from the largest legacy attempt number accepted while reading state (`5`). Existing schema-version-2 manifests and attempt history remain readable.
+- Never start another call for a legacy non-success target whose current attempt count is already three or greater.
+- Preserve legacy `success` and `accepted-local` targets unchanged. Preserve a legacy running artifact for reinspection; when it is valid, compare the valid artifacts from that contiguous legacy cycle and accept the garment-best existing candidate without another call.
+- Normalize a legacy `pending` target already at three or more attempts to terminal `failed` during load/reconciliation. It requires the existing explicit `--retry-failed` path before a fresh three-attempt cycle can begin.
+- A fresh explicit retry or changed source identity resets only the current attempt counter to zero, preserves immutable history, and starts a new selectable suffix at attempt one.
+
 ## Skill-contract changes
 
 - `SKILL.md` describes the three-call budget, early acceptance, generation-failure retries on attempts one and two, and third-attempt comparative selection.
@@ -55,6 +63,7 @@ Use test-first development and verify each new test fails for the expected old b
 - Upload success updates the selected history entry, not automatically the latest entry.
 - Invalid attempts are excluded; an invalid third attempt can still select a valid earlier candidate.
 - Three invalid artifacts create terminal `external-call`; upload and critical Base failures still stop immediately.
+- Legacy attempt-four/five histories remain loadable, cannot trigger another paid call, and preserve existing success or accepted-local recovery.
 - Skill pressure tests produce early acceptance when an early candidate passes and garment-first comparative selection only after the third attempt.
 - Run focused state/contract tests, the complete helper test suite, `git diff --check`, and the skill validator.
 
