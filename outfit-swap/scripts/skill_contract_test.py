@@ -211,6 +211,14 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("one initial call plus at most two retries", qc)
         self.assertIn("stop immediately after an early full-QC pass", qc)
         self.assertIn("compare every complete decodable candidate", qc)
+        self.assertIn(
+            "including a candidate previously visually rejected on attempt one or two",
+            qc,
+        )
+        self.assertIn(
+            "garment fidelity outranks the earlier visual-rejection rationale",
+            qc,
+        )
         self.assertIn("garment construction and silhouette", qc)
         self.assertIn("accept-local", qc)
         self.assertIn("Reuse the same prompt and ordered references", edit)

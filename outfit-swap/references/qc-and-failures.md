@@ -73,7 +73,7 @@ Persist the `record-error` state, compact and summarize it, and write terminal `
 
 ### Third-attempt garment-best selection
 
-After the third initiated call, compare every complete decodable candidate from the contiguous current three-attempt cycle against the ordered garment references. Exclude missing, partial, corrupt, and undecodable artifacts. Rank valid candidates by direct comparative inspection, in this order:
+After the third initiated call, compare every complete decodable candidate from the contiguous current three-attempt cycle against the ordered garment references, including a candidate previously visually rejected on attempt one or two. Exclude missing, partial, corrupt, and undecodable artifacts. At this final garment-best selection, garment fidelity outranks the earlier visual-rejection rationale. Rank eligible candidates by direct comparative inspection, in this order:
 
 1. garment construction and silhouette;
 2. color and material appearance;
@@ -81,7 +81,7 @@ After the third initiated call, compare every complete decodable candidate from 
 4. when garment similarity is tied, preservation of the target person, pose, crop, composition, accessories, background, lighting, and text/layout;
 5. when the visual result is still tied, choose the earlier attempt.
 
-Promote the selected artifact and pass its artifact name to `scripts/task_state.py accept-local`; this may select an earlier valid artifact while attempt three remains active. If the third artifact is invalid but an earlier valid candidate exists, select the best earlier candidate. If no complete decodable candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` directly while attempt three is active, mark the record failed when Base remains writable, and stop the run without exposing another pending attempt.
+Promote the selected artifact and pass its artifact name to `scripts/task_state.py accept-local`; this may select an earlier eligible artifact while attempt three remains active. If the third artifact is invalid but an earlier eligible candidate exists, select the best earlier candidate. If no complete decodable candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` directly while attempt three is active, mark the record failed when Base remains writable, and stop the run without exposing another pending attempt.
 
 ### External call failure
 
