@@ -96,6 +96,17 @@ class TaskStateTest(unittest.TestCase):
         )
         return state, first
 
+    def assert_persisted_state_rejected_without_mutation(self, state: dict) -> None:
+        serialized = json.dumps(state, sort_keys=True)
+        before = json.loads(serialized)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(serialized, encoding="utf-8")
+            with self.assertRaisesRegex(task_state.TaskStateError, "attempt history"):
+                task_state.load_state(path)
+            self.assertEqual(path.read_text(encoding="utf-8"), serialized)
+        self.assertEqual(state, before)
+
     def test_output_name_is_stable_and_indexed(self) -> None:
         self.assertEqual(
             task_state.output_name(2, "box_target_123"),
@@ -156,6 +167,80 @@ class TaskStateTest(unittest.TestCase):
         )
         self.assertEqual(history[0]["output"]["file_token"], "box_out")
         self.assertIsNone(history[-1]["output"])
+
+    def test_persisted_second_attempt_historical_acceptance_is_rejected(self) -> None:
+        state, _first = self.make_first_of_three_locally_accepted()
+        target = state["targets"]["box_t1"]
+        target["attempts"] = 2
+        target["attempt_history"] = target["attempt_history"][:2]
+
+        self.assert_persisted_state_rejected_without_mutation(state)
+
+    def test_persisted_historical_acceptance_requires_failed_later_attempts(self) -> None:
+        state, _first = self.make_first_of_three_locally_accepted()
+        target = state["targets"]["box_t1"]
+        target["attempt_history"][-1]["outcome"] = "interrupted"
+        target["attempt_history"][-1]["error"] = "malformed later outcome"
+
+        self.assert_persisted_state_rejected_without_mutation(state)
+
+    def test_persisted_second_attempt_historical_success_is_rejected(self) -> None:
+        state, _first = self.make_first_of_three_locally_accepted()
+        target = state["targets"]["box_t1"]
+        output = {
+            "file_token": "box_out",
+            "name": task_state.output_name(1, "box_t1"),
+        }
+        target["attempts"] = 2
+        target["attempt_history"] = target["attempt_history"][:2]
+        target["attempt_history"][0]["outcome"] = "success"
+        target["attempt_history"][0]["output"] = output
+        target["status"] = "success"
+        target["output"] = output
+        target["local_acceptance"] = None
+
+        self.assert_persisted_state_rejected_without_mutation(state)
+
+    def test_historical_acceptance_copies_selected_metadata_to_target(self) -> None:
+        state = self.make_state()
+        task_state.begin_attempt(
+            state, target_token="box_t1", classification="front three-quarter",
+            reference_tokens=["box_s1"], prompt="chosen garment prompt",
+            model="chosen-model", updated_at="2026-08-17T10:01:00+08:00",
+        )
+        first = state["targets"]["box_t1"]["attempt_history"][-1]["artifact_name"]
+        task_state.record_failure(
+            state, target_token="box_t1", error="reject 1",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+        task_state.begin_attempt(
+            state, target_token="box_t1", classification="side",
+            reference_tokens=["box_s1"], prompt="second garment prompt",
+            model="second-model", updated_at="2026-08-17T10:02:00+08:00",
+        )
+        task_state.record_failure(
+            state, target_token="box_t1", error="reject 2",
+            updated_at="2026-08-17T10:02:30+08:00",
+        )
+        task_state.begin_attempt(
+            state, target_token="box_t1", classification="back",
+            reference_tokens=["box_s1"], prompt="third garment prompt",
+            model="third-model", updated_at="2026-08-17T10:03:00+08:00",
+        )
+        task_state.record_local_acceptance(
+            state, target_token="box_t1", artifact_name=first,
+            name=task_state.output_name(1, "box_t1"),
+            updated_at="2026-08-17T10:03:30+08:00",
+        )
+
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["classification"], "front three-quarter")
+        self.assertEqual(target["reference_tokens"], ["box_s1"])
+        self.assertEqual(
+            target["prompt_sha256"],
+            hashlib.sha256(b"chosen garment prompt").hexdigest(),
+        )
+        self.assertEqual(target["model"], "chosen-model")
 
     def test_historical_acceptance_rejects_artifact_from_previous_retry_cycle(self) -> None:
         state = self.make_state()

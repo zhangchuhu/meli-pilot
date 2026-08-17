@@ -349,6 +349,25 @@ def _current_cycle_history(target: dict[str, Any]) -> list[dict[str, Any]]:
     return cycle
 
 
+def _validate_historical_selection(
+        target: dict[str, Any], selected: dict[str, Any],
+) -> None:
+    """Require a non-latest selection to follow three or more failed attempts."""
+    cycle = _current_cycle_history(target)
+    try:
+        selected_index = next(
+            (index for index, entry in enumerate(cycle) if entry is selected),
+        )
+    except StopIteration as error:
+        raise TaskStateError("selected entry is not in the current attempt cycle") from error
+    if selected_index == len(cycle) - 1:
+        return
+    if (len(cycle) < MAX_ATTEMPTS
+            or any(entry.get("outcome") != "failed"
+                   for entry in cycle[selected_index + 1:])):
+        raise TaskStateError("historical selection has invalid later attempt history")
+
+
 def _accepted_history_entry(target: dict[str, Any]) -> dict[str, Any]:
     """Return the sole history entry matching local_acceptance artifact identity."""
     local_acceptance = target.get("local_acceptance")
@@ -364,6 +383,7 @@ def _accepted_history_entry(target: dict[str, Any]) -> dict[str, Any]:
     if (accepted.get("run_id") != local_acceptance.get("run_id")
             or accepted.get("artifact_name") != local_acceptance.get("artifact_name")):
         raise TaskStateError("local acceptance does not match current attempt cycle")
+    _validate_historical_selection(target, accepted)
     return accepted
 
 
@@ -548,6 +568,12 @@ def _validate_state(state: Any) -> dict[str, Any]:
                     raise TaskStateError(
                         f"successful target has invalid attempt history: {token}",
                     )
+                try:
+                    _validate_historical_selection(target, success_entries[0])
+                except TaskStateError as error:
+                    raise TaskStateError(
+                        f"successful target has invalid attempt history: {token}",
+                    ) from error
     if current_target is not None and state["targets"][current_target]["status"] != "running":
         raise TaskStateError("current_target is not running")
     return state
