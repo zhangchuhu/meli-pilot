@@ -328,6 +328,45 @@ def new_record_error_state(
     return _validate_state(state)
 
 
+def _current_cycle_history(target: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the final contiguous 1..N attempt suffix for the current cycle."""
+    history = target.get("attempt_history")
+    if not isinstance(history, list):
+        raise TaskStateError("target has no current attempt cycle")
+    start = next(
+        (index for index in range(len(history) - 1, -1, -1)
+         if history[index].get("attempt") == 1),
+        None,
+    )
+    if start is None:
+        raise TaskStateError("target has no current attempt cycle")
+    cycle = history[start:]
+    if (not cycle
+            or any(entry.get("attempt") != number
+                   for number, entry in enumerate(cycle, start=1))
+            or len(cycle) != target.get("attempts")):
+        raise TaskStateError("target has an invalid current attempt cycle")
+    return cycle
+
+
+def _accepted_history_entry(target: dict[str, Any]) -> dict[str, Any]:
+    """Return the sole history entry matching local_acceptance artifact identity."""
+    local_acceptance = target.get("local_acceptance")
+    if not isinstance(local_acceptance, dict):
+        raise TaskStateError("target has no local acceptance")
+    accepted_entries = [
+        entry for entry in _current_cycle_history(target)
+        if entry.get("outcome") == "accepted-local"
+    ]
+    if len(accepted_entries) != 1:
+        raise TaskStateError("local acceptance does not match current attempt cycle")
+    accepted = accepted_entries[0]
+    if (accepted.get("run_id") != local_acceptance.get("run_id")
+            or accepted.get("artifact_name") != local_acceptance.get("artifact_name")):
+        raise TaskStateError("local acceptance does not match current attempt cycle")
+    return accepted
+
+
 def _validate_state(state: Any) -> dict[str, Any]:
     if not isinstance(state, dict):
         raise TaskStateError("state must be a JSON object")
@@ -474,15 +513,15 @@ def _validate_state(state: Any) -> dict[str, Any]:
         if target["status"] != "running" and active_history:
             raise TaskStateError(f"non-running target has active attempt history: {token}")
         if target["status"] == "accepted-local":
-            if (not target["attempt_history"]
-                    or target["attempt_history"][-1].get("outcome") != "accepted-local"
-                    or local_acceptance["run_id"]
-                    != target["attempt_history"][-1]["run_id"]
-                    or local_acceptance["artifact_name"]
-                    != target["attempt_history"][-1]["artifact_name"]
-                    or local_acceptance["name"] != promoted_output_name(
-                        local_acceptance["artifact_name"], token,
-                    )):
+            try:
+                _accepted_history_entry(target)
+            except TaskStateError as error:
+                raise TaskStateError(
+                    f"local acceptance does not match attempt history: {token}",
+                ) from error
+            if local_acceptance["name"] != promoted_output_name(
+                    local_acceptance["artifact_name"], token,
+            ):
                 raise TaskStateError(
                     f"local acceptance does not match attempt history: {token}",
                 )
@@ -495,6 +534,20 @@ def _validate_state(state: Any) -> dict[str, Any]:
             output = target["output"]
             if output is None or not _output_name_matches_target(output["name"], token):
                 raise TaskStateError(f"successful target has invalid output: {token}")
+            if target["attempt_history"]:
+                try:
+                    success_entries = [
+                        entry for entry in _current_cycle_history(target)
+                        if entry.get("outcome") == "success"
+                    ]
+                except TaskStateError as error:
+                    raise TaskStateError(
+                        f"successful target has invalid attempt history: {token}",
+                    ) from error
+                if len(success_entries) != 1 or success_entries[0].get("output") != output:
+                    raise TaskStateError(
+                        f"successful target has invalid attempt history: {token}",
+                    )
     if current_target is not None and state["targets"][current_target]["status"] != "running":
         raise TaskStateError("current_target is not running")
     return state
@@ -745,7 +798,7 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
                     output=uploaded,
                 )
             elif target["status"] == "accepted-local":
-                history = target["attempt_history"][-1]
+                history = _accepted_history_entry(target)
                 history["outcome"] = "success"
                 history["finished_at"] = updated_at
                 history["error"] = None
@@ -779,7 +832,7 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
             identity = (accepted["run_id"], accepted["artifact_name"])
             if identity not in available_artifacts:
                 missing = "accepted local artifact is missing; regeneration required"
-                history = target["attempt_history"][-1]
+                history = _accepted_history_entry(target)
                 history["outcome"] = "failed"
                 history["finished_at"] = updated_at
                 history["error"] = missing
@@ -955,8 +1008,18 @@ def record_local_acceptance(
         raise TaskStateError(f"target attempt is not running: {target_token}")
     active = target["attempt_history"][-1]
     artifact_name = _nonempty_string(artifact_name, "artifact_name")
+    selected = active
     if artifact_name != active["artifact_name"]:
-        raise TaskStateError("local acceptance does not match active artifact")
+        current_cycle = _current_cycle_history(target)
+        selected = next(
+            (entry for entry in current_cycle
+             if entry["artifact_name"] == artifact_name and entry["outcome"] == "failed"),
+            None,
+        )
+        if selected is None:
+            raise TaskStateError("artifact is not in the current attempt cycle")
+        if target["attempts"] < MAX_ATTEMPTS:
+            raise TaskStateError("local acceptance does not match active artifact")
     expected_name = promoted_output_name(artifact_name, target_token)
     if name != expected_name:
         raise TaskStateError(
@@ -966,19 +1029,38 @@ def record_local_acceptance(
 
     candidate = copy.deepcopy(state)
     accepted_target = candidate["targets"][target_token]
+    accepted_active = accepted_target["attempt_history"][-1]
+    accepted_selected = next(
+        entry for entry in accepted_target["attempt_history"]
+        if (entry["run_id"], entry["artifact_name"])
+        == (selected["run_id"], selected["artifact_name"])
+    )
+    if accepted_selected is not accepted_active:
+        _finish_running_history(
+            accepted_target, outcome="failed",
+            error=_sanitize_error("not selected; lower garment-reference similarity"),
+            updated_at=updated_at,
+        )
+        accepted_selected["outcome"] = "accepted-local"
+        accepted_selected["finished_at"] = updated_at
+        accepted_selected["error"] = None
+        accepted_selected["output"] = None
+        for field in ("classification", "reference_tokens", "prompt_sha256", "model"):
+            accepted_target[field] = copy.deepcopy(accepted_selected[field])
+    else:
+        _finish_running_history(
+            accepted_target, outcome="accepted-local", error=None,
+            updated_at=updated_at,
+        )
     accepted_target["status"] = "accepted-local"
     accepted_target["local_acceptance"] = {
-        "run_id": active["run_id"],
+        "run_id": accepted_selected["run_id"],
         "artifact_name": artifact_name,
         "name": name,
         "accepted_at": updated_at,
     }
     accepted_target["error"] = None
     accepted_target["updated_at"] = updated_at
-    _finish_running_history(
-        accepted_target, outcome="accepted-local", error=None,
-        updated_at=updated_at,
-    )
     candidate["current_target"] = None
     _validate_state(candidate)
     state.clear()
@@ -1009,14 +1091,14 @@ def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
     uploaded = {"file_token": file_token, "name": name}
     successful["status"] = "success"
     successful["output"] = uploaded
-    successful["local_acceptance"] = None
-    successful["error"] = None
-    successful["updated_at"] = updated_at
-    history = successful["attempt_history"][-1]
+    history = _accepted_history_entry(successful)
     history["outcome"] = "success"
     history["finished_at"] = updated_at
     history["error"] = None
     history["output"] = uploaded
+    successful["local_acceptance"] = None
+    successful["error"] = None
+    successful["updated_at"] = updated_at
     _validate_state(candidate)
     state.clear()
     state.update(candidate)
