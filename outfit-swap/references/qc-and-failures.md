@@ -28,6 +28,10 @@ Every target has three initiated calls in the current source identity and explic
 
 ## Rejection conditions
 
+Never compare a generated artifact's pixel dimensions or aspect ratio with its target `爆款图`.
+Never reject, retry, fail, or rank candidates by a target/output dimension or aspect-ratio difference.
+Continue complete/decodable artifact validation and full visual QC for garment fidelity and target-preservation invariants.
+
 Reject an output when any of these occur:
 
 - target identity, pose, composition, scene, or an important accessory changed

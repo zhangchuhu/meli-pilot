@@ -188,6 +188,26 @@ class SkillContractTest(unittest.TestCase):
             self.assertIn(role, self.all_markdown)
         self.assertIn("visible construction in Image 2 wins", self.all_markdown)
 
+    def test_doubao_stays_2k_and_qc_ignores_target_output_size(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        safe_edit = read_required(SKILL_ROOT / "scripts" / "safe_edit.py")
+        self.assertIn('"--size", "2K"', safe_edit)
+        self.assertIn("fixed `--size 2K`", self.skill)
+        self.assertIn(
+            "Never compare a generated artifact's pixel dimensions or aspect ratio "
+            "with its target `爆款图`",
+            qc,
+        )
+        self.assertIn(
+            "Never reject, retry, fail, or rank candidates by a target/output "
+            "dimension or aspect-ratio difference",
+            qc,
+        )
+        self.assertIn(
+            "Continue complete/decodable artifact validation and full visual QC",
+            qc,
+        )
+
     def test_skill_invocation_authorizes_doubao_image_transfer(self) -> None:
         self.assertIn(
             "Treat invocation of this skill with an exact table URL as authorization",
