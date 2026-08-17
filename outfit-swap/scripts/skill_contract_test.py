@@ -234,6 +234,16 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("Upload and critical Base-write/readback failures", qc)
         self.assertIn("stop immediately", base)
 
+    def test_restarted_exhausted_attempt_selects_or_records_terminal_external_call(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        self.assertIn("non-callable final-selection checkpoint", qc)
+        self.assertIn(
+            "choose an existing revalidated current-cycle candidate with `accept-local`",
+            qc,
+        )
+        self.assertIn("record-error --code external-call", qc)
+        self.assertIn("without another `attempt`", qc)
+
     def test_record_error_table_excludes_retryable_doubao_failures(self) -> None:
         qc = self.references["qc-and-failures.md"]
         self.assertIn(

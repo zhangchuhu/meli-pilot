@@ -352,7 +352,7 @@ def _current_cycle_history(target: dict[str, Any]) -> list[dict[str, Any]]:
 def _validate_historical_selection(
         target: dict[str, Any], selected: dict[str, Any],
 ) -> None:
-    """Require a non-latest selection to follow three or more failed attempts."""
+    """Require a compatible non-latest selection after an exhausted cycle."""
     cycle = _current_cycle_history(target)
     try:
         selected_index = next(
@@ -362,8 +362,12 @@ def _validate_historical_selection(
         raise TaskStateError("selected entry is not in the current attempt cycle") from error
     if selected_index == len(cycle) - 1:
         return
+    if selected.get("reference_tokens") != cycle[-1].get("reference_tokens"):
+        raise TaskStateError(
+            "historical selection reference_tokens do not match current attempt cycle",
+        )
     if (len(cycle) < MAX_ATTEMPTS
-            or any(entry.get("outcome") != "failed"
+            or any(entry.get("outcome") not in {"failed", "interrupted"}
                    for entry in cycle[selected_index + 1:])):
         raise TaskStateError("historical selection has invalid later attempt history")
 
@@ -837,7 +841,8 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
         elif target["status"] == "running":
             active = target["attempt_history"][-1]
             identity = (active["run_id"], active["artifact_name"])
-            if identity in available_artifacts:
+            if (identity in available_artifacts
+                    or target["attempts"] >= MAX_ATTEMPTS):
                 preserved_current = token
             else:
                 interrupted = (
@@ -985,6 +990,12 @@ def begin_attempt(state: dict[str, Any], *, target_token: str, classification: s
     if classification not in CLASSIFICATIONS:
         raise TaskStateError(f"unknown classification: {classification!r}")
     references = _token_iterable(reference_tokens, "reference_tokens")
+    if (target["attempts"] > 0
+            and references
+            != _current_cycle_history(target)[0]["reference_tokens"]):
+        raise TaskStateError(
+            "reference_tokens must preserve current attempt cycle order",
+        )
     prompt = _nonempty_string(prompt, "prompt")
     model = _nonempty_string(model, "model")
     updated_at = _nonempty_string(updated_at, "updated_at")
@@ -1039,7 +1050,8 @@ def record_local_acceptance(
         current_cycle = _current_cycle_history(target)
         selected = next(
             (entry for entry in current_cycle
-             if entry["artifact_name"] == artifact_name and entry["outcome"] == "failed"),
+             if (entry["artifact_name"] == artifact_name
+                 and entry["outcome"] in {"failed", "interrupted"})),
             None,
         )
         if selected is None:

@@ -14,21 +14,27 @@ import task_state
 
 
 class TaskStateTest(unittest.TestCase):
-    def make_state(self, targets: list[str] | None = None) -> dict:
+    def make_state(
+            self, targets: list[str] | None = None,
+            sources: list[str] | None = None,
+    ) -> dict:
         return task_state.new_state(
             record_id="rec_1",
             run_id="run_1",
-            source_tokens=["box_s1"],
+            source_tokens=sources or ["box_s1"],
             target_tokens=targets or ["box_t1"],
             started_at="2026-08-15T10:00:00+08:00",
         )
 
-    def begin(self, state: dict, token: str = "box_t1") -> None:
+    def begin(
+            self, state: dict, token: str = "box_t1",
+            references: list[str] | None = None,
+    ) -> None:
         task_state.begin_attempt(
             state,
             target_token=token,
             classification="front",
-            reference_tokens=["box_s1"],
+            reference_tokens=references or ["box_s1"],
             prompt="put the outfit on the person",
             model="image-model",
             updated_at="2026-08-15T10:01:00+08:00",
@@ -176,13 +182,256 @@ class TaskStateTest(unittest.TestCase):
 
         self.assert_persisted_state_rejected_without_mutation(state)
 
-    def test_persisted_historical_acceptance_requires_failed_later_attempts(self) -> None:
+    def test_persisted_historical_acceptance_allows_interrupted_later_attempt(self) -> None:
         state, _first = self.make_first_of_three_locally_accepted()
         target = state["targets"]["box_t1"]
         target["attempt_history"][-1]["outcome"] = "interrupted"
-        target["attempt_history"][-1]["error"] = "malformed later outcome"
+        target["attempt_history"][-1]["error"] = "interrupted after initiation"
 
-        self.assert_persisted_state_rejected_without_mutation(state)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            loaded = task_state.load_state(path)
+
+        self.assertEqual(loaded, state)
+
+    def test_interrupted_middle_attempt_does_not_poison_failed_candidate_selection(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        first = state["targets"]["box_t1"]["attempt_history"][-1]["artifact_name"]
+        task_state.record_failure(
+            state, target_token="box_t1", error="first visual rejection",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+        self.begin(state)
+        self.reconcile(
+            state, target_tokens=["box_t1"], outputs=[],
+            updated_at="2026-08-17T10:02:30+08:00",
+        )
+        self.begin(state)
+
+        task_state.record_local_acceptance(
+            state, target_token="box_t1", artifact_name=first,
+            name=task_state.output_name(1, "box_t1"),
+            updated_at="2026-08-17T10:03:30+08:00",
+        )
+
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["status"], "accepted-local")
+        self.assertEqual(
+            [entry["outcome"] for entry in target["attempt_history"]],
+            ["accepted-local", "interrupted", "failed"],
+        )
+        self.assertEqual(target["local_acceptance"]["artifact_name"], first)
+
+    def test_revalidated_interrupted_candidate_is_eligible_for_selection(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        task_state.record_failure(
+            state, target_token="box_t1", error="first visual rejection",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+        self.begin(state)
+        interrupted = state["targets"]["box_t1"]["attempt_history"][-1][
+            "artifact_name"
+        ]
+        self.reconcile(
+            state, target_tokens=["box_t1"], outputs=[],
+            updated_at="2026-08-17T10:02:30+08:00",
+        )
+        self.begin(state)
+
+        task_state.record_local_acceptance(
+            state, target_token="box_t1", artifact_name=interrupted,
+            name=task_state.output_name(1, "box_t1"),
+            updated_at="2026-08-17T10:03:30+08:00",
+        )
+
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["status"], "accepted-local")
+        self.assertEqual(
+            [entry["outcome"] for entry in target["attempt_history"]],
+            ["failed", "accepted-local", "failed"],
+        )
+        self.assertEqual(target["local_acceptance"]["artifact_name"], interrupted)
+
+    def test_persisted_historical_selection_rejects_conflicting_later_outcomes(self) -> None:
+        for outcome in ("running", "accepted-local", "success"):
+            with self.subTest(outcome=outcome):
+                state, _first = self.make_first_of_three_locally_accepted()
+                later = state["targets"]["box_t1"]["attempt_history"][-1]
+                later["outcome"] = outcome
+                if outcome == "running":
+                    later["finished_at"] = None
+                    later["error"] = None
+                elif outcome == "accepted-local":
+                    later["error"] = None
+                else:
+                    later["error"] = None
+                    later["output"] = {
+                        "file_token": "box_conflict",
+                        "name": task_state.output_name(1, "box_t1"),
+                    }
+
+                self.assert_persisted_state_rejected_without_mutation(state)
+
+    def test_attempt_two_and_three_reject_ordered_reference_drift_without_mutation(self) -> None:
+        state = self.make_state(sources=["box_s1", "box_s2"])
+        expected_references = ["box_s1", "box_s2"]
+        self.begin(state, references=expected_references)
+        task_state.record_failure(
+            state, target_token="box_t1", error="first rejection",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+
+        before_second = json.loads(json.dumps(state))
+        with self.assertRaisesRegex(task_state.TaskStateError, "reference"):
+            self.begin(state, references=["box_s2", "box_s1"])
+        self.assertEqual(state, before_second)
+
+        self.begin(state, references=expected_references)
+        task_state.record_failure(
+            state, target_token="box_t1", error="second rejection",
+            updated_at="2026-08-17T10:02:30+08:00",
+        )
+        before_third = json.loads(json.dumps(state))
+        with self.assertRaisesRegex(task_state.TaskStateError, "reference"):
+            self.begin(state, references=["box_s2", "box_s1"])
+        self.assertEqual(state, before_third)
+        self.assertEqual(state["targets"]["box_t1"]["attempts"], 2)
+
+    def test_live_historical_selection_rejects_mismatched_ordered_references_without_mutation(self) -> None:
+        state = self.make_state(sources=["box_s1", "box_s2"])
+        references = ["box_s1", "box_s2"]
+        for attempt in range(2):
+            self.begin(state, references=references)
+            task_state.record_failure(
+                state, target_token="box_t1", error=f"rejection {attempt + 1}",
+                updated_at=f"2026-08-17T10:0{attempt + 1}:30+08:00",
+            )
+        self.begin(state, references=references)
+        target = state["targets"]["box_t1"]
+        selected = target["attempt_history"][0]
+        selected["reference_tokens"] = ["box_s2", "box_s1"]
+        before = json.loads(json.dumps(state))
+
+        with self.assertRaisesRegex(task_state.TaskStateError, "attempt history"):
+            task_state.record_local_acceptance(
+                state, target_token="box_t1",
+                artifact_name=selected["artifact_name"],
+                name=task_state.output_name(1, "box_t1"),
+                updated_at="2026-08-17T10:03:30+08:00",
+            )
+
+        self.assertEqual(state, before)
+
+    def test_persisted_historical_acceptance_and_success_reject_mismatched_ordered_references(self) -> None:
+        for terminal_status in ("accepted-local", "success"):
+            with self.subTest(terminal_status=terminal_status):
+                state = self.make_state(sources=["box_s1", "box_s2"])
+                references = ["box_s1", "box_s2"]
+                self.begin(state, references=references)
+                first = state["targets"]["box_t1"]["attempt_history"][-1][
+                    "artifact_name"
+                ]
+                task_state.record_failure(
+                    state, target_token="box_t1", error="first rejection",
+                    updated_at="2026-08-17T10:01:30+08:00",
+                )
+                self.begin(state, references=references)
+                task_state.record_failure(
+                    state, target_token="box_t1", error="second rejection",
+                    updated_at="2026-08-17T10:02:30+08:00",
+                )
+                self.begin(state, references=references)
+                task_state.record_local_acceptance(
+                    state, target_token="box_t1", artifact_name=first,
+                    name=task_state.output_name(1, "box_t1"),
+                    updated_at="2026-08-17T10:03:30+08:00",
+                )
+                if terminal_status == "success":
+                    task_state.record_success(
+                        state, target_token="box_t1", file_token="box_out",
+                        name=task_state.output_name(1, "box_t1"),
+                        updated_at="2026-08-17T10:04:00+08:00",
+                    )
+                state["targets"]["box_t1"]["attempt_history"][0][
+                    "reference_tokens"
+                ] = ["box_s2", "box_s1"]
+                serialized = json.dumps(state, sort_keys=True)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "state.json"
+                    path.write_text(serialized, encoding="utf-8")
+                    with self.assertRaisesRegex(task_state.TaskStateError, "attempt history"):
+                        task_state.load_state(path)
+                    self.assertEqual(path.read_text(encoding="utf-8"), serialized)
+
+    def test_new_retry_and_source_change_cycles_establish_new_ordered_references(self) -> None:
+        retry_state = self.make_state(sources=["box_s1", "box_s2"])
+        self.begin(retry_state, references=["box_s1", "box_s2"])
+        task_state.record_failure(
+            retry_state, target_token="box_t1", error="old retry cycle",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+        task_state.prepare_retry(
+            retry_state, updated_at="2026-08-17T11:00:00+08:00",
+        )
+        self.begin(retry_state, references=["box_s2", "box_s1"])
+        retry_cycle = retry_state["targets"]["box_t1"]["attempt_history"][-1]
+        self.assertEqual(retry_cycle["attempt"], 1)
+        self.assertEqual(retry_cycle["reference_tokens"], ["box_s2", "box_s1"])
+
+        source_state = self.make_state(sources=["box_s1", "box_s2"])
+        self.begin(source_state, references=["box_s1", "box_s2"])
+        task_state.record_failure(
+            source_state, target_token="box_t1", error="old source cycle",
+            updated_at="2026-08-17T10:01:30+08:00",
+        )
+        task_state.reconcile(
+            source_state, source_tokens=["box_s1", "box_s3"],
+            target_tokens=["box_t1"], outputs=[], run_id="run_2",
+            started_at="2026-08-17T12:00:00+08:00",
+            updated_at="2026-08-17T12:00:01+08:00",
+        )
+        self.begin(source_state, references=["box_s3", "box_s1"])
+        source_cycle = source_state["targets"]["box_t1"]["attempt_history"][-1]
+        self.assertEqual(source_cycle["attempt"], 1)
+        self.assertEqual(source_cycle["reference_tokens"], ["box_s3", "box_s1"])
+
+    def test_latest_selection_remains_readable_when_older_cycle_references_differ(self) -> None:
+        for terminal_status in ("accepted-local", "success"):
+            with self.subTest(terminal_status=terminal_status):
+                state = self.make_state(sources=["box_s1", "box_s2"])
+                references = ["box_s1", "box_s2"]
+                for attempt in range(2):
+                    self.begin(state, references=references)
+                    task_state.record_failure(
+                        state, target_token="box_t1",
+                        error=f"legacy rejection {attempt + 1}",
+                        updated_at=f"2026-08-17T10:0{attempt + 1}:30+08:00",
+                    )
+                self.begin(state, references=references)
+                self.accept_local(state)
+                if terminal_status == "success":
+                    task_state.record_success(
+                        state, target_token="box_t1", file_token="box_out",
+                        name=task_state.output_name(1, "box_t1"),
+                        updated_at="2026-08-17T10:04:00+08:00",
+                    )
+                state["targets"]["box_t1"]["attempt_history"][0][
+                    "reference_tokens"
+                ] = ["box_s2", "box_s1"]
+                state["targets"]["box_t1"]["attempt_history"][1][
+                    "reference_tokens"
+                ] = ["box_s2", "box_s1"]
+
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "state.json"
+                    path.write_text(json.dumps(state), encoding="utf-8")
+                    loaded = task_state.load_state(path)
+
+                self.assertEqual(loaded, state)
 
     def test_persisted_second_attempt_historical_success_is_rejected(self) -> None:
         state, _first = self.make_first_of_three_locally_accepted()
@@ -590,7 +839,58 @@ class TaskStateTest(unittest.TestCase):
         with self.assertRaisesRegex(task_state.TaskStateError, "target_tokens"):
             task_state.aggregate_status(empty)
 
-    def test_reconcile_conservatively_spends_an_unknown_final_attempt(self) -> None:
+    def test_restart_does_not_close_exhausted_selection_when_earlier_candidate_is_valid(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        first = state["targets"]["box_t1"]["attempt_history"][-1]
+        task_state.record_failure(
+            state, target_token="box_t1", error="first visual rejection",
+            updated_at="2026-08-15T10:01:30+08:00",
+        )
+        self.begin(state)
+        task_state.record_failure(
+            state, target_token="box_t1", error="second visual rejection",
+            updated_at="2026-08-15T10:02:30+08:00",
+        )
+        self.begin(state)
+
+        task_state.reconcile(
+            state, source_tokens=["box_s1"], target_tokens=["box_t1"],
+            outputs=[], run_id="run_2",
+            started_at="2026-08-15T11:00:00+08:00",
+            updated_at="2026-08-15T11:00:01+08:00",
+            resumable_artifacts=[{
+                "run_id": first["run_id"],
+                "artifact_name": first["artifact_name"],
+            }],
+        )
+
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["status"], "running")
+        self.assertEqual(state["current_target"], "box_t1")
+        self.assertEqual(target["attempts"], 3)
+        self.assertEqual(
+            [entry["outcome"] for entry in target["attempt_history"]],
+            ["failed", "failed", "running"],
+        )
+        self.assertEqual(task_state.pending_targets(state), [])
+
+        task_state.record_local_acceptance(
+            state, target_token="box_t1", artifact_name=first["artifact_name"],
+            name=task_state.output_name(1, "box_t1"),
+            updated_at="2026-08-15T11:01:00+08:00",
+        )
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["status"], "accepted-local")
+        self.assertEqual(
+            target["local_acceptance"]["artifact_name"], first["artifact_name"],
+        )
+        self.assertEqual(
+            [entry["outcome"] for entry in target["attempt_history"]],
+            ["accepted-local", "failed", "failed"],
+        )
+
+    def test_restart_without_candidates_keeps_checkpoint_until_external_call(self) -> None:
         state = self.make_state()
         for attempt in range(2):
             self.begin(state)
@@ -609,14 +909,70 @@ class TaskStateTest(unittest.TestCase):
             state, target_tokens=["box_t1"], outputs=[],
             updated_at="2026-08-15T10:03:00+08:00",
         )
+        checkpoint = json.loads(json.dumps(state))
+        self.reconcile(
+            state, target_tokens=["box_t1"], outputs=[],
+            updated_at="2026-08-15T10:03:00+08:00",
+        )
+        self.assertEqual(state, checkpoint)
         self.assertEqual(
             (state["targets"]["box_t1"]["status"],
              state["targets"]["box_t1"]["attempts"]),
-            ("failed", 3),
+            ("running", 3),
         )
         self.assertEqual(task_state.pending_targets(state), [])
         with self.assertRaisesRegex(task_state.TaskStateError, "exhausted"):
             self.begin(state)
+
+        task_state.record_error(
+            state, code="external-call", error="no valid current-cycle candidate",
+            updated_at="2026-08-15T10:04:00+08:00",
+        )
+        target = state["targets"]["box_t1"]
+        self.assertEqual(target["status"], "failed")
+        self.assertEqual(target["attempt_history"][-1]["outcome"], "failed")
+        self.assertEqual(state["record_error"], {
+            "code": "external-call",
+            "message": "no valid current-cycle candidate",
+            "updated_at": "2026-08-15T10:04:00+08:00",
+        })
+        self.assertIsNone(state["current_target"])
+
+    def test_restart_does_not_close_legacy_exhausted_selection_checkpoint(self) -> None:
+        for attempts in (4, 5):
+            with self.subTest(attempts=attempts):
+                state = self.make_state()
+                history = self.legacy_finished_history(attempts, outcome="failed")
+                history[-1].update({
+                    "outcome": "running", "finished_at": None,
+                    "error": None, "output": None,
+                })
+                target = state["targets"]["box_t1"]
+                target.update({
+                    "status": "running", "classification": "front",
+                    "reference_tokens": ["box_s1"], "attempts": attempts,
+                    "prompt_sha256": history[-1]["prompt_sha256"],
+                    "model": "image-model", "error": None,
+                    "updated_at": history[-1]["started_at"],
+                    "attempt_history": history,
+                })
+                state["current_target"] = "box_t1"
+
+                self.reconcile(
+                    state, target_tokens=["box_t1"], outputs=[],
+                    updated_at="2026-08-17T11:00:01+08:00",
+                )
+
+                target = state["targets"]["box_t1"]
+                self.assertEqual(target["status"], "running")
+                self.assertEqual(state["current_target"], "box_t1")
+                self.assertEqual(target["attempts"], attempts)
+                self.assertEqual(len(target["attempt_history"]), attempts)
+                self.assertEqual(target["attempt_history"][-1]["outcome"], "running")
+                with self.assertRaisesRegex(
+                        task_state.TaskStateError, "exhausted|not pending",
+                ):
+                    self.begin(state)
 
     def test_interrupted_attempt_gets_a_new_immutable_artifact_identity(self) -> None:
         state = self.make_state()

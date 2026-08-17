@@ -83,6 +83,8 @@ After the third initiated call, compare every complete decodable candidate from 
 
 Promote the selected artifact and pass its artifact name to `scripts/task_state.py accept-local`; this may select an earlier eligible artifact while attempt three remains active. If the third artifact is invalid but an earlier eligible candidate exists, select the best earlier candidate. If no complete decodable candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` directly while attempt three is active, mark the record failed when Base remains writable, and stop the run without exposing another pending attempt.
 
+On restart, if attempt three or a readable legacy attempt four/five remains active but its artifact is absent, incomplete, corrupt, or undecodable, reconciliation preserves a non-callable final-selection checkpoint without another `attempt`. From that checkpoint, choose an existing revalidated current-cycle candidate with `accept-local`; if none exists, call `record-error --code external-call` directly. Never call `failure`, `retry`, or `attempt` from this exhausted checkpoint.
+
 ### External call failure
 
 A Doubao tool/API failure during attempt one or two uses the generation retry rule above. Upload and critical Base-write/readback failures stop the entire run immediately, are not generation retries, and mark the current record `失败` when Base remains writable. Persist an already-inspected bitmap with `accept-local` before upload; after restart, reconcile its validated identity and drain `scripts/task_state.py uploads` before calibration or generation. If Feishu cannot be updated, retain local artifacts and manifest state for recovery and leave later records untouched.
