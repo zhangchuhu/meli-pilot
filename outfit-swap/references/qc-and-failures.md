@@ -24,7 +24,7 @@ For every initialized record, run `scripts/image_qc.py empty-contact-sheet` to c
 4. Process every other pending target serially in original attachment order.
 5. If no pending ordinary target remains, skip calibration and process any pending details, flat lays, or infographics serially. This includes retries where an earlier ordinary calibration target is already a valid current success.
 
-Every target has five attempts in the current source identity and explicit retry cycle: one initial edit plus at most four one-change corrections. A user-authorized later `--retry-failed` cycle starts a fresh budget for current non-success targets. Inspect attempts one through four and apply the normal rejection conditions. For attempt five, accept the fifth complete decodable bitmap after `scripts/image_qc.py` validation and continue through promotion, durable local acceptance, upload, and success. Do not apply visual rejection conditions to attempt five. A missing, incomplete, corrupt, or undecodable fifth artifact is not eligible for forced acceptance and follows the external-call or record-data failure contract.
+Every target has three initiated calls in the current source identity and explicit retry cycle: one initial call plus at most two retries. A user-authorized later `--retry-failed` cycle starts a fresh budget for current non-success targets. Attempts one and two use the normal full-QC rejection conditions. When either passes, stop immediately after an early full-QC pass, then promote, durably accept, upload, and mark that artifact successful. For a visual rejection on attempt one or two, retain the immutable artifact, call `failure --error-file`, add one targeted correction, and retry the same target. For a command failure or absent, incomplete, corrupt, or undecodable artifact on attempt one or two, call `failure --error-file` and retry the same target with no visual prompt correction. After attempt three, use the third-attempt garment-best selection below.
 
 ## Rejection conditions
 
@@ -40,7 +40,7 @@ Reject an output when any of these occur:
 - a multi-model grid changes only one cell when all clothing instances were required to change
 - visible text or infographic layout changes materially
 
-Record each attempt through `scripts/task_state.py`. For attempts one through four, accept only after direct inspection confirms both garment fidelity and all target-preservation invariants. Attempt five uses the forced-acceptance rule above.
+Record each attempt through `scripts/task_state.py`. For attempts one and two, accept only after direct inspection confirms both garment fidelity and all target-preservation invariants. After attempt three, compare every complete decodable candidate from the current cycle; the selected candidate may be earlier than the third artifact.
 
 ## Failure classes
 
@@ -70,10 +70,18 @@ Missing source/target attachments, a corrupt image, or invalid image constraints
 
 Persist the `record-error` state, compact and summarize it, and write terminal `任务状态: 失败` plus `处理明细` before continuing, even when current targets remain pending. This terminal Base write is required for every record-level stop.
 
-### Fifth-attempt forced acceptance
+### Third-attempt garment-best selection
 
-Visual rejection cannot exhaust calibration or a later target: when attempts one through four are rejected, generate attempt five with the latest one-change correction and accept its complete decodable bitmap directly. Continue the record after its upload succeeds. Only a missing, incomplete, corrupt, or undecodable fifth artifact can prevent this forced acceptance, and it follows the applicable external-call or record-data failure rule.
+After the third initiated call, compare every complete decodable candidate from the contiguous current three-attempt cycle against the ordered garment references. Exclude missing, partial, corrupt, and undecodable artifacts. Rank valid candidates by direct comparative inspection, in this order:
+
+1. garment construction and silhouette;
+2. color and material appearance;
+3. closures, seams, trim, decoration, logos, and other visible garment details;
+4. when garment similarity is tied, preservation of the target person, pose, crop, composition, accessories, background, lighting, and text/layout;
+5. when the visual result is still tied, choose the earlier attempt.
+
+Promote the selected artifact and pass its artifact name to `scripts/task_state.py accept-local`; this may select an earlier valid artifact while attempt three remains active. If the third artifact is invalid but an earlier valid candidate exists, select the best earlier candidate. If no complete decodable candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` directly while attempt three is active, mark the record failed when Base remains writable, and stop the run without exposing another pending attempt.
 
 ### External call failure
 
-A Doubao tool/API failure, attachment-upload failure, or critical Base-write failure stops the entire run immediately. Mark the current record `失败` when Base remains writable. Persist an already-inspected bitmap with `accept-local` before upload; after restart, reconcile its validated identity and drain `scripts/task_state.py uploads` before calibration or generation. If Feishu cannot be updated, retain local artifacts and manifest state for recovery and leave later records untouched.
+A Doubao tool/API failure during attempt one or two uses the generation retry rule above. Upload and critical Base-write/readback failures stop the entire run immediately, are not generation retries, and mark the current record `失败` when Base remains writable. Persist an already-inspected bitmap with `accept-local` before upload; after restart, reconcile its validated identity and drain `scripts/task_state.py uploads` before calibration or generation. If Feishu cannot be updated, retain local artifacts and manifest state for recovery and leave later records untouched.

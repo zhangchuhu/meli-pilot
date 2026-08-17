@@ -204,19 +204,44 @@ class SkillContractTest(unittest.TestCase):
             self.skill,
         )
 
-    def test_retry_calibration_and_attempt_artifacts_are_unambiguous(self) -> None:
+    def test_three_attempt_early_pass_and_garment_best_fallback_contract(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        edit = self.references["edit-prompt.md"]
+        runtime_markdown = "\n".join([self.skill, *self.references.values()]).lower()
+        self.assertIn("one initial call plus at most two retries", qc)
+        self.assertIn("stop immediately after an early full-QC pass", qc)
+        self.assertIn("compare every complete decodable candidate", qc)
+        self.assertIn("garment construction and silhouette", qc)
+        self.assertIn("accept-local", qc)
+        self.assertIn("Reuse the same prompt and ordered references", edit)
+        for obsolete in ("five attempts", "attempt five", "fifth bitmap"):
+            self.assertNotIn(obsolete, runtime_markdown)
+
+    def test_generation_failures_retry_but_upload_and_base_failures_stop(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        base = self.references["base-contract.md"]
+        self.assertIn("attempt one or two", qc)
+        self.assertIn("retry the same target", qc)
+        self.assertIn("no visual prompt correction", qc)
+        self.assertIn("Upload and critical Base-write/readback failures", qc)
+        self.assertIn("stop immediately", base)
+
+    def test_calibration_and_attempt_artifacts_remain_unambiguous(self) -> None:
         qc = self.references["qc-and-failures.md"]
         edit = self.references["edit-prompt.md"]
         self.assertIn("first pending ordinary single-model target", qc)
         self.assertIn("If no pending ordinary target remains, skip calibration", qc)
-        self.assertIn("attempt-<ordered-index>-<target-token-digest>-<artifact-ordinal>.png", edit)
-        self.assertIn("monotonic artifact ordinal is independent of the five-attempt budget", edit)
+        self.assertIn(
+            "attempt-<ordered-index>-<target-token-digest>-<artifact-ordinal>.png",
+            edit,
+        )
+        self.assertIn(
+            "monotonic artifact ordinal is independent of that three-call budget",
+            edit,
+        )
         self.assertIn("`-06.png` and higher", edit)
         self.assertIn("Never pass the deterministic `look-…png` path to Doubao", edit)
         self.assertIn("scripts/image_qc.py promote-output", edit)
-        self.assertIn("five attempts", qc)
-        self.assertIn("accept the fifth complete decodable bitmap", qc)
-        self.assertIn("Do not apply visual rejection conditions to attempt five", qc)
 
     def test_paid_artifacts_and_pending_uploads_resume_before_generation(self) -> None:
         self.assertIn("--resumable-artifacts-json", self.skill)
@@ -343,7 +368,7 @@ class SkillContractTest(unittest.TestCase):
         for failure_class in (
             "Global preflight failure",
             "Record data failure",
-            "Fifth-attempt forced acceptance",
+            "Third-attempt garment-best selection",
             "External call failure",
         ):
             self.assertIn(failure_class, qc)

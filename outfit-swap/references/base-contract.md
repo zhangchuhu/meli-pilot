@@ -81,7 +81,7 @@ After all current targets reach a terminal state or record processing stops earl
 {"update_records":{"<record-id>":{"任务状态":["成功"],"处理明细":"<compact-json>"}}}
 ```
 
-Failure uses the same shape with `["失败"]`. Batch updates may contain at most 200 record entries, although this workflow writes one current record at a time. Read the record back after each critical detail/status write; on mismatch or write failure, stop under the external-call policy rather than generating further images.
+Failure uses the same shape with `["失败"]`. Batch updates may contain at most 200 record entries, although this workflow writes one current record at a time. Read the record back after each critical detail/status write; on mismatch or write failure, stop immediately under the external-call policy rather than generating further images. Upload and critical Base-write/readback failures are immediate stops, not generation retries.
 
 ## Compact processing detail
 
