@@ -56,9 +56,10 @@ Use only this exact record-error mapping. Put the sanitized diagnostic in a loca
 | decodable `原图` violates image constraints | `record-error` | `invalid-source` |
 | decodable `爆款图` violates image constraints | `record-error` | `invalid-target` |
 | other record-scoped data fault whose role cannot be attributed | `record-error` | `record-data` |
-| Doubao, upload, or critical Base-write failure while local state is writable | `record-error` | `external-call` |
+| attempt three has no complete decodable current-cycle candidate | `record-error` | `external-call` |
+| attachment upload or critical Base-write/readback failure | `record-error` | `external-call` |
 
-These are the only record-error codes. A rejected target attempt uses `failure`, not a record error.
+These are the only record-error codes. A Doubao failure on attempt one or two never uses `record-error`; use `failure --error-file`, retry the same target, and add no visual prompt correction. A rejected target attempt likewise uses `failure`, not a record error. Only a third attempt with no complete decodable current-cycle candidate becomes a generation-related `record-error --code external-call`; upload and critical Base-write/readback failures use that code immediately.
 
 ### Global preflight failure
 

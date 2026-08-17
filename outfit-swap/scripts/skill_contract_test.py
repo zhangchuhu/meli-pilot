@@ -226,6 +226,29 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("Upload and critical Base-write/readback failures", qc)
         self.assertIn("stop immediately", base)
 
+    def test_record_error_table_excludes_retryable_doubao_failures(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        self.assertIn(
+            "| attempt three has no complete decodable current-cycle candidate "
+            "| `record-error` | `external-call` |",
+            qc,
+        )
+        self.assertIn(
+            "| attachment upload or critical Base-write/readback failure "
+            "| `record-error` | `external-call` |",
+            qc,
+        )
+        self.assertNotIn(
+            "| Doubao, upload, or critical Base-write failure while local state "
+            "is writable |",
+            qc,
+        )
+        self.assertIn(
+            "A Doubao failure on attempt one or two never uses `record-error`; "
+            "use `failure --error-file`",
+            qc,
+        )
+
     def test_calibration_and_attempt_artifacts_remain_unambiguous(self) -> None:
         qc = self.references["qc-and-failures.md"]
         edit = self.references["edit-prompt.md"]
