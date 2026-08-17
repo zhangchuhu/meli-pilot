@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import sys
 import tempfile
@@ -51,6 +52,28 @@ class TaskStateTest(unittest.TestCase):
             name=task_state.output_name(state["target_tokens"].index(token) + 1, token),
             updated_at="2026-08-15T10:01:30+08:00",
         )
+
+    def legacy_finished_history(self, count: int, outcome: str) -> list[dict]:
+        entries = []
+        for number in range(1, count + 1):
+            prompt = f"legacy prompt {number}"
+            entries.append({
+                "attempt": number,
+                "artifact_ordinal": number,
+                "artifact_name": task_state.attempt_output_name(1, "box_t1", number),
+                "run_id": "run_1",
+                "classification": "front",
+                "reference_tokens": ["box_s1"],
+                "prompt": prompt,
+                "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+                "model": "image-model",
+                "started_at": f"2026-08-16T10:0{number}:00+08:00",
+                "finished_at": f"2026-08-16T10:0{number}:30+08:00",
+                "outcome": outcome,
+                "error": "legacy rejection" if outcome == "failed" else None,
+                "output": None,
+            })
+        return entries
 
     def test_output_name_is_stable_and_indexed(self) -> None:
         self.assertEqual(
@@ -164,23 +187,57 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(task_state.pending_targets(state), [])
         task_state.compact_detail(state)
 
-    def test_five_attempts_make_target_terminal_failed(self) -> None:
+    def test_three_attempts_make_target_terminal_failed(self) -> None:
         state = self.make_state()
-        for attempt in range(4):
+        for attempt in range(2):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
-                updated_at="2026-08-15T10:02:00+08:00",
+                updated_at="2026-08-17T10:02:00+08:00",
             )
             self.assertEqual(state["targets"]["box_t1"]["status"], "pending")
         self.begin(state)
         task_state.record_failure(
-            state, target_token="box_t1", error="failure 4",
-            updated_at="2026-08-15T10:02:00+08:00",
+            state, target_token="box_t1", error="failure 2",
+            updated_at="2026-08-17T10:03:00+08:00",
         )
+        self.assertEqual(state["targets"]["box_t1"]["attempts"], 3)
         self.assertEqual(state["targets"]["box_t1"]["status"], "failed")
-        with self.assertRaises(task_state.TaskStateError):
+        with self.assertRaisesRegex(task_state.TaskStateError, "exhausted"):
             self.begin(state)
+
+    def test_load_preserves_legacy_success_with_five_attempts(self) -> None:
+        state = self.make_state()
+        target = state["targets"]["box_t1"]
+        target["attempts"] = 5
+        target["status"] = "success"
+        target["output"] = {
+            "file_token": "box_out", "name": task_state.output_name(1, "box_t1"),
+        }
+        target["attempt_history"] = self.legacy_finished_history(5, outcome="failed")
+        target["attempt_history"][-1]["outcome"] = "success"
+        target["attempt_history"][-1]["error"] = None
+        target["attempt_history"][-1]["output"] = target["output"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            loaded = task_state.load_state(path)
+        self.assertEqual(loaded["targets"]["box_t1"]["status"], "success")
+        self.assertEqual(loaded["targets"]["box_t1"]["attempts"], 5)
+
+    def test_load_terminalizes_legacy_pending_without_new_call(self) -> None:
+        state = self.make_state()
+        target = state["targets"]["box_t1"]
+        target["attempts"] = 4
+        target["status"] = "pending"
+        target["attempt_history"] = self.legacy_finished_history(4, outcome="failed")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(state), encoding="utf-8")
+            loaded = task_state.load_state(path)
+        self.assertEqual(loaded["targets"]["box_t1"]["status"], "failed")
+        with self.assertRaisesRegex(task_state.TaskStateError, "not pending"):
+            self.begin(loaded)
 
     def test_begin_attempt_requires_pending_and_known_classification(self) -> None:
         state = self.make_state()
@@ -262,7 +319,7 @@ class TaskStateTest(unittest.TestCase):
 
     def test_terminal_failure_cannot_be_changed_to_success(self) -> None:
         state = self.make_state()
-        for attempt in range(5):
+        for attempt in range(3):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -302,9 +359,9 @@ class TaskStateTest(unittest.TestCase):
         with self.assertRaisesRegex(task_state.TaskStateError, "target_tokens"):
             task_state.aggregate_status(empty)
 
-    def test_reconcile_conservatively_spends_an_unknown_fifth_attempt(self) -> None:
+    def test_reconcile_conservatively_spends_an_unknown_final_attempt(self) -> None:
         state = self.make_state()
-        for attempt in range(4):
+        for attempt in range(2):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -314,7 +371,7 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(
             (state["targets"]["box_t1"]["status"],
              state["targets"]["box_t1"]["attempts"]),
-            ("running", 5),
+            ("running", 3),
         )
 
         self.reconcile(
@@ -324,10 +381,10 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(
             (state["targets"]["box_t1"]["status"],
              state["targets"]["box_t1"]["attempts"]),
-            ("failed", 5),
+            ("failed", 3),
         )
         self.assertEqual(task_state.pending_targets(state), [])
-        with self.assertRaisesRegex(task_state.TaskStateError, "not pending"):
+        with self.assertRaisesRegex(task_state.TaskStateError, "exhausted"):
             self.begin(state)
 
     def test_interrupted_attempt_gets_a_new_immutable_artifact_identity(self) -> None:
@@ -573,7 +630,7 @@ class TaskStateTest(unittest.TestCase):
 
     def test_terminal_failed_target_is_not_retryable_pending(self) -> None:
         state = self.make_state()
-        for attempt in range(5):
+        for attempt in range(3):
             self.begin(state)
             task_state.record_failure(
                 state, target_token="box_t1", error=f"failure {attempt}",
@@ -592,7 +649,7 @@ class TaskStateTest(unittest.TestCase):
             updated_at="2026-08-15T10:02:00+08:00",
         )
         for token in ("box_t2", "box_t3"):
-            for attempt in range(5):
+            for attempt in range(3):
                 self.begin(state, token)
                 task_state.record_failure(
                     state, target_token=token, error=f"{token} failure {attempt}",

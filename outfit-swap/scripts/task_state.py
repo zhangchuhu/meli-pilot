@@ -14,7 +14,8 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 2
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 3
+MAX_RECORDED_ATTEMPT = 5
 CLASSIFICATIONS = frozenset({
     "front",
     "front three-quarter",
@@ -372,7 +373,7 @@ def _validate_state(state: Any) -> dict[str, Any]:
                 or not isinstance(target["reference_tokens"], list)
                 or not isinstance(target["attempts"], int)
                 or isinstance(target["attempts"], bool)
-                or not 0 <= target["attempts"] <= MAX_ATTEMPTS
+                or not 0 <= target["attempts"] <= MAX_RECORDED_ATTEMPT
                 or not isinstance(target["updated_at"], str) or not target["updated_at"]
                 or not isinstance(target["stale_output_tokens"], list)
                 or not all(isinstance(item, str) and item
@@ -431,7 +432,7 @@ def _validate_state(state: Any) -> dict[str, Any]:
             ordinal = entry.get("artifact_ordinal")
             if (not isinstance(entry.get("attempt"), int)
                     or isinstance(entry.get("attempt"), bool)
-                    or not 1 <= entry["attempt"] <= MAX_ATTEMPTS
+                    or not 1 <= entry["attempt"] <= MAX_RECORDED_ATTEMPT
                     or not isinstance(ordinal, int) or isinstance(ordinal, bool)
                     or ordinal <= 0
                     or not _attempt_name_matches_target(
@@ -467,7 +468,7 @@ def _validate_state(state: Any) -> dict[str, Any]:
                 or target["attempt_history"][-1] is not active_history[0]):
             raise TaskStateError(f"running target has invalid attempt history: {token}")
         if target["status"] == "running" and (
-                not 1 <= target["attempts"] <= MAX_ATTEMPTS
+                not 1 <= target["attempts"] <= MAX_RECORDED_ATTEMPT
                 or active_history[0]["attempt"] != target["attempts"]):
             raise TaskStateError(f"running attempt does not match budget: {token}")
         if target["status"] != "running" and active_history:
@@ -589,11 +590,23 @@ def _migrate_v1_state(value: Any) -> Any:
     return state
 
 
+def _normalize_legacy_budget(state: dict[str, Any]) -> dict[str, Any]:
+    """Terminalize pending legacy work that has exceeded the active budget."""
+    for target in state["targets"].values():
+        if (target["status"] == "pending"
+                and target["attempts"] >= MAX_ATTEMPTS):
+            target["status"] = "failed"
+            target["error"] = "legacy attempt budget exceeds current three-call limit"
+    return state
+
+
 def load_state(path: str | Path) -> dict[str, Any]:
     """Load and validate a persisted state file."""
     try:
         with Path(path).open(encoding="utf-8") as handle:
-            return _validate_state(_migrate_v1_state(json.load(handle)))
+            state = _validate_state(_migrate_v1_state(json.load(handle)))
+        state = _normalize_legacy_budget(state)
+        return _validate_state(state)
     except (OSError, json.JSONDecodeError) as error:
         raise TaskStateError(f"cannot load state: {error}") from error
 
@@ -882,6 +895,8 @@ def begin_attempt(state: dict[str, Any], *, target_token: str, classification: s
     """Start an attempt, recording only the prompt digest in persistent state."""
     _validate_state(state)
     target = _require_target(state, target_token)
+    if target["attempts"] == MAX_ATTEMPTS:
+        raise TaskStateError(f"target has exhausted attempts: {target_token}")
     if target["status"] != "pending":
         raise TaskStateError(f"target is not pending: {target_token}")
     if state["current_target"] is not None:
@@ -978,7 +993,7 @@ def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
     target = _require_target(state, target_token)
     if target["status"] != "accepted-local" or target["local_acceptance"] is None:
         raise TaskStateError(f"target has no durable local acceptance: {target_token}")
-    if not 1 <= target["attempts"] <= MAX_ATTEMPTS:
+    if not 1 <= target["attempts"] <= MAX_RECORDED_ATTEMPT:
         raise TaskStateError(f"target has no accepted attempt: {target_token}")
     if not isinstance(file_token, str) or not file_token:
         raise TaskStateError("file_token must not be empty")
@@ -1015,12 +1030,12 @@ def record_failure(state: dict[str, Any], *, target_token: str, error: str,
     target = _require_target(state, target_token)
     if target["status"] != "running":
         raise TaskStateError(f"target attempt is not running: {target_token}")
-    if not 1 <= target["attempts"] <= MAX_ATTEMPTS:
+    if not 1 <= target["attempts"] <= MAX_RECORDED_ATTEMPT:
         raise TaskStateError(f"target has no active attempt: {target_token}")
     concise_error = _sanitize_error(error)
     updated_at = _nonempty_string(updated_at, "updated_at")
     target["status"] = (
-        "failed" if target["attempts"] == MAX_ATTEMPTS else "pending"
+        "failed" if target["attempts"] >= MAX_ATTEMPTS else "pending"
     )
     target["error"] = concise_error
     target["updated_at"] = updated_at
