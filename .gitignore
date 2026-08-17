@@ -1,3 +1,4 @@
 *.pyc
 outfit-swap/.runtime/
 outfit-swap/docs/superpowers/plans/2026-08-16-content-driven-image-validation.md
+.idea/misc.xml
