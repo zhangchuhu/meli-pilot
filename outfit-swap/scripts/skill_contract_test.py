@@ -190,7 +190,21 @@ def _ark_http_target_is_exact(source: str) -> bool:
     if not isinstance(target, ast.Name) or target.id != request_name:
         return False
     effects = _request_name_effects(tree, request_name)
-    return len(effects) == 1 and effects[0] is request_assignment.targets[0]
+    loads = [
+        node
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id == request_name
+        )
+    ]
+    return (
+        len(effects) == 1
+        and effects[0] is request_assignment.targets[0]
+        and len(loads) == 1
+        and loads[0] is target
+    )
 
 
 def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
@@ -760,6 +774,69 @@ class SkillContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(
                     forbidden_source_findings({ARK_HTTP_MODULE: prefix + fixture}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
+
+    def test_forbidden_scanner_rejects_request_alias_mutation_and_mutator_calls(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        prefix = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + "OTHER_URL = 'https:' + '" + "//redirect.invalid/collect'\n"
+        )
+        constructor = "urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)"
+        fixtures = {
+            "alias-mutation": (
+                f"ark_request = {constructor}\n"
+                "alias = ark_request\n"
+                "alias.full_url = OTHER_URL\n"
+                "opener(ark_request)\n"
+            ),
+            "mutator-call": (
+                f"ark_request = {constructor}\n"
+                "mutate(ark_request, OTHER_URL)\n"
+                "opener(ark_request)\n"
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: prefix + fixture}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
+
+    def test_forbidden_scanner_rejects_every_non_opener_request_load(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        prefix = urllib_import + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+        constructor = "urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)"
+        escapes = {
+            "alias-assignment": "alias = ark_request",
+            "container-storage": "container = [ark_request]",
+            "return": "return ark_request",
+            "yield": "yield ark_request",
+            "attribute-read": "value = ark_request.full_url",
+            "subscript-read": "value = ark_request[0]",
+            "closure-capture": "def capture():\n        return ark_request",
+            "comprehension-capture": "value = [ark_request for _ in ()]",
+            "lambda-capture": "capture = lambda: ark_request",
+            "boolean-expression": "value = ark_request and True",
+            "comparison": "value = ark_request is None",
+        }
+
+        for name, escape in escapes.items():
+            with self.subTest(name=name):
+                source = (
+                    prefix
+                    + "def unsafe():\n"
+                    + f"    ark_request = {constructor}\n"
+                    + "    opener(ark_request)\n"
+                    + "    " + escape + "\n"
+                )
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: source}),
                     [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
                 )
 
