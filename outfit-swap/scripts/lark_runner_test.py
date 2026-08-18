@@ -60,7 +60,10 @@ class LarkBaseClientTest(unittest.TestCase):
         candidate.write_bytes(b"candidate")
         payload.write_text('{"update_records":{"rec123":{}}}', encoding="utf-8")
         filter_payload = self.task_dir / "status-filter.json"
-        filter_payload.write_text('{"logic":"and","conditions":[]}', encoding="utf-8")
+        filter_payload.write_text(
+            '{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]]}',
+            encoding="utf-8",
+        )
 
         self.assertEqual(
             self.client.upload_attachment(
@@ -182,6 +185,54 @@ class LarkBaseClientTest(unittest.TestCase):
                 payload=Path("update.json"),
             )
         self.assertFalse(self.trace.exists())
+
+    def test_list_rejects_filter_outside_the_selected_status_scope(self) -> None:
+        """Fails if a listing can include records outside pending or retry-failed scope."""
+        invalid_filters = [
+            '{"logic":"and","conditions":[]}',
+            '{"logic":"and","conditions":[["任务状态","intersects",["成功"]]]}',
+            ('{"logic":"and","conditions":[["任务状态","intersects",["未开始"]],'
+             '["任务状态","intersects",["失败"]]]}'),
+            '{"logic":"and","conditions":[["错误字段","intersects",["未开始"]]]}',
+            '{"logic":"and","conditions":[["任务状态","intersects",["未开始","失败"]]]}',
+            ('{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]],'
+             '"conditions":[["任务状态","intersects",["未开始"]]]}'),
+        ]
+        filter_payload = self.task_dir / "status-filter.json"
+        for contents in invalid_filters:
+            with self.subTest(contents=contents):
+                filter_payload.write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(LarkRunnerError, "record list filter is invalid"):
+                    self.client.list_records(
+                        app_token="app-token", table_id="tbl123", field_ids=["fld-status"],
+                        filter_payload=Path("status-filter.json"), output=Path("records.ndjson"),
+                    )
+        self.assertFalse(self.trace.exists())
+
+    def test_list_accepts_only_the_status_filter_matching_explicit_retry_intent(self) -> None:
+        """Fails if retry-failed intent can use the pending status filter or vice versa."""
+        filter_payload = self.task_dir / "status-filter.json"
+        filter_payload.write_text(
+            '{"logic":"and","conditions":[["任务状态","intersects",["失败"]]]}',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(LarkRunnerError, "record list filter is invalid"):
+            self.client.list_records(
+                app_token="app-token", table_id="tbl123", field_ids=["fld-status"],
+                filter_payload=Path("status-filter.json"), output=Path("records.ndjson"),
+            )
+        self.assertEqual(
+            self.client.list_records(
+                app_token="app-token", table_id="tbl123", field_ids=["fld-status"],
+                filter_payload=Path("status-filter.json"), output=Path("records.ndjson"),
+                retry_failed=True,
+            ),
+            self.task_dir.resolve() / "records.ndjson",
+        )
+        argv = self._calls()[0]["argv"]
+        self.assertIn("@./status-filter.json", argv)
+        self.assertEqual(argv[-4:], ["./records.ndjson", "--minimal-stdout", "--as", "user"])
 
     def test_timeout_failure_has_no_exception_chain_or_sensitive_formatting(self) -> None:
         """Fails if a timeout retains subprocess argv through an exception chain."""

@@ -38,11 +38,12 @@ class LarkBaseClient:
     def list_records(
             self, *, app_token: str, table_id: str, field_ids: Sequence[str],
             filter_payload: Path, output: Path, limit: int = 2000, offset: int = 0,
-            view_id: str | None = None,
+            view_id: str | None = None, retry_failed: bool = False,
     ) -> Path:
         """Write one NDJSON record listing to a new task-local artifact."""
+        filter_path, filter_arg = self._input_path(filter_payload)
+        self._validate_status_filter(filter_path, retry_failed=retry_failed)
         output_path, output_arg = self._output_path(output)
-        _filter_path, filter_arg = self._input_path(filter_payload)
         command = [
             "base", "+record-list", "--base-token", self._required(app_token, "app token"),
             "--table-id", self._required(table_id, "table ID"),
@@ -209,3 +210,35 @@ class LarkBaseClient:
             invalid_payload = True
         if invalid_payload:
             raise LarkRunnerError("record update payload is invalid")
+
+    @staticmethod
+    def _validate_status_filter(filter_payload: Path, *, retry_failed: bool) -> None:
+        if not isinstance(retry_failed, bool):
+            raise LarkRunnerError("record list retry intent is invalid")
+        invalid_filter = False
+        try:
+            decoded = json.loads(
+                filter_payload.read_text(encoding="utf-8"),
+                object_pairs_hook=LarkBaseClient._unique_object,
+            )
+        except (OSError, UnicodeError, ValueError):
+            invalid_filter = True
+            decoded = None
+        expected_status = "失败" if retry_failed else "未开始"
+        expected_filter = {
+            "logic": "and",
+            "conditions": [["任务状态", "intersects", [expected_status]]],
+        }
+        if decoded != expected_filter:
+            invalid_filter = True
+        if invalid_filter:
+            raise LarkRunnerError("record list filter is invalid")
+
+    @staticmethod
+    def _unique_object(pairs: list[tuple[object, object]]) -> dict[object, object]:
+        decoded: dict[object, object] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError("duplicate JSON key")
+            decoded[key] = value
+        return decoded
