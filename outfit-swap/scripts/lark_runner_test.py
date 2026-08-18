@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import traceback
 import unittest
 from pathlib import Path
 
@@ -25,13 +26,16 @@ class LarkBaseClientTest(unittest.TestCase):
             "trace = pathlib.Path(os.environ['LARK_TEST_TRACE'])\n"
             "trace.open('a', encoding='utf-8').write(json.dumps(\n"
             "    {'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n"
+            "if os.environ.get('LARK_TEST_TIMEOUT') == '1':\n"
+            "    import time\n"
+            "    time.sleep(1)\n"
             "if os.environ.get('LARK_TEST_FAIL') == '1':\n"
             "    print(os.environ['LARK_TEST_SECRET'], file=sys.stderr)\n"
             "    raise SystemExit(7)\n"
             "for flag in ('--output',):\n"
             "    if flag in sys.argv:\n"
             "        pathlib.Path(sys.argv[sys.argv.index(flag) + 1].lstrip('@')).write_text('artifact')\n"
-            "print(json.dumps({'ok': True}))\n",
+            "print(os.environ.get('LARK_TEST_STDOUT', json.dumps({'ok': True})))\n",
             encoding="utf-8",
         )
         self.executable.chmod(0o755)
@@ -54,13 +58,23 @@ class LarkBaseClientTest(unittest.TestCase):
         candidate = self.task_dir / "candidate.png"
         payload = self.task_dir / "update.json"
         candidate.write_bytes(b"candidate")
-        payload.write_text('{"update_records":{}}', encoding="utf-8")
+        payload.write_text('{"update_records":{"rec123":{}}}', encoding="utf-8")
+        filter_payload = self.task_dir / "status-filter.json"
+        filter_payload.write_text('{"logic":"and","conditions":[]}', encoding="utf-8")
 
         self.assertEqual(
             self.client.upload_attachment(
                 file=Path("candidate.png"), app_token="app-token", table_id="tbl123",
+                record_id="rec123", field_id="fld-output",
             ),
             {"ok": True},
+        )
+        self.assertEqual(
+            self.client.download_attachment(
+                app_token="app-token", table_id="tbl123", record_id="rec123",
+                token="attachment-token", output=Path("download.png"),
+            ),
+            self.task_dir.resolve() / "download.png",
         )
         self.assertEqual(
             self.client.update_record(
@@ -72,25 +86,35 @@ class LarkBaseClientTest(unittest.TestCase):
         self.assertEqual(
             self.client.list_records(
                 app_token="app-token", table_id="tbl123", view_id="vew123",
+                field_ids=["fld-source", "fld-target", "fld-output", "fld-status", "fld-detail"],
+                filter_payload=Path("status-filter.json"), limit=2000, offset=4000,
                 output=Path("records.ndjson"),
             ),
             self.task_dir.resolve() / "records.ndjson",
         )
 
         calls = self._calls()
-        self.assertEqual([call["cwd"] for call in calls], [str(self.task_dir.resolve())] * 3)
+        self.assertEqual([call["cwd"] for call in calls], [str(self.task_dir.resolve())] * 4)
         self.assertEqual(calls[0]["argv"], [
             "base", "+record-upload-attachment", "--base-token", "app-token",
-            "--table-id", "tbl123", "--file", "./candidate.png", "--as", "user",
+            "--table-id", "tbl123", "--record-id", "rec123", "--field-id", "fld-output",
+            "--file", "./candidate.png", "--as", "user",
         ])
         self.assertEqual(calls[1]["argv"], [
+            "base", "+record-download-attachment", "--base-token", "app-token",
+            "--table-id", "tbl123", "--record-id", "rec123", "--file-token",
+            "attachment-token", "--output", "./download.png", "--as", "user",
+        ])
+        self.assertEqual(calls[2]["argv"], [
             "base", "+record-batch-update", "--base-token", "app-token",
             "--table-id", "tbl123", "--json", "@./update.json", "--as", "user",
         ])
-        self.assertEqual(calls[2]["argv"], [
+        self.assertEqual(calls[3]["argv"], [
             "base", "+record-list", "--base-token", "app-token", "--table-id", "tbl123",
-            "--view-id", "vew123", "--output", "./records.ndjson", "--minimal-stdout",
-            "--as", "user",
+            "--view-id", "vew123", "--field-id", "fld-source", "--field-id", "fld-target",
+            "--field-id", "fld-output", "--field-id", "fld-status", "--field-id", "fld-detail",
+            "--filter-json", "@./status-filter.json", "--format", "ndjson", "--limit", "2000",
+            "--offset", "4000", "--output", "./records.ndjson", "--minimal-stdout", "--as", "user",
         ])
 
     def test_rejects_unsafe_or_missing_file_inputs_before_cli_execution(self) -> None:
@@ -112,6 +136,7 @@ class LarkBaseClientTest(unittest.TestCase):
                 with self.assertRaises(LarkRunnerError):
                     self.client.upload_attachment(
                         file=unsafe, app_token="app-token", table_id="tbl123",
+                        record_id="rec123", field_id="fld-output",
                     )
         self.assertFalse(self.trace.exists())
 
@@ -119,7 +144,7 @@ class LarkBaseClientTest(unittest.TestCase):
         """Fails if child diagnostics expose sensitive command data to callers."""
         secret = "attachment-token-secret-local-file-content"
         payload = self.task_dir / "update.json"
-        payload.write_text(secret, encoding="utf-8")
+        payload.write_text('{"update_records":{"rec123":{}}}', encoding="utf-8")
         old_fail = os.environ.get("LARK_TEST_FAIL")
         old_secret = os.environ.get("LARK_TEST_SECRET")
         os.environ["LARK_TEST_FAIL"] = "1"
@@ -143,6 +168,70 @@ class LarkBaseClientTest(unittest.TestCase):
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn("app-token", str(raised.exception))
         self.assertEqual(str(raised.exception), "lark-cli command failed with status 7")
+
+    def test_update_rejects_a_payload_that_does_not_target_exactly_one_requested_record(self) -> None:
+        """Fails if an update can write a record other than the caller selected."""
+        payload = self.task_dir / "update.json"
+        payload.write_text(
+            '{"update_records":{"rec123":{},"rec456":{}}}', encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(LarkRunnerError, "record update payload is invalid"):
+            self.client.update_record(
+                app_token="app-token", table_id="tbl123", record_id="rec123",
+                payload=Path("update.json"),
+            )
+        self.assertFalse(self.trace.exists())
+
+    def test_timeout_failure_has_no_exception_chain_or_sensitive_formatting(self) -> None:
+        """Fails if a timeout retains subprocess argv through an exception chain."""
+        payload = self.task_dir / "update.json"
+        payload.write_text('{"update_records":{"rec123":{}}}', encoding="utf-8")
+        old_timeout = os.environ.get("LARK_TEST_TIMEOUT")
+        os.environ["LARK_TEST_TIMEOUT"] = "1"
+        client = LarkBaseClient(
+            task_dir=self.task_dir, executable=self.executable, timeout_seconds=0.01,
+        )
+        try:
+            with self.assertRaises(LarkRunnerError) as raised:
+                client.update_record(
+                    app_token="app-token-secret", table_id="tbl123", record_id="rec123",
+                    payload=Path("update.json"),
+                )
+        finally:
+            if old_timeout is None:
+                os.environ.pop("LARK_TEST_TIMEOUT", None)
+            else:
+                os.environ["LARK_TEST_TIMEOUT"] = old_timeout
+
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertEqual(str(raised.exception), "lark-cli command timed out")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn("app-token-secret", rendered)
+
+    def test_invalid_json_has_no_exception_chain_or_stdout_formatting(self) -> None:
+        """Fails if invalid child JSON remains available through its decode exception."""
+        secret = "attachment-token-secret-stdout"
+        old_stdout = os.environ.get("LARK_TEST_STDOUT")
+        os.environ["LARK_TEST_STDOUT"] = secret
+        try:
+            with self.assertRaises(LarkRunnerError) as raised:
+                self.client.get_record(
+                    app_token="app-token-secret", table_id="tbl123", record_id="rec123",
+                )
+        finally:
+            if old_stdout is None:
+                os.environ.pop("LARK_TEST_STDOUT", None)
+            else:
+                os.environ["LARK_TEST_STDOUT"] = old_stdout
+
+        rendered = "".join(traceback.format_exception(raised.exception))
+        self.assertEqual(str(raised.exception), "lark-cli returned invalid JSON")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn("app-token-secret", rendered)
 
     def test_non_file_calls_return_json_from_the_cli(self) -> None:
         """Fails if typed read commands do not parse the CLI's JSON response."""

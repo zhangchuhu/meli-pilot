@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 
 class LarkRunnerError(RuntimeError):
@@ -36,36 +36,56 @@ class LarkBaseClient:
         ])
 
     def list_records(
-            self, *, app_token: str, table_id: str, view_id: str, output: Path,
+            self, *, app_token: str, table_id: str, field_ids: Sequence[str],
+            filter_payload: Path, output: Path, limit: int = 2000, offset: int = 0,
+            view_id: str | None = None,
     ) -> Path:
         """Write one NDJSON record listing to a new task-local artifact."""
         output_path, output_arg = self._output_path(output)
-        self._run([
+        _filter_path, filter_arg = self._input_path(filter_payload)
+        command = [
             "base", "+record-list", "--base-token", self._required(app_token, "app token"),
             "--table-id", self._required(table_id, "table ID"),
-            "--view-id", self._required(view_id, "view ID"), "--output", output_arg,
-            "--minimal-stdout", "--as", "user",
-        ], cwd=output_path.parent)
+        ]
+        if view_id is not None:
+            command.extend(["--view-id", self._required(view_id, "view ID")])
+        for field_id in self._required_values(field_ids, "field IDs"):
+            command.extend(["--field-id", field_id])
+        command.extend([
+            "--filter-json", f"@{filter_arg}", "--format", "ndjson", "--limit",
+            str(self._page_limit(limit)), "--offset", str(self._page_offset(offset)),
+            "--output", output_arg, "--minimal-stdout", "--as", "user",
+        ])
+        self._run(command, cwd=output_path.parent)
         return output_path
 
-    def download_attachment(self, *, token: str, output: Path) -> Path:
+    def download_attachment(
+            self, *, app_token: str, table_id: str, record_id: str, token: str,
+            output: Path,
+    ) -> Path:
         """Download one attachment token to a new task-local artifact."""
         output_path, output_arg = self._output_path(output)
         self._run([
-            "base", "+record-download-attachment", "--file-token",
+            "base", "+record-download-attachment", "--base-token",
+            self._required(app_token, "app token"), "--table-id",
+            self._required(table_id, "table ID"), "--record-id",
+            self._required(record_id, "record ID"), "--file-token",
             self._required(token, "attachment token"), "--output", output_arg, "--as", "user",
         ], cwd=output_path.parent)
         return output_path
 
     def upload_attachment(
-            self, *, file: Path, app_token: str, table_id: str,
+            self, *, file: Path, app_token: str, table_id: str, record_id: str,
+            field_id: str,
     ) -> dict:
         """Upload one existing task-local attachment file."""
         file_path, file_arg = self._input_path(file)
         return self._json([
             "base", "+record-upload-attachment", "--base-token",
             self._required(app_token, "app token"), "--table-id",
-            self._required(table_id, "table ID"), "--file", file_arg, "--as", "user",
+            self._required(table_id, "table ID"), "--record-id",
+            self._required(record_id, "record ID"), "--field-id",
+            self._required(field_id, "field ID"), "--file", file_arg, "--as", "user",
         ], cwd=file_path.parent)
 
     def update_record(
@@ -73,7 +93,8 @@ class LarkBaseClient:
     ) -> dict:
         """Apply a record-keyed batch update stored in a task-local JSON file."""
         payload_path, payload_arg = self._input_path(payload)
-        self._required(record_id, "record ID")
+        record_id = self._required(record_id, "record ID")
+        self._validate_update_payload(payload_path, record_id)
         return self._json([
             "base", "+record-batch-update", "--base-token",
             self._required(app_token, "app token"), "--table-id",
@@ -105,33 +126,43 @@ class LarkBaseClient:
         if path.is_absolute() or len(path.parts) != 1 or path.name in {"", ".", ".."}:
             raise LarkRunnerError("file argument must be one task-local filename")
         candidate = self._task_dir / path.name
+        escapes_task_directory = False
         try:
             resolved = candidate.resolve(strict=False)
             resolved.relative_to(self._task_dir)
-        except (OSError, ValueError) as error:
-            raise LarkRunnerError("file argument escapes the task directory") from error
+        except (OSError, ValueError):
+            escapes_task_directory = True
+        if escapes_task_directory:
+            raise LarkRunnerError("file argument escapes the task directory")
         return candidate
 
     def _json(self, command: Sequence[str], *, cwd: Path | None = None) -> dict:
         result = self._run(command, cwd=cwd)
+        invalid_json = False
         try:
             decoded = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise LarkRunnerError("lark-cli returned invalid JSON") from error
+        except json.JSONDecodeError:
+            invalid_json = True
+            decoded = None
+        if invalid_json:
+            raise LarkRunnerError("lark-cli returned invalid JSON")
         if not isinstance(decoded, dict):
             raise LarkRunnerError("lark-cli returned an unexpected JSON response")
         return decoded
 
     def _run(self, command: Sequence[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        error_message: str | None = None
         try:
             result = subprocess.run(
                 [self._executable, *command], cwd=cwd or self._task_dir, shell=False,
                 capture_output=True, text=True, check=False, timeout=self._timeout_seconds,
             )
-        except subprocess.TimeoutExpired as error:
-            raise LarkRunnerError("lark-cli command timed out") from error
-        except OSError as error:
-            raise LarkRunnerError("cannot start lark-cli") from error
+        except subprocess.TimeoutExpired:
+            error_message = "lark-cli command timed out"
+        except OSError:
+            error_message = "cannot start lark-cli"
+        if error_message is not None:
+            raise LarkRunnerError(error_message)
         if result.returncode != 0:
             raise LarkRunnerError(
                 f"lark-cli command failed with status {result.returncode}",
@@ -143,3 +174,38 @@ class LarkBaseClient:
         if not isinstance(value, str) or not value:
             raise LarkRunnerError(f"{label} is required")
         return value
+
+    @classmethod
+    def _required_values(cls, values: Sequence[str], label: str) -> list[str]:
+        if isinstance(values, (str, bytes)) or not values:
+            raise LarkRunnerError(f"{label} are required")
+        return [cls._required(value, label) for value in values]
+
+    @staticmethod
+    def _page_limit(limit: int) -> int:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 2000:
+            raise LarkRunnerError("record list limit is invalid")
+        return limit
+
+    @staticmethod
+    def _page_offset(offset: int) -> int:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise LarkRunnerError("record list offset is invalid")
+        return offset
+
+    @staticmethod
+    def _validate_update_payload(payload: Path, record_id: str) -> None:
+        invalid_payload = False
+        try:
+            decoded = json.loads(payload.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            invalid_payload = True
+            decoded = None
+        if not isinstance(decoded, dict):
+            invalid_payload = True
+        update_records = decoded.get("update_records") if isinstance(decoded, dict) else None
+        if (not isinstance(update_records, dict) or set(update_records) != {record_id}
+                or not isinstance(update_records.get(record_id), dict)):
+            invalid_payload = True
+        if invalid_payload:
+            raise LarkRunnerError("record update payload is invalid")
