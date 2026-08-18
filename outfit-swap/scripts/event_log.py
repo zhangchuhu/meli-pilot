@@ -33,6 +33,10 @@ STATUSES = frozenset({
     "pending", "running", "success", "failed", "interrupted", "accepted",
     "accepted-local", "early_accept", "reject", "retry", "selected", "stopped",
 })
+ACCEPTED_TARGET_STATUSES = frozenset({
+    "success", "accepted", "accepted-local", "early_accept",
+})
+TERMINAL_TARGET_STATUSES = ACCEPTED_TARGET_STATUSES | frozenset({"failed", "stopped"})
 ERROR_CATEGORIES = frozenset({
     "missing-source", "missing-target", "corrupt-source", "corrupt-target",
     "invalid-source", "invalid-target", "record-data", "external-call",
@@ -65,7 +69,7 @@ class EventLogError(ValueError):
 class EventLog:
     """Append one validated event per durable NDJSON line.
 
-    Every append uses an exclusive advisory lock and a single O_APPEND write so
+    Every append uses an exclusive advisory lock and O_APPEND writes so
     independently scheduled record workers cannot interleave event payloads.
     """
 
@@ -101,16 +105,28 @@ class EventLog:
         flags |= getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = -1
+        original_end = 0
+        appended_bytes = 0
         try:
             descriptor = os.open(self._path, flags, 0o600)
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise EventLogError("event log must be a regular file")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            written = os.write(descriptor, encoded)
-            if written != len(encoded):
-                raise EventLogError("event log write was incomplete")
+            original_end = os.lseek(descriptor, 0, os.SEEK_END)
+            while appended_bytes < len(encoded):
+                written = os.write(descriptor, encoded[appended_bytes:])
+                remaining = len(encoded) - appended_bytes
+                if not 0 < written <= remaining:
+                    raise OSError("event log write was incomplete")
+                appended_bytes += written
             os.fsync(descriptor)
-        except OSError as exc:
+        except (OSError, EventLogError) as exc:
+            if descriptor >= 0 and appended_bytes:
+                try:
+                    os.ftruncate(descriptor, original_end)
+                    os.fsync(descriptor)
+                except OSError:
+                    pass
             raise EventLogError("event log append failed") from exc
         finally:
             if descriptor >= 0:
@@ -132,12 +148,12 @@ def summarize_events(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     target_started = {_target_key(event) for event in normalized if event["event"] == "target_started"}
     terminal_targets = {
         _target_key(event) for event in normalized
-        if event["event"] == "target_finished" and event.get("status") in {"success", "failed", "stopped"}
+        if event["event"] == "target_finished" and event.get("status") in TERMINAL_TARGET_STATUSES
     }
     targets = terminal_targets or target_started
     accepted_targets = {
         _target_key(event) for event in normalized
-        if event["event"] == "target_finished" and event.get("status") in {"success", "accepted"}
+        if event["event"] == "target_finished" and event.get("status") in ACCEPTED_TARGET_STATUSES
     }
     early_accepted = {
         _target_key(event) for event in normalized
