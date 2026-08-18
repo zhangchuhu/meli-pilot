@@ -1,6 +1,7 @@
 import io
 import hashlib
 import json
+import signal
 import sys
 import tempfile
 import unittest
@@ -687,6 +688,29 @@ class TaskStateTest(unittest.TestCase):
             )
 
         self.assertEqual(state, before)
+
+    def test_checkpoint_payloads_reject_cyclic_dicts_and_lists_atomically(self) -> None:
+        cyclic_dict: dict[str, object] = {}
+        cyclic_dict["self"] = cyclic_dict
+        cyclic_list: list[object] = []
+        cyclic_list.append(cyclic_list)
+
+        def timeout(_signum: int, _frame: object) -> None:
+            raise TimeoutError("cycle validation timed out")
+
+        for cycle in (cyclic_dict, cyclic_list):
+            with self.subTest(cycle=type(cycle).__name__):
+                state = self.make_state()
+                before = json.loads(json.dumps(state))
+                previous_handler = signal.signal(signal.SIGALRM, timeout)
+                signal.setitimer(signal.ITIMER_REAL, 0.1)
+                try:
+                    with self.assertRaisesRegex(task_state.TaskStateError, "cycle"):
+                        task_state.record_target_plan(state, 0, {"value": cycle})
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                    signal.signal(signal.SIGALRM, previous_handler)
+                self.assertEqual(state, before)
 
     def test_qc_reports_append_with_artifact_digest_and_attempt_number(self) -> None:
         state = self.make_state()

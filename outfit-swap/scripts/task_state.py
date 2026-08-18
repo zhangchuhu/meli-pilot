@@ -308,15 +308,26 @@ def _json_object(value: Any, name: str) -> dict[str, Any]:
     """Validate and normalize a JSON object kept in durable target metadata."""
     if not isinstance(value, dict):
         raise TaskStateError(f"{name} must be a JSON object")
-    pending = [value]
+    pending = [(value, True)]
+    active_containers: set[int] = set()
     while pending:
-        current = pending.pop()
+        current, entering = pending.pop()
+        if not isinstance(current, (dict, list, tuple)):
+            continue
+        identity = id(current)
+        if not entering:
+            active_containers.remove(identity)
+            continue
+        if identity in active_containers:
+            raise TaskStateError(f"{name} must not contain a cycle")
+        active_containers.add(identity)
+        pending.append((current, False))
         if isinstance(current, dict):
             if not all(isinstance(key, str) for key in current):
                 raise TaskStateError(f"{name} must contain only string keys")
-            pending.extend(current.values())
-        elif isinstance(current, (list, tuple)):
-            pending.extend(current)
+            pending.extend((child, True) for child in current.values())
+        else:
+            pending.extend((child, True) for child in current)
     try:
         normalized = json.loads(json.dumps(value, allow_nan=False))
     except (TypeError, ValueError) as error:
