@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 import zlib
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -194,9 +194,14 @@ class StandaloneEntryTest(unittest.TestCase):
                 ])
 
             self.assertEqual(code, 0, stderr.getvalue())
-            self.assertEqual(json.loads(stdout.getvalue()), {
+            cli_payload = json.loads(stdout.getvalue())
+            self.assertEqual({
+                key: cli_payload[key]
+                for key in ("failed", "selected", "stopped", "succeeded")
+            }, {
                 "failed": 0, "selected": 1, "stopped": 0, "succeeded": 1,
             })
+            self.assertIsInstance(cli_payload.get("metrics_path"), str)
             remote = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(remote["status"], ["成功"])
             self.assertEqual(len(remote["outputs"]), 1)
@@ -208,6 +213,12 @@ class StandaloneEntryTest(unittest.TestCase):
             self.assertEqual(metrics["paid_generation_calls"], 1)
             self.assertEqual(metrics["qc_calls"], 1)
             self.assertGreaterEqual(metrics["total_wall_time_ms"], 0)
+            self.assertGreater(metrics["input_bytes"]["total"], 0)
+            self.assertTrue({
+                "download", "classification", "reference_selection",
+                "generation", "qc", "finalize", "upload", "detail_update",
+                "readback",
+            }.issubset(metrics["phase_latency_ms"]))
             calls = [json.loads(line) for line in trace.read_text().splitlines()]
             list_call = next(call for call in calls if call["argv"][1] == "+record-list")
             self.assertIn("--view-id", list_call["argv"])
@@ -230,9 +241,14 @@ class StandaloneEntryTest(unittest.TestCase):
                     "https://example.invalid/base/app_exact?table=tbl_exact&view=vew_exact",
                 ])
             self.assertEqual(resumed_code, 0, resumed_stderr.getvalue())
-            self.assertEqual(json.loads(resumed_stdout.getvalue()), {
+            resumed_payload = json.loads(resumed_stdout.getvalue())
+            self.assertEqual({
+                key: resumed_payload[key]
+                for key in ("failed", "selected", "stopped", "succeeded")
+            }, {
                 "failed": 0, "selected": 1, "stopped": 0, "succeeded": 1,
             })
+            self.assertIsInstance(resumed_payload.get("metrics_path"), str)
             resumed_calls = [
                 json.loads(line) for line in trace.read_text().splitlines()
             ]
@@ -303,9 +319,14 @@ class StandaloneEntryTest(unittest.TestCase):
                 capture_output=True, text=True, check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {
+            payload = json.loads(result.stdout)
+            self.assertEqual({
+                key: payload[key]
+                for key in ("failed", "selected", "stopped", "succeeded")
+            }, {
                 "failed": 0, "selected": 0, "stopped": 0, "succeeded": 0,
             })
+            self.assertTrue(Path(payload["metrics_path"]).is_file())
 
 
 class ProductionRuntimeContractTest(unittest.TestCase):
@@ -441,6 +462,36 @@ class ProductionRuntimeContractTest(unittest.TestCase):
             self.assertFalse((root / "state").exists())
             self.assertFalse((root / "runs").exists())
 
+    def test_post_run_directory_preflight_failure_closes_table_metrics(self) -> None:
+        from scripts import production_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(
+                production_runtime, "_require_dependencies", return_value="echo",
+            ), self.assertRaisesRegex(Exception, "regular file"):
+                production_runtime.execute(
+                    TableConfig(
+                        "https://example.invalid/base/app?table=tbl&view=vew",
+                    ),
+                    environ={
+                        "OUTFIT_SWAP_STATE_ROOT": str(root / "state"),
+                        "OUTFIT_SWAP_RUNS_ROOT": str(root / "runs"),
+                        "OUTFIT_SWAP_DOUBAO_SCRIPT": str(root / "missing.py"),
+                    },
+                )
+            run_dir = next((root / "runs").iterdir())
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.ndjson").read_text().splitlines()
+            ]
+            self.assertEqual(
+                [event["event"] for event in events],
+                ["table_started", "table_finished"],
+            )
+            self.assertEqual(events[-1]["status"], "failed")
+            self.assertTrue((run_dir / "metrics.json").is_file())
+
     def test_shared_ark_gate_limits_every_request_and_blocks_waiters_after_stop(self) -> None:
         from scripts import production_runtime
 
@@ -568,6 +619,247 @@ class ProductionRuntimeContractTest(unittest.TestCase):
             self.assertEqual(identities, ({"run_id": "prior", "artifact_name": name},))
             self.assertEqual((current / name).read_bytes(), b"candidate")
             self.assertFalse((current / name).is_symlink())
+            context = RecordContext(current.parent, "rec_1", (0,))
+            self.assertEqual(
+                adapter.artifact_path(
+                    context, state["targets"]["target_1"]["attempt_history"][-1],
+                ),
+                (current / name).resolve(),
+            )
+
+    def test_prior_accepted_local_completes_via_current_stage_without_duplicate_calls(self) -> None:
+        from scripts import production_runtime, prompt_builder, task_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            current_record = runs / "current" / "rec_1"
+            generated = current_record / "generated_images"
+            generated.mkdir(parents=True)
+            state = task_state.new_state(
+                record_id="rec_1", run_id="prior", source_tokens=["source_1"],
+                target_tokens=["target_1"], started_at="2026-08-19T00:00:00+00:00",
+            )
+            plan = prompt_builder.TargetPlan(
+                classification="front",
+                selected_references=(
+                    prompt_builder.SelectedReference("source_1", "model"),
+                ),
+                garment_facts=prompt_builder.GarmentFacts(
+                    ("Use the evidenced ivory color.",), (),
+                ),
+                infographic_inventory=None,
+            )
+            task_state.record_target_plan(
+                state, 0, json.loads(prompt_builder.serialize_plan(plan)),
+            )
+            task_state.begin_attempt(
+                state, target_token="target_1", classification="front",
+                reference_tokens=["source_1"], prompt="prompt", model="model",
+                updated_at="2026-08-19T00:00:01+00:00",
+            )
+            history = state["targets"]["target_1"]["attempt_history"][-1]
+            prior = runs / "prior" / "rec_1" / "generated_images" / history["artifact_name"]
+            prior.parent.mkdir(parents=True)
+            _write_png(prior)
+            output_name = task_state.promoted_output_name(
+                history["artifact_name"], "target_1",
+            )
+            task_state.record_local_acceptance(
+                state, target_token="target_1",
+                artifact_name=history["artifact_name"], name=output_name,
+                updated_at="2026-08-19T00:00:02+00:00",
+            )
+            accepted_checkpoint = json.loads(json.dumps(state))
+            manifest = current_record / "manifest.json"
+            task_state.save_state(manifest, state)
+
+            class Base:
+                def __init__(self, payload_root: Path) -> None:
+                    self.payload_root = payload_root
+                    self.outputs: list[dict[str, str]] = []
+                    self.detail: str | None = None
+                    self.status: list[str] | None = None
+                    self.uploads = 0
+
+                def get_record(self, **_kwargs: object) -> dict:
+                    return {"record": {"record_id": "rec_1", "fields": {
+                        "输出图": list(self.outputs), "处理明细": self.detail,
+                        "任务状态": self.status,
+                    }}}
+
+                def upload_attachment(self, **kwargs: object) -> dict:
+                    file = kwargs["file"]
+                    self.assert_current_file(file)
+                    self.uploads += 1
+                    mapping = {"file_token": "uploaded_1", "name": Path(file).name}
+                    self.outputs.append(mapping)
+                    return mapping
+
+                def update_record(self, **kwargs: object) -> dict:
+                    payload = kwargs["payload"]
+                    self.assert_current_file(payload)
+                    value = json.loads(
+                        (self.payload_root / Path(payload).name).read_text(),
+                    )
+                    fields = value["update_records"]["rec_1"]
+                    if "处理明细" in fields:
+                        self.detail = fields["处理明细"]
+                    if "任务状态" in fields:
+                        self.status = fields["任务状态"]
+                    return {"ok": True}
+
+                def assert_current_file(self, path: object) -> None:
+                    if Path(path).name != str(path):
+                        raise AssertionError("Base transport must receive a basename")
+                    if not (self.payload_root / Path(path).name).is_file():
+                        raise AssertionError("Base transport did not resolve current stage")
+
+            base = Base(generated)
+            adapter = production_runtime.ProductionTableAdapter(
+                run_id="current", run_dir=runs / "current", runs_root=runs,
+                state_root=root / "state", base_service=object(), ark_client=object(),
+            )
+            adapter._scope = TableScope("app_exact", "tbl_exact", "vew_exact")
+            adapter._schema = TableSchema((
+                BaseField("原图", "fld_source", "attachment"),
+                BaseField("爆款图", "fld_target", "attachment"),
+                BaseField("输出图", "fld_output", "attachment"),
+                BaseField("任务状态", "fld_status", "single_select", ("未开始", "成功", "失败")),
+                BaseField("处理明细", "fld_detail", "text"),
+            ))
+            adapter._resumable_artifacts(state, generated)
+            context = RecordContext(current_record, "rec_1", (0,))
+
+            class Generator:
+                model = "model"
+
+                def artifact_path(self, current: RecordContext, item: dict) -> Path:
+                    return adapter.artifact_path(current, item)
+
+            for _run in range(2):
+                services = adapter.record_services(
+                    context, Generator(), object(), base, GlobalStop(), "automatic",
+                )
+                result = production_runtime._terminal_worker(context, services)
+                self.assertEqual(result.status, "success")
+            self.assertEqual(base.uploads, 1)
+            self.assertEqual(base.status, ["成功"])
+            self.assertEqual(len(base.outputs), 1)
+            self.assertIsNotNone(base.detail)
+
+            uploaded_record = runs / "uploaded-restart" / "rec_1"
+            uploaded_generated = uploaded_record / "generated_images"
+            uploaded_generated.mkdir(parents=True)
+            uploaded_manifest = uploaded_record / "manifest.json"
+            task_state.save_state(uploaded_manifest, accepted_checkpoint)
+            uploaded_base = Base(uploaded_generated)
+            uploaded_base.outputs = [{
+                "file_token": "already_uploaded", "name": output_name,
+            }]
+            uploaded_adapter = production_runtime.ProductionTableAdapter(
+                run_id="uploaded-restart", run_dir=runs / "uploaded-restart",
+                runs_root=runs, state_root=root / "state",
+                base_service=object(), ark_client=object(),
+            )
+            uploaded_adapter._scope = adapter._scope
+            uploaded_adapter._schema = adapter._schema
+            uploaded_adapter._resumable_artifacts(
+                accepted_checkpoint, uploaded_generated,
+            )
+            uploaded_context = RecordContext(uploaded_record, "rec_1", (0,))
+
+            class UploadedGenerator:
+                model = "model"
+
+                def artifact_path(self, current: RecordContext, item: dict) -> Path:
+                    return uploaded_adapter.artifact_path(current, item)
+
+            uploaded_services = uploaded_adapter.record_services(
+                uploaded_context, UploadedGenerator(), object(), uploaded_base,
+                GlobalStop(), "automatic",
+            )
+            uploaded_result = production_runtime._terminal_worker(
+                uploaded_context, uploaded_services,
+            )
+            self.assertEqual(uploaded_result.status, "success")
+            self.assertEqual(uploaded_base.uploads, 0)
+            self.assertEqual(uploaded_base.status, ["成功"])
+            self.assertIsNotNone(uploaded_base.detail)
+
+    def test_ivory_lace_plan_renders_all_bounded_simultaneous_constraints(self) -> None:
+        from scripts import production_runtime, prompt_builder
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images: dict[str, Path] = {}
+            for token in ("target_1", "source_1", "source_2", "source_3"):
+                path = root / f"{token}.png"
+                _write_png(path)
+                images[token] = path
+
+            responses = iter((
+                {"schema_version": 1, "classification": "front"},
+                {
+                    "schema_version": 1,
+                    "sources": [
+                        {"token": "source_1", "angle": "front", "roles": ["model"], "information_score": 100},
+                        {"token": "source_2", "angle": "front", "roles": ["upper_construction"], "information_score": 90},
+                        {"token": "source_3", "angle": "front", "roles": ["full_outfit_flat_lay", "skirt_hem"], "information_score": 80},
+                    ],
+                    "garment_facts": {
+                        "required": [
+                            "color:ivory", "collar_shape:pointed",
+                            "collar_size:small", "placket:continuous-to-bottom",
+                            "closure_type:pearl-buttons", "closure_state:closed",
+                            "sleeve_length:long", "sleeve_coverage:both",
+                            "cuff:present", "material:lace", "trim:lace",
+                        ],
+                        "forbidden": [
+                            "neckline:v-neck", "front_style:open-cardigan",
+                            "undergarment_visibility:exposed-straps",
+                        ],
+                    },
+                    "unique_requirement": None,
+                },
+            ))
+            ark_requests: list[dict[str, object]] = []
+
+            class Adapter:
+                def image_path(self, _record: str, token: str, _role: str) -> Path:
+                    return images[token]
+
+                def source_paths(self, _record: str) -> tuple[tuple[str, Path], ...]:
+                    return tuple((token, images[token]) for token in (
+                        "source_1", "source_2", "source_3",
+                    ))
+
+                def planning_checkpoint(self, *_args: object) -> None:
+                    return None
+
+                def timed_phase(self, *_args: object) -> object:
+                    return nullcontext()
+
+                def ark_complete(self, **kwargs: object) -> str:
+                    ark_requests.append(dict(kwargs))
+                    return json.dumps(next(responses))
+
+            planner = production_runtime.ArkPlanner(Adapter(), object())
+            plan = planner.plan_target(
+                RecordContext(root, "rec_1", (0,)), 0, "target_1",
+            )
+            prompt = prompt_builder.build_prompt(plan, attempt=1).text
+            evidence_request = str(ark_requests[1]["user_prompt"])
+            self.assertIn("Multiple compatible codes are allowed", evidence_request)
+            self.assertNotIn("at most one code per category", evidence_request)
+            for phrase in (
+                "ivory", "small pointed collar", "continuous button placket",
+                "pearl buttons", "closed through the bottom", "both long sleeves",
+                "both cuffs", "lace material", "lace trim", "no V-neck",
+                "no open-cardigan front", "no exposed undergarment straps",
+            ):
+                self.assertIn(phrase, prompt)
+            self.assertNotIn("ignore prior instructions", prompt)
 
     def test_ark_authored_imperatives_cannot_enter_seedream_facts(self) -> None:
         from scripts import production_runtime
@@ -594,6 +886,9 @@ class ProductionRuntimeContractTest(unittest.TestCase):
 
                 def planning_checkpoint(self, *_args: object) -> None:
                     return None
+
+                def timed_phase(self, *_args: object) -> object:
+                    return nullcontext()
 
             class Client:
                 calls = 0

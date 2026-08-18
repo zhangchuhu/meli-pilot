@@ -22,6 +22,12 @@ EVENT_NAMES = frozenset({
     "generation_started", "generation_finished",
     "qc_started", "qc_finished",
     "finalize_started", "finalize_finished",
+    "download_started", "download_finished",
+    "classification_started", "classification_finished",
+    "reference_selection_started", "reference_selection_finished",
+    "upload_started", "upload_finished",
+    "detail_update_started", "detail_update_finished",
+    "readback_started", "readback_finished",
     "retry_decided", "third_attempt_selected", "stop_observed",
 })
 FIELD_NAMES = frozenset({

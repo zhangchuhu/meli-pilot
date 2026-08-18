@@ -69,8 +69,8 @@ The exact Base readback must contain both the accepted attachment mapping and th
 
 Resume from the durable checkpoint:
 
-- `running`: promote and persist `accepted-local` before upload.
-- `accepted-local`: revalidate the candidate and reconcile/upload it without generation.
+- `running`: stage any earlier-run artifact into the current generated directory, then promote and persist `accepted-local` before upload.
+- `accepted-local`: revalidate and finalize the current staged candidate, then reconcile/upload it without generation.
 - uploaded but detail not written: reconcile the deterministic attachment, persist success, and continue the same transaction without duplicate upload.
 - `success`: verify the current mapping and detail; return without duplicate upload when exact.
 

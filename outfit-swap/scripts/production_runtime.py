@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -73,7 +74,21 @@ _FACT_CODES = frozenset({
     "color:black", "color:white", "color:gray", "color:red", "color:orange",
     "color:yellow", "color:green", "color:blue", "color:purple",
     "color:pink", "color:brown", "color:beige", "color:multicolor",
-    "color:other", "color:unclear",
+    "color:ivory", "color:other", "color:unclear",
+    "collar_shape:pointed", "collar_shape:rounded", "collar_shape:other",
+    "collar_size:small", "collar_size:standard", "collar_size:large",
+    "placket:continuous-to-bottom", "placket:partial", "placket:none",
+    "closure_type:pearl-buttons", "closure_type:buttons",
+    "closure_type:zip", "closure_type:other",
+    "closure_state:closed", "closure_state:open",
+    "sleeve_length:sleeveless", "sleeve_length:short",
+    "sleeve_length:three-quarter", "sleeve_length:long",
+    "sleeve_coverage:both", "sleeve_coverage:asymmetric",
+    "cuff:present", "cuff:absent",
+    "front_style:closed-front", "front_style:open-cardigan",
+    "undergarment_visibility:no-exposed-straps",
+    "undergarment_visibility:exposed-straps",
+    "trim:lace", "trim:ruffle", "trim:piping", "trim:none",
 })
 _FACT_LABELS = {
     "garment_type": "Garment type evidence",
@@ -83,6 +98,30 @@ _FACT_LABELS = {
     "silhouette": "Silhouette evidence",
     "material": "Material-family evidence",
     "color": "Color-family evidence",
+    "collar_shape": "Collar-shape evidence",
+    "collar_size": "Collar-size evidence",
+    "placket": "Placket evidence",
+    "closure_type": "Closure-type evidence",
+    "closure_state": "Closure-state evidence",
+    "sleeve_length": "Sleeve-length evidence",
+    "sleeve_coverage": "Sleeve-coverage evidence",
+    "cuff": "Cuff evidence",
+    "front_style": "Front-style evidence",
+    "undergarment_visibility": "Undergarment-visibility evidence",
+    "trim": "Trim evidence",
+}
+_REQUIRED_FACT_TEMPLATES = {
+    "color:ivory": "Use the evidenced ivory color.",
+    "material:lace": "Preserve the evidenced lace material.",
+    "trim:lace": "Preserve the evidenced lace trim and edge details.",
+    "closure_state:closed": "Keep the evidenced closure closed.",
+    "cuff:present": "Preserve both evidenced cuffs.",
+}
+_FORBIDDEN_FACT_TEMPLATES = {
+    "neckline:v-neck": "Use no V-neck construction.",
+    "front_style:open-cardigan": "Use no open-cardigan front.",
+    "undergarment_visibility:exposed-straps":
+        "Show no exposed undergarment straps.",
 }
 
 
@@ -263,21 +302,53 @@ def _bounded_garment_facts(
     if (not codes or any(code not in _FACT_CODES for code in codes)
             or len(set(codes)) != len(codes)):
         raise TableSchedulerError("Ark garment facts are not bounded evidence codes")
-    seen_categories: set[str] = set()
-    for code in codes:
-        category, _value = code.split(":", 1)
-        if category in seen_categories:
-            raise TableSchedulerError("Ark garment facts duplicate an evidence category")
-        seen_categories.add(category)
+    def render_required(values: tuple[str, ...]) -> tuple[str, ...]:
+        remaining = list(values)
+        rendered: list[str] = []
 
-    def render(values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(
-            f"{_FACT_LABELS[category]}: {value}."
-            for category, value in (code.split(":", 1) for code in values)
+        def composite(parts: tuple[str, ...], sentence: str) -> None:
+            if all(part in remaining for part in parts):
+                rendered.append(sentence)
+                for part in parts:
+                    remaining.remove(part)
+
+        composite(
+            ("collar_shape:pointed", "collar_size:small"),
+            "Preserve the evidenced small pointed collar.",
         )
+        composite(
+            (
+                "placket:continuous-to-bottom", "closure_type:pearl-buttons",
+                "closure_state:closed",
+            ),
+            "Preserve the continuous button placket with pearl buttons, closed through the bottom.",
+        )
+        composite(
+            ("sleeve_length:long", "sleeve_coverage:both", "cuff:present"),
+            "Preserve both long sleeves and both cuffs.",
+        )
+        for code in remaining:
+            category, value = code.split(":", 1)
+            rendered.append(
+                _REQUIRED_FACT_TEMPLATES.get(
+                    code, f"{_FACT_LABELS[category]}: {value}.",
+                )
+            )
+        return tuple(rendered)
+
+    def render_forbidden(values: tuple[str, ...]) -> tuple[str, ...]:
+        rendered: list[str] = []
+        for code in values:
+            category, value = code.split(":", 1)
+            rendered.append(
+                _FORBIDDEN_FACT_TEMPLATES.get(
+                    code, f"Do not use {_FACT_LABELS[category].lower()}: {value}.",
+                )
+            )
+        return tuple(rendered)
 
     return prompt_builder.GarmentFacts(
-        required=render(required), forbidden=render(forbidden),
+        required=render_required(required), forbidden=render_forbidden(forbidden),
     )
 
 
@@ -312,6 +383,87 @@ class TimingEventLog:
                 if started is not None:
                     fields["duration_ms"] = max(0, (now - started) // 1_000_000)
         return self._delegate.append(event, **fields)
+
+
+@contextmanager
+def _timed_phase(
+        events: object, name: str, phase: str, **identity: Any,
+) -> Iterable[None]:
+    append = getattr(events, "append", None)
+    if not callable(append):
+        raise TableSchedulerError("phase event boundary is unavailable")
+    append(f"{name}_started", phase=phase, status="running", **identity)
+    try:
+        yield
+    except BaseException:
+        append(f"{name}_finished", phase=phase, status="failed", **identity)
+        raise
+    else:
+        append(f"{name}_finished", phase=phase, status="success", **identity)
+
+
+class ProductionRecordEventLog(TimingEventLog):
+    """Enrich target events with bounded byte totals from resolved inputs."""
+
+    def __init__(
+            self, path: Path, *, adapter: "ProductionTableAdapter",
+            context: RecordContext,
+    ) -> None:
+        super().__init__(path)
+        self._adapter = adapter
+        self._context = context
+
+    def append(self, event: str, /, **fields: Any) -> dict[str, Any]:
+        if event == "target_started" and "input_bytes" not in fields:
+            target_id = fields.get("target_id")
+            if not isinstance(target_id, str):
+                raise TableSchedulerError("target event identity is invalid")
+            state = task_state.load_state(
+                Path(self._context.task_dir).resolve() / "manifest.json",
+            )
+            target = state["targets"][target_id]
+            plan = prompt_builder.deserialize_plan(target["target_plan"])
+            inputs = (
+                self._adapter.image_path(
+                    self._context.record_id, target_id, "target",
+                ),
+                *(self._adapter.image_path(
+                    self._context.record_id, token, "source",
+                ) for token in plan.reference_tokens),
+            )
+            fields["input_bytes"] = sum(path.stat().st_size for path in inputs)
+        return super().append(event, **fields)
+
+
+class RecordEventBase:
+    """Instrument record-scoped Base persistence without changing transport."""
+
+    def __init__(self, base: object, events: object, record_id: str) -> None:
+        self._base = base
+        self._events = events
+        self._record_id = record_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+    def upload_attachment(self, **kwargs: object) -> object:
+        with _timed_phase(
+            self._events, "upload", "upload", record_id=self._record_id,
+        ):
+            return self._base.upload_attachment(**kwargs)
+
+    def update_record(self, **kwargs: object) -> object:
+        with _timed_phase(
+            self._events, "detail_update", "detail_update",
+            record_id=self._record_id,
+        ):
+            return self._base.update_record(**kwargs)
+
+    def get_record(self, **kwargs: object) -> object:
+        with _timed_phase(
+            self._events, "readback", "readback", record_id=self._record_id,
+        ):
+            return self._base.get_record(**kwargs)
 
 
 class ProductionLarkService:
@@ -424,48 +576,54 @@ class ArkPlanner:
         checkpoint = lambda: self._adapter.planning_checkpoint(
             context, target_index, target_token,
         )
-        classification = self._classify(target, checkpoint)
-        inventory = None
-        instances: Sequence[str] = ()
-        if classification == "infographic":
-            inventory = infographic_text.settle_inventory(
-                target_token,
-                read=lambda token: self._read_inventory(token, target, checkpoint),
-                adjudicate=lambda token, first, second: self._adjudicate_inventory(
-                    token, target, first, second, checkpoint,
-                ),
-            )
-            instances = inventory.garment_instances
-        evidence, facts, unique = self._source_evidence(
-            sources, instances=instances, checkpoint=checkpoint,
-        )
-        if classification in _ORDINARY or classification == "infographic":
-            selection = reference_selector.select_references(
-                evidence, classification=classification,
-                garment_instances=instances, unique_requirement=unique,
-            )
-            chosen = list(selection.selected)
-            roles = list(selection.roles)
-            fifth_reason = selection.fifth_reference_reason
-        else:
-            chosen = sorted(
-                (item for item in evidence if item.information_score > 0
-                 and "size_chart" not in item.roles),
-                key=lambda item: (-item.information_score, item.token),
-            )[:4]
-            roles = ["garment_evidence"] * len(chosen)
-            fifth_reason = None
-        selected_tokens = {item.token for item in chosen}
-        for item in sorted(
-                evidence, key=lambda value: (-value.information_score, value.token),
+        with self._adapter.timed_phase(
+            "classification", context.record_id, target_token,
         ):
-            if len(chosen) >= 3:
-                break
-            if (item.token not in selected_tokens and item.information_score > 0
-                    and "size_chart" not in item.roles):
-                chosen.append(item)
-                roles.append("supporting_evidence")
-                selected_tokens.add(item.token)
+            classification = self._classify(target, checkpoint)
+        with self._adapter.timed_phase(
+            "reference_selection", context.record_id, target_token,
+        ):
+            inventory = None
+            instances: Sequence[str] = ()
+            if classification == "infographic":
+                inventory = infographic_text.settle_inventory(
+                    target_token,
+                    read=lambda token: self._read_inventory(token, target, checkpoint),
+                    adjudicate=lambda token, first, second: self._adjudicate_inventory(
+                        token, target, first, second, checkpoint,
+                    ),
+                )
+                instances = inventory.garment_instances
+            evidence, facts, unique = self._source_evidence(
+                sources, instances=instances, checkpoint=checkpoint,
+            )
+            if classification in _ORDINARY or classification == "infographic":
+                selection = reference_selector.select_references(
+                    evidence, classification=classification,
+                    garment_instances=instances, unique_requirement=unique,
+                )
+                chosen = list(selection.selected)
+                roles = list(selection.roles)
+                fifth_reason = selection.fifth_reference_reason
+            else:
+                chosen = sorted(
+                    (item for item in evidence if item.information_score > 0
+                     and "size_chart" not in item.roles),
+                    key=lambda item: (-item.information_score, item.token),
+                )[:4]
+                roles = ["garment_evidence"] * len(chosen)
+                fifth_reason = None
+            selected_tokens = {item.token for item in chosen}
+            for item in sorted(
+                    evidence, key=lambda value: (-value.information_score, value.token),
+            ):
+                if len(chosen) >= 3:
+                    break
+                if (item.token not in selected_tokens and item.information_score > 0
+                        and "size_chart" not in item.roles):
+                    chosen.append(item)
+                    roles.append("supporting_evidence")
+                    selected_tokens.add(item.token)
         if not 3 <= len(chosen) <= 5:
             raise TableSchedulerError("target planning requires three or four references")
         if len(chosen) == 5 and fifth_reason is None:
@@ -529,8 +687,9 @@ class ArkPlanner:
                 "Tokens in image order: " + json.dumps(tokens, separators=(",", ":"))
                 + ". Roles may include model, upper_construction, "
                   "full_outfit_flat_lay, skirt_hem, size_chart, and instance:<literal>. "
-                + "Garment facts must use only these enumerated codes, with at most "
-                  "one code per category across required and forbidden: "
+                + "Garment facts must use only these enumerated codes. Multiple "
+                  "compatible codes are allowed; list each exact code at most once "
+                  "across required and forbidden: "
                 + json.dumps(sorted(_FACT_CODES), separators=(",", ":"))
                 + ". "
                 + "Required infographic instances: "
@@ -690,8 +849,18 @@ class ProductionTableAdapter:
         self._scope: TableScope | None = None
         self._schema: TableSchema | None = None
         self._attachments: dict[str, dict[str, dict[str, Path]]] = {}
-        self._table_events = event_log.EventLog(self._run_dir / "events.ndjson")
+        self._table_events = TimingEventLog(self._run_dir / "events.ndjson")
         self._ark_gate: SharedArkGate | None = None
+
+    def timed_phase(
+            self, phase: str, record_id: str, target_id: str,
+    ) -> Any:
+        if phase not in {"classification", "reference_selection"}:
+            raise TableSchedulerError("planning phase is invalid")
+        return _timed_phase(
+            self._table_events, phase, phase,
+            record_id=record_id, target_id=target_id,
+        )
 
     def bind_shared_ark(
             self, stop_signal: object, semaphore: threading.BoundedSemaphore,
@@ -943,18 +1112,22 @@ class ProductionTableAdapter:
             token = item["file_token"]
             digest = hashlib.sha256(token.encode()).hexdigest()[:12]
             provisional = directory / f"{role}-{index:02d}-{digest}.png"
-            base.download_attachment(
-                app_token=scope.app_token, table_id=scope.table_id,
-                record_id=record_id, token=token, output=provisional,
-            )
-            try:
-                info = image_qc.validate_decodable_raster(provisional)
-            except image_qc.ImageQCError:
-                raise RecordMaterializationError(f"corrupt-{role}") from None
-            try:
-                output = _canonicalize_download(provisional, info)
-            except RecordMaterializationError:
-                raise RecordMaterializationError(f"invalid-{role}") from None
+            with _timed_phase(
+                self._table_events, "download", "download",
+                record_id=record_id,
+            ):
+                base.download_attachment(
+                    app_token=scope.app_token, table_id=scope.table_id,
+                    record_id=record_id, token=token, output=provisional,
+                )
+                try:
+                    info = image_qc.validate_decodable_raster(provisional)
+                except image_qc.ImageQCError:
+                    raise RecordMaterializationError(f"corrupt-{role}") from None
+                try:
+                    output = _canonicalize_download(provisional, info)
+                except RecordMaterializationError:
+                    raise RecordMaterializationError(f"invalid-{role}") from None
             paths[role][token] = output
 
     def _resumable_artifacts(
@@ -1010,13 +1183,17 @@ class ProductionTableAdapter:
     ) -> RecordServices:
         if self._scope is None or self._schema is None:
             raise TableSchedulerError("record services precede table preflight")
+        events = ProductionRecordEventLog(
+            context.task_dir / "events.ndjson", adapter=self, context=context,
+        )
         factory = ProductionRecordServicesFactory(
             scope=self._scope, schema=self._schema,
-            events_factory=lambda current: TimingEventLog(
-                current.task_dir / "events.ndjson",
-            ),
+            events_factory=lambda _current: events,
         )
-        return factory(context, generator, qc, base, stop_signal, qc_mode)
+        instrumented_base = RecordEventBase(base, events, context.record_id)
+        return factory(
+            context, generator, qc, instrumented_base, stop_signal, qc_mode,
+        )
 
     def image_path(self, record_id: str, token: str, role: str) -> Path:
         try:
@@ -1046,6 +1223,11 @@ class ProductionTableAdapter:
         name = history.get("artifact_name")
         if not isinstance(run_id, str) or not isinstance(name, str):
             raise TableSchedulerError("artifact identity is invalid")
+        staged = (
+            Path(context.task_dir).resolve() / "generated_images" / name
+        )
+        if staged.is_file() and not staged.is_symlink():
+            return staged
         return self._runs_root / run_id / context.record_id / "generated_images" / name
 
     def qc_images(self, request: QCRequest) -> tuple[Path, ...]:
@@ -1227,39 +1409,40 @@ def execute(
     run_id = _run_id()
     run_dir = runs_root / run_id
     run_dir.mkdir(mode=0o700)
-    doubao = _file_from_env(
-        env, "OUTFIT_SWAP_DOUBAO_SCRIPT",
-        str(Path.home() / ".codex" / "skills" / "image-gen-ark"
-            / "doubao-imagegen" / "scripts" / "doubao_imagegen.py"),
-    )
-    base = ProductionLarkService(run_dir=run_dir, executable=executable)
-    ark = _make_ark_client()
-    adapter = ProductionTableAdapter(
-        run_id=run_id, run_dir=run_dir, runs_root=runs_root,
-        state_root=state_root, base_service=base, ark_client=ark,
-    )
-    planner = ArkPlanner(adapter, ark)
-    generator = SeedreamGeneratorAdapter(
-        doubao_script=doubao, planner=planner,
-        image_resolver=adapter.generation_images,
-        artifact_resolver=adapter.artifact_path,
-        approved_run_roots=(runs_root,),
-    )
-    runtime = TableRuntime(
-        adapter=adapter, base=base, generator=generator,
-        qc=ArkQCAdapter(adapter, ark), worker=_terminal_worker,
-    )
     table_started = time.monotonic_ns()
-    adapter._table_events.append(
+    table_events = TimingEventLog(run_dir / "events.ndjson")
+    table_events.append(
         "table_started", status="running",
         concurrency=config.record_concurrency,
     )
     result: TableResult | None = None
+    adapter: ProductionTableAdapter | None = None
     try:
+        doubao = _file_from_env(
+            env, "OUTFIT_SWAP_DOUBAO_SCRIPT",
+            str(Path.home() / ".codex" / "skills" / "image-gen-ark"
+                / "doubao-imagegen" / "scripts" / "doubao_imagegen.py"),
+        )
+        base = ProductionLarkService(run_dir=run_dir, executable=executable)
+        ark = _make_ark_client()
+        adapter = ProductionTableAdapter(
+            run_id=run_id, run_dir=run_dir, runs_root=runs_root,
+            state_root=state_root, base_service=base, ark_client=ark,
+        )
+        planner = ArkPlanner(adapter, ark)
+        generator = SeedreamGeneratorAdapter(
+            doubao_script=doubao, planner=planner,
+            image_resolver=adapter.generation_images,
+            artifact_resolver=adapter.artifact_path,
+            approved_run_roots=(runs_root,),
+        )
+        runtime = TableRuntime(
+            adapter=adapter, base=base, generator=generator,
+            qc=ArkQCAdapter(adapter, ark), worker=_terminal_worker,
+        )
         result = run_table(config, runtime)
-        return result
     finally:
-        scope = adapter._scope
+        scope = None if adapter is None else adapter._scope
         fields: dict[str, Any] = {
             "status": (
                 "failed" if result is None
@@ -1272,7 +1455,14 @@ def execute(
         }
         if scope is not None:
             fields["table_id"] = scope.table_id
-        adapter._table_events.append("table_finished", **fields)
+        table_events.append("table_finished", **fields)
         _persist_metrics(
             run_dir, record_concurrency=config.record_concurrency,
         )
+    if result is None:  # pragma: no cover - an exception above remains active.
+        raise TableSchedulerError("table scheduler returned no result")
+    return TableResult(
+        selected=result.selected, succeeded=result.succeeded,
+        failed=result.failed, stopped=result.stopped,
+        metrics_path=str(run_dir / "metrics.json"),
+    )

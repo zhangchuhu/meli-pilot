@@ -93,6 +93,7 @@ class TableResult:
     succeeded: int
     failed: int
     stopped: int
+    metrics_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1227,6 +1228,7 @@ def _production_execute(config: TableConfig) -> TableResult:
     return TableResult(
         selected=result.selected, succeeded=result.succeeded,
         failed=result.failed, stopped=result.stopped,
+        metrics_path=result.metrics_path,
     )
 
 
@@ -1248,7 +1250,10 @@ def main(
     except (OSError, TableSchedulerError, TypeError, ValueError) as error:
         print(f"run-table error: {error}", file=__import__("sys").stderr)
         return 1
-    print(json.dumps(asdict(result), sort_keys=True, separators=(",", ":")))
+    payload = asdict(result)
+    if payload["metrics_path"] is None:
+        payload.pop("metrics_path")
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0
 
 
