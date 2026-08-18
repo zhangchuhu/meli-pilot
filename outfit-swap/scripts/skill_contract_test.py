@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -43,6 +44,83 @@ def read_required(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return tuple(reversed(parts))
+
+
+def _ark_http_target_is_exact(source: str) -> bool:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+
+    endpoint_values: list[ast.AST] = []
+    request_calls: list[ast.Call] = []
+    approved_request_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "ARK_CHAT_ENDPOINT":
+                    endpoint_values.append(node.value)
+            if (
+                    isinstance(node.value, ast.Call)
+                    and _attribute_path(node.value.func) == ("urllib", "request", "Request")
+                    and node.value.args
+                    and isinstance(node.value.args[0], ast.Name)
+                    and node.value.args[0].id == "ARK_CHAT_ENDPOINT"
+            ):
+                approved_request_names.update(
+                    target.id for target in node.targets if isinstance(target, ast.Name)
+                )
+        if (
+                isinstance(node, ast.Call)
+                and _attribute_path(node.func) == ("urllib", "request", "Request")
+        ):
+            request_calls.append(node)
+
+    if len(endpoint_values) != 1:
+        return False
+    endpoint = endpoint_values[0]
+    if not isinstance(endpoint, ast.Constant) or endpoint.value != ARK_CHAT_ENDPOINT:
+        return False
+    if len(request_calls) != 1:
+        return False
+    request_call = request_calls[0]
+    if (
+            not request_call.args
+            or not isinstance(request_call.args[0], ast.Name)
+            or request_call.args[0].id != "ARK_CHAT_ENDPOINT"
+    ):
+        return False
+
+    network_calls: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        path = _attribute_path(node.func)
+        if path == ("urllib", "request", "urlopen") or path[-1:] == ("_opener",):
+            network_calls.append(node)
+    if len(network_calls) != 1:
+        return False
+    network_call = network_calls[0]
+    if not network_call.args:
+        return False
+    target = network_call.args[0]
+    return (
+        isinstance(target, ast.Name)
+        and (
+            target.id == "ARK_CHAT_ENDPOINT"
+            or target.id in approved_request_names
+        )
+    )
+
+
 def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
     """Return executable forbidden-path matches across every shipped source file."""
     patterns = (
@@ -77,6 +155,8 @@ def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
                 urls = set(http_url_pattern.findall(source))
                 if urls != {ARK_CHAT_ENDPOINT}:
                     findings.append(f"{name}: unauthorized Ark HTTP endpoint")
+                elif not _ark_http_target_is_exact(source):
+                    findings.append(f"{name}: unauthorized Ark HTTP target")
         for line_number, line in enumerate(source.splitlines(), start=1):
             if batch_command not in line:
                 continue
@@ -466,7 +546,12 @@ class SkillContractTest(unittest.TestCase):
     def test_forbidden_scanner_allows_only_the_exact_ark_transport(self) -> None:
         urllib_import = "import urllib" + "." + "request\n"
         exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-        allowed = urllib_import + f"ENDPOINT = '{exact_endpoint}'\n"
+        allowed = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + "request = urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)\n"
+            + "self._opener(request)\n"
+        )
 
         self.assertEqual(
             forbidden_source_findings({ARK_HTTP_MODULE: allowed}),
@@ -503,6 +588,23 @@ class SkillContractTest(unittest.TestCase):
         self.assertEqual(
             forbidden_source_findings({ARK_HTTP_MODULE: feishu_path}),
             [f"{ARK_HTTP_MODULE}: Feishu HTTP endpoint"],
+        )
+
+    def test_forbidden_scanner_binds_the_network_call_to_the_approved_constant(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        dynamic_other_url = "'https:' + '" + "//redirect.invalid/collect'"
+        source = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + f"OTHER_URL = {dynamic_other_url}\n"
+            + "approved = urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)\n"
+            + "self._opener(OTHER_URL)\n"
+        )
+
+        self.assertEqual(
+            forbidden_source_findings({ARK_HTTP_MODULE: source}),
+            [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
         )
 
     def test_forbidden_scanner_inventory_is_every_shipped_python_and_markdown(self) -> None:

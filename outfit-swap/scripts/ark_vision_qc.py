@@ -81,6 +81,8 @@ def _reject_json_constant(_value: str) -> None:
 def _extract_content(body: bytes) -> str:
     if not isinstance(body, bytes) or len(body) > _MAX_RESPONSE_BYTES:
         raise ArkVisionError("Ark vision response was invalid")
+    malformed = False
+    payload: Any = None
     try:
         payload = json.loads(
             body.decode("utf-8"),
@@ -88,7 +90,9 @@ def _extract_content(body: bytes) -> str:
             parse_constant=_reject_json_constant,
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        raise ArkVisionError("Ark vision response was not valid JSON") from None
+        malformed = True
+    if malformed:
+        raise ArkVisionError("Ark vision response was not valid JSON")
     if not isinstance(payload, dict):
         raise ArkVisionError("Ark vision response had an invalid shape")
     choices = payload.get("choices")
@@ -113,6 +117,18 @@ def _extract_content(body: bytes) -> str:
     return content
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+            self, request: Any, file_pointer: Any, code: int, message: str,
+            headers: Any, new_url: str,
+    ) -> None:
+        return None
+
+
+def _build_rejecting_opener(*handlers: Any) -> Callable[..., Any]:
+    return urllib.request.build_opener(_RejectRedirects(), *handlers).open
+
+
 class ArkVisionClient:
     def __init__(
             self, *, environ: Mapping[str, str] | None = None,
@@ -125,7 +141,7 @@ class ArkVisionClient:
                 or timeout_seconds <= 0):
             raise ValueError("timeout_seconds must be a positive finite number")
         self._environ = os.environ if environ is None else environ
-        self._opener = urllib.request.urlopen if opener is None else opener
+        self._opener = _build_rejecting_opener() if opener is None else opener
         self._timeout_seconds = float(timeout_seconds)
 
     def complete_json(
@@ -155,6 +171,9 @@ class ArkVisionClient:
         request_body = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
+        failure: str | None = None
+        body = b""
+        final_url: str | None = None
         try:
             request = urllib.request.Request(
                 ARK_CHAT_ENDPOINT,
@@ -166,15 +185,30 @@ class ArkVisionClient:
                 method="POST",
             )
             with self._opener(request, timeout=self._timeout_seconds) as response:
-                body = response.read(_MAX_RESPONSE_BYTES + 1)
+                final_url = response.geturl()
+                if final_url == ARK_CHAT_ENDPOINT:
+                    body = response.read(_MAX_RESPONSE_BYTES + 1)
         except (TimeoutError, socket.timeout):
-            raise ArkVisionError("Ark vision request timed out") from None
+            failure = "timeout"
         except urllib.error.URLError as exc:
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                raise ArkVisionError("Ark vision request timed out") from None
-            raise ArkVisionError("Ark vision request failed") from None
+                failure = "timeout"
+            else:
+                failure = "failed"
+            close = getattr(exc, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
         except Exception:
-            raise ArkVisionError("Ark vision request failed") from None
+            failure = "failed"
+        if failure == "timeout":
+            raise ArkVisionError("Ark vision request timed out")
+        if failure is not None:
+            raise ArkVisionError("Ark vision request failed")
+        if final_url != ARK_CHAT_ENDPOINT:
+            raise ArkVisionError("Ark vision response came from an unapproved endpoint")
         return _extract_content(body)
 
 

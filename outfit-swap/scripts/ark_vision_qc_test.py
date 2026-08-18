@@ -1,8 +1,12 @@
 import base64
+import io
 import json
 import sys
 import tempfile
+import traceback
 import unittest
+import urllib.response
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +54,12 @@ def response_body(
 
 
 class FakeResponse:
-    def __init__(self, body: bytes) -> None:
+    def __init__(
+            self, body: bytes,
+            url: str = "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    ) -> None:
         self.body = body
+        self.url = url
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -63,6 +71,9 @@ class FakeResponse:
         if amount < 0:
             return self.body
         return self.body[:amount]
+
+    def geturl(self) -> str:
+        return self.url
 
 
 class RecordingOpener:
@@ -76,6 +87,32 @@ class RecordingOpener:
 
 
 class ArkVisionClientTest(unittest.TestCase):
+    def assert_exception_is_sanitized(
+            self, exception: BaseException, *sentinels: str,
+    ) -> None:
+        pending: list[BaseException] = [exception]
+        seen: set[int] = set()
+        graph: list[BaseException] = []
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            graph.append(current)
+            if current.__cause__ is not None:
+                pending.append(current.__cause__)
+            if current.__context__ is not None:
+                pending.append(current.__context__)
+        rendered_graph = "\n".join(
+            repr((type(item).__name__, item.args, vars(item))) for item in graph
+        )
+        formatted = "".join(traceback.format_exception(exception))
+        for sentinel in sentinels:
+            self.assertNotIn(sentinel, rendered_graph)
+            self.assertNotIn(sentinel, formatted)
+        self.assertIsNone(exception.__cause__)
+        self.assertIsNone(exception.__context__)
+
     def test_posts_exact_multimodal_request_with_env_model_and_credentials(self) -> None:
         opener = RecordingOpener(response_body("{\"result\":\"ok\"}"))
         with tempfile.TemporaryDirectory() as directory:
@@ -172,6 +209,9 @@ class ArkVisionClientTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertNotIn(api_key, message)
         self.assertNotIn(base64_fragment, message)
+        self.assert_exception_is_sanitized(
+            raised.exception, api_key, base64_fragment,
+        )
 
     def test_remote_failures_never_expose_credentials_base64_or_response_text(self) -> None:
         api_key = "never-leak-api-key"
@@ -197,6 +237,121 @@ class ArkVisionClientTest(unittest.TestCase):
         self.assertNotIn(api_key, message)
         self.assertNotIn("base64", message.lower())
         self.assertNotIn(remote_body, message)
+        self.assert_exception_is_sanitized(
+            raised.exception, api_key, "AAAA", remote_body,
+        )
+
+    def test_malformed_response_exception_graph_does_not_retain_remote_body(self) -> None:
+        remote_sentinel = "private-remote-response-sentinel"
+        client = ark_vision_qc.ArkVisionClient(
+            environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+            opener=RecordingOpener(
+                f'{{"choices":["{remote_sentinel}"'.encode("utf-8"),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "candidate.png"
+            image.write_bytes(b"image")
+            with self.assertRaises(ark_vision_qc.ArkVisionError) as raised:
+                client.complete_json(
+                    system_prompt="system", user_prompt="user", images=(image,),
+                )
+
+        self.assert_exception_is_sanitized(raised.exception, remote_sentinel)
+
+    def test_same_host_and_cross_host_redirects_are_not_followed(self) -> None:
+        self.assertTrue(
+            hasattr(ark_vision_qc, "_build_rejecting_opener"),
+            "Ark transport must build an opener that rejects redirects",
+        )
+        url_request = getattr(ark_vision_qc.urllib, "request")
+
+        class RedirectingHTTPSHandler(url_request.BaseHandler):
+            handler_order = 100
+
+            def __init__(self, location: str, code: int) -> None:
+                self.location = location
+                self.code = code
+                self.requests: list[Any] = []
+                self.responses: list[Any] = []
+
+            def https_open(self, request: Any) -> Any:
+                self.requests.append(request)
+                headers = Message()
+                headers["Location"] = self.location
+                response = urllib.response.addinfourl(
+                    io.BytesIO(b"private redirect body"),
+                    headers,
+                    request.full_url,
+                    code=self.code,
+                )
+                response.msg = "Redirect"
+                self.responses.append(response)
+                return response
+
+        key_sentinel = "redirect-secret-key"
+        redirect_targets = (
+            "https://ark.cn-beijing.volces.com/api/v3/other",
+            "https://redirect-secret.invalid/collect",
+        )
+        for code in (301, 302, 303):
+            for target in redirect_targets:
+                with self.subTest(code=code, target=target):
+                    handler = RedirectingHTTPSHandler(target, code)
+                    opener = ark_vision_qc._build_rejecting_opener(handler)
+                    client = ark_vision_qc.ArkVisionClient(
+                        environ={
+                            "ARK_API_KEY": key_sentinel,
+                            "ARK_VISION_MODEL": "model",
+                        },
+                        opener=opener,
+                    )
+                    with tempfile.TemporaryDirectory() as directory:
+                        image = Path(directory) / "candidate.png"
+                        image.write_bytes(b"image")
+                        with self.assertRaises(ark_vision_qc.ArkVisionError) as raised:
+                            client.complete_json(
+                                system_prompt="system",
+                                user_prompt="private redirect prompt",
+                                images=(image,),
+                            )
+
+                    self.assertEqual(len(handler.requests), 1)
+                    self.assertTrue(handler.responses[0].closed)
+                    self.assertEqual(
+                        handler.requests[0].full_url,
+                        ark_vision_qc.ARK_CHAT_ENDPOINT,
+                    )
+                    self.assert_exception_is_sanitized(
+                        raised.exception,
+                        key_sentinel,
+                        target,
+                        "private redirect body",
+                        "private redirect prompt",
+                    )
+
+    def test_rejects_success_response_with_nonapproved_final_url(self) -> None:
+        for final_url in (
+            "https://ark.cn-beijing.volces.com/api/v3/other",
+            "https://redirect.invalid/api/v3/chat/completions",
+        ):
+            with self.subTest(final_url=final_url):
+                client = ark_vision_qc.ArkVisionClient(
+                    environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+                    opener=lambda _request, *, timeout: FakeResponse(
+                        response_body("private redirected response"), url=final_url,
+                    ),
+                )
+                with tempfile.TemporaryDirectory() as directory:
+                    image = Path(directory) / "candidate.png"
+                    image.write_bytes(b"image")
+                    with self.assertRaises(ark_vision_qc.ArkVisionError) as raised:
+                        client.complete_json(
+                            system_prompt="system", user_prompt="user", images=(image,),
+                        )
+                self.assert_exception_is_sanitized(
+                    raised.exception, final_url, "private redirected response",
+                )
 
     def test_rejects_content_filter_and_truncated_completions(self) -> None:
         for finish_reason, expected in (
