@@ -24,6 +24,13 @@ class _PrivateUpdate:
     payload_identity: tuple[int, int]
 
 
+@dataclass(frozen=True)
+class RecordPage:
+    path: Path
+    records_count: int
+    has_more: bool
+
+
 class LarkBaseClient:
     """Run Base commands without exposing task-local paths to the CLI argv."""
 
@@ -47,6 +54,39 @@ class LarkBaseClient:
             "--as", "user",
         ])
 
+    def list_fields(
+            self, *, app_token: str, table_id: str, limit: int = 200,
+            offset: int = 0,
+    ) -> dict:
+        """Return one schema page through the authenticated CLI."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+            raise LarkRunnerError("field list limit is invalid")
+        return self._json([
+            "base", "+field-list", "--base-token",
+            self._required(app_token, "app token"), "--table-id",
+            self._required(table_id, "table ID"), "--limit", str(limit),
+            "--offset", str(self._page_offset(offset)), "--as", "user",
+        ])
+
+    def create_field(
+            self, *, app_token: str, table_id: str, definition: dict,
+    ) -> dict:
+        """Create only a caller-validated field definition."""
+        expected = {
+            "name": "处理明细", "type": "text", "style": {"type": "plain"},
+        }
+        if definition != expected:
+            raise LarkRunnerError("field definition is not approved")
+        payload = json.dumps(
+            expected, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        return self._json([
+            "base", "+field-create", "--base-token",
+            self._required(app_token, "app token"), "--table-id",
+            self._required(table_id, "table ID"), "--json", payload,
+            "--as", "user",
+        ])
+
     def list_records(
             self, *, app_token: str, table_id: str, field_ids: Sequence[str],
             filter_payload: Path, output: Path, limit: int = 2000, offset: int = 0,
@@ -56,6 +96,50 @@ class LarkBaseClient:
         filter_path, filter_arg = self._input_path(filter_payload)
         self._validate_status_filter(filter_path, retry_failed=retry_failed)
         output_path, output_arg = self._output_path(output)
+        command = self._record_list_command(
+            app_token=app_token, table_id=table_id, field_ids=field_ids,
+            filter_arg=filter_arg, output_arg=output_arg, limit=limit,
+            offset=offset, view_id=view_id,
+        )
+        self._run(command, cwd=output_path.parent)
+        return output_path
+
+    def list_records_page(
+            self, *, app_token: str, table_id: str, field_ids: Sequence[str],
+            filter_payload: Path, output: Path, limit: int = 2000,
+            offset: int = 0, view_id: str | None = None,
+            retry_failed: bool = False,
+    ) -> RecordPage:
+        """Write one NDJSON page and return its validated minimal summary."""
+        filter_path, filter_arg = self._input_path(filter_payload)
+        self._validate_status_filter(filter_path, retry_failed=retry_failed)
+        output_path, output_arg = self._output_path(output)
+        command = self._record_list_command(
+            app_token=app_token, table_id=table_id, field_ids=field_ids,
+            filter_arg=filter_arg, output_arg=output_arg, limit=limit,
+            offset=offset, view_id=view_id,
+        )
+        result = self._run(command, cwd=output_path.parent)
+        try:
+            summary = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise LarkRunnerError("lark-cli returned invalid record summary") from None
+        if (not isinstance(summary, dict)
+                or not isinstance(summary.get("records_count"), int)
+                or isinstance(summary.get("records_count"), bool)
+                or summary["records_count"] < 0
+                or not isinstance(summary.get("has_more"), bool)):
+            raise LarkRunnerError("lark-cli returned invalid record summary")
+        return RecordPage(
+            path=output_path, records_count=summary["records_count"],
+            has_more=summary["has_more"],
+        )
+
+    def _record_list_command(
+            self, *, app_token: str, table_id: str,
+            field_ids: Sequence[str], filter_arg: str, output_arg: str,
+            limit: int, offset: int, view_id: str | None,
+    ) -> list[str]:
         command = [
             "base", "+record-list", "--base-token", self._required(app_token, "app token"),
             "--table-id", self._required(table_id, "table ID"),
@@ -69,8 +153,7 @@ class LarkBaseClient:
             str(self._page_limit(limit)), "--offset", str(self._page_offset(offset)),
             "--output", output_arg, "--minimal-stdout", "--as", "user",
         ])
-        self._run(command, cwd=output_path.parent)
-        return output_path
+        return command
 
     def download_attachment(
             self, *, app_token: str, table_id: str, record_id: str, token: str,

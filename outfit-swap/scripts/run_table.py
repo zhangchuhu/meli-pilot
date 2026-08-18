@@ -369,6 +369,9 @@ class BoundedBase:
     def list_records(self, **kwargs: object) -> object:
         return self._read("list_records", **kwargs)
 
+    def list_records_page(self, **kwargs: object) -> object:
+        return self._read("list_records_page", **kwargs)
+
     def download_attachment(self, **kwargs: object) -> object:
         return self._read("download_attachment", **kwargs)
 
@@ -437,10 +440,18 @@ class ScopedBase:
         self._scope(kwargs, frozenset({
             "app_token", "table_id", "record_id", "field_ids",
         }))
-        if kwargs["field_ids"] != [
+        permitted = (
+            [
                 self._scope_value.output_field_id,
                 self._scope_value.detail_field_id,
-        ]:
+            ],
+            [
+                self._scope_value.output_field_id,
+                self._scope_value.status_field_id,
+                self._scope_value.detail_field_id,
+            ],
+        )
+        if kwargs["field_ids"] not in permitted:
             raise PreflightError("Base read fields escaped the record capability scope")
         return self._base.get_record(**kwargs)
 
@@ -698,6 +709,7 @@ class RecordFinalizerAdapter:
     def __init__(
             self, *, base: object, app_token: str, table_id: str,
             output_field_id: str, detail_field_id: str,
+            status_field_id: str | None = None,
             clock: Callable[[], str] | None = None, qc_mode: str = "automatic",
     ) -> None:
         if qc_mode not in {"automatic", "shadow"}:
@@ -707,6 +719,7 @@ class RecordFinalizerAdapter:
         self._app_token = app_token
         self._table_id = table_id
         self._output_field_id = output_field_id
+        self._status_field_id = status_field_id
         self._detail_field_id = detail_field_id
         self._clock = clock or _utc_now
         self._target = finalize_target.TargetFinalizer(
@@ -775,6 +788,64 @@ class RecordFinalizerAdapter:
     ) -> finalize_target.FinalizeResult:
         return self._target.finalize(request)
 
+    def terminalize_record(
+            self, context: RecordContext, result_status: str,
+    ) -> None:
+        """Persist and exact-readback one terminal status/detail envelope."""
+        if (not isinstance(context, RecordContext)
+                or result_status not in {"success", "failed", "stopped"}
+                or not isinstance(self._status_field_id, str)
+                or not self._status_field_id):
+            raise finalize_target.FinalizeError("terminal record scope is invalid")
+        state_file = Path(context.task_dir).resolve() / "manifest.json"
+        try:
+            state = task_state.load_state(state_file)
+            if state["record_id"] != context.record_id:
+                raise ValueError
+            detail = task_state.compact_detail(state)
+        except Exception:
+            raise finalize_target.FinalizeError("terminal record state is invalid") from None
+        status = "成功" if result_status == "success" else "失败"
+        root = Path(context.task_dir).resolve() / "generated_images"
+        descriptor, filename = tempfile.mkstemp(
+            prefix=".terminal-record-", suffix=".json", dir=root,
+        )
+        payload = Path(filename)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"update_records": {context.record_id: {
+                        "任务状态": [status], "处理明细": detail,
+                    }}},
+                    handle, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._base.update_record(
+                app_token=self._app_token, table_id=self._table_id,
+                record_id=context.record_id, payload=Path(payload.name),
+            )
+            response = self._base.get_record(
+                app_token=self._app_token, table_id=self._table_id,
+                record_id=context.record_id,
+                field_ids=[
+                    self._output_field_id, self._status_field_id,
+                    self._detail_field_id,
+                ],
+            )
+            fields = finalize_target._record_fields(response, context.record_id)
+            if fields.get("任务状态") != [status] or fields.get("处理明细") != detail:
+                raise ValueError
+        except Exception:
+            raise finalize_target.FinalizeError("terminal record write/readback failed") from None
+        finally:
+            try:
+                payload.unlink()
+            except FileNotFoundError:
+                pass
+
     def __call__(
             self, request: finalize_target.FinalizeRequest,
     ) -> finalize_target.FinalizeResult:
@@ -817,6 +888,7 @@ class ProductionRecordServicesFactory:
             app_token=self._scope.app_token,
             table_id=self._scope.table_id,
             output_field_id=self._schema.field("输出图").field_id,
+            status_field_id=self._schema.field("任务状态").field_id,
             detail_field_id=self._schema.field("处理明细").field_id,
             clock=self._clock,
             qc_mode=qc_mode,
@@ -1129,8 +1201,12 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _missing_runtime(_config: TableConfig) -> TableResult:
-    raise TableSchedulerError("production runtime must be supplied by the skill entry point")
+def _production_execute(config: TableConfig) -> TableResult:
+    try:
+        from scripts.production_runtime import execute
+    except ImportError:  # pragma: no cover - direct script-directory execution
+        from production_runtime import execute  # type: ignore[no-redef]
+    return execute(config)
 
 
 def main(
@@ -1145,7 +1221,7 @@ def main(
         qc_mode=args.qc_mode,
     )
     try:
-        result = (execute or _missing_runtime)(config)
+        result = (execute or _production_execute)(config)
         if not isinstance(result, TableResult):
             raise TableSchedulerError("table execution returned an invalid result")
     except (OSError, TableSchedulerError, TypeError, ValueError) as error:

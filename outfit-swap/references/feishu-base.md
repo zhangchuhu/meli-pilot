@@ -34,7 +34,7 @@ Skip `成功` in both modes. While `has_more` is true, advance listing offset by
 
 ## Typed Lark interface
 
-Use `scripts/lark_runner.py:LarkBaseClient` for Base transport. Its implemented operations are `resolve_base`, `list_records`, `download_attachment`, `upload_attachment`, `update_record`, and `get_record`. Authenticate as the user. Never make direct Feishu HTTP calls.
+Use `scripts/lark_runner.py:LarkBaseClient` for Base transport. Its implemented operations are `resolve_base`, `list_fields`, `create_field`, `list_records`, `list_records_page`, `download_attachment`, `upload_attachment`, `update_record`, and `get_record`. `scripts/production_runtime.py` assembles these operations for bare `scripts/run_table.py`; no host-supplied dependency injection is required. Authenticate as the user. Never make direct Feishu HTTP calls.
 
 For every file-backed call, pass one task-local basename. Run `lark-cli` with the file's validated parent as `cwd`. Every file-backed argument is relative to that `cwd`:
 
@@ -45,6 +45,8 @@ For every file-backed call, pass one task-local basename. Run `lark-cli` with th
 ```
 
 Reject absolute file arguments, `..`, path separators, pre-existing output files, and symlink escapes. Keep argv as a list and `shell=False`; never construct `cd`, shell interpolation, or a shell pipeline.
+
+Treat remote attachment names as untrusted metadata. Build local names only from the opaque role, attachment order, and token digest. Download to a safe provisional raster basename, validate the actual bytes, and use a canonical suffix derived from the decoded codec before Seedream or Ark transfer. A path-like remote name or an extension that disagrees with the bytes must neither escape the record directory nor become a MIME-label mismatch.
 
 Use these record-keyed CellValue envelopes internally:
 

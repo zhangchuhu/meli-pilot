@@ -25,7 +25,7 @@ Treat invocation of this skill with an exact table URL as authorization for this
 
 ## Before running
 
-Require Python 3.10 or newer, `lark-cli`, `ffmpeg`, `ffprobe`, `ARK_API_KEY`, `ARK_VISION_MODEL`, and the active installed `doubao-imagegen` skill. Resolve that skill and its `scripts/doubao_imagegen.py` from the active skill catalog; never hardcode a home-directory path.
+Require Python 3.10 or newer, `lark-cli`, `ffmpeg`, `ffprobe`, `ARK_API_KEY`, `ARK_VISION_MODEL`, and the active installed `doubao-imagegen` skill. The production entry uses the normal installed skill location; set `OUTFIT_SWAP_DOUBAO_SCRIPT` to the resolved script path only when the active catalog uses another location. `OUTFIT_SWAP_LARK_CLI`, `OUTFIT_SWAP_STATE_ROOT`, and `OUTFIT_SWAP_RUNS_ROOT` are optional non-secret executable/state discovery overrides. Do not use these variables for credentials or endpoint overrides.
 
 Read these contracts before execution:
 
@@ -63,6 +63,7 @@ Pass diagnostics through `--error-file`; never put raw diagnostics in argv.
 Use these modules through `run_table.py`; read their source only for diagnosis or extension:
 
 - [`scripts/run_table.py`](scripts/run_table.py): preflight, bounded record scheduling, service limits, and global stop
+- [`scripts/production_runtime.py`](scripts/production_runtime.py): concrete Lark/Seedream/Ark materialization and service assembly used by bare `run_table.py`
 - [`scripts/run_record.py`](scripts/run_record.py): serial target orchestration and recovery
 - [`scripts/reference_selector.py`](scripts/reference_selector.py): deterministic three/four-reference selection and evidenced fifth exception
 - [`scripts/prompt_builder.py`](scripts/prompt_builder.py): immutable target plans and controlled corrections

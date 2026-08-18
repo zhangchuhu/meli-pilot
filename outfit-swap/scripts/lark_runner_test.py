@@ -9,7 +9,7 @@ import traceback
 import unittest
 from pathlib import Path
 
-from scripts.lark_runner import LarkBaseClient, LarkRunnerError
+from scripts.lark_runner import LarkBaseClient, LarkRunnerError, RecordPage
 
 
 class LarkBaseClientTest(unittest.TestCase):
@@ -415,6 +415,54 @@ class LarkBaseClientTest(unittest.TestCase):
             "tbl123", "--record-id", "rec123", "--field-id", "fld-output",
             "--field-id", "fld-detail", "--format", "json", "--as", "user",
         ])
+
+    def test_schema_commands_are_typed_and_field_creation_is_pinned(self) -> None:
+        self.assertEqual(self.client.list_fields(
+            app_token="app-token", table_id="tbl123", limit=200, offset=400,
+        ), {"ok": True})
+        self.assertEqual(self.client.create_field(
+            app_token="app-token", table_id="tbl123",
+            definition={
+                "name": "处理明细", "type": "text",
+                "style": {"type": "plain"},
+            },
+        ), {"ok": True})
+        calls = self._calls()
+        self.assertEqual(calls[-2]["argv"], [
+            "base", "+field-list", "--base-token", "app-token", "--table-id",
+            "tbl123", "--limit", "200", "--offset", "400", "--as", "user",
+        ])
+        self.assertEqual(calls[-1]["argv"][:6], [
+            "base", "+field-create", "--base-token", "app-token", "--table-id",
+            "tbl123",
+        ])
+        self.assertIn("--json", calls[-1]["argv"])
+
+    def test_record_page_returns_validated_minimal_summary(self) -> None:
+        (self.task_dir / "status-filter.json").write_text(
+            '{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]]}',
+            encoding="utf-8",
+        )
+        old_stdout = os.environ.get("LARK_TEST_STDOUT")
+        os.environ["LARK_TEST_STDOUT"] = json.dumps({
+            "records_count": 1, "has_more": False,
+        })
+        try:
+            page = self.client.list_records_page(
+                app_token="app-token", table_id="tbl123", view_id="vew123",
+                field_ids=["fld-source"],
+                filter_payload=Path("status-filter.json"),
+                output=Path("page.ndjson"),
+            )
+        finally:
+            if old_stdout is None:
+                os.environ.pop("LARK_TEST_STDOUT", None)
+            else:
+                os.environ["LARK_TEST_STDOUT"] = old_stdout
+        self.assertEqual(page, RecordPage(
+            path=(self.task_dir / "page.ndjson").resolve(),
+            records_count=1, has_more=False,
+        ))
 
 
 if __name__ == "__main__":

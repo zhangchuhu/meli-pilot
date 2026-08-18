@@ -30,6 +30,7 @@ RUNTIME_SCRIPTS = (
     "scripts/infographic_text.py",
     "scripts/lark_runner.py",
     "scripts/prompt_builder.py",
+    "scripts/production_runtime.py",
     "scripts/qc_replay.py",
     "scripts/reference_selector.py",
     "scripts/run_record.py",
