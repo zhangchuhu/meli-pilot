@@ -353,7 +353,7 @@ class StandaloneEntryTest(unittest.TestCase):
 class ProductionRuntimeContractTest(unittest.TestCase):
     def test_retry_failed_resumes_exhausted_comparative_checkpoint_without_reset(self) -> None:
         from scripts import production_runtime, prompt_builder, task_state, vision_qc
-        from scripts.run_record import run_record
+        from scripts.lark_runner import RecordPage
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -408,52 +408,34 @@ class ProductionRuntimeContractTest(unittest.TestCase):
                     )
             task_state.save_state(state_path, state)
 
-            input_image = root / "input.png"
-            _write_png(input_image)
-            class Service:
-                def register_record(self, *_args: object) -> None: pass
-            class Base:
-                def download_attachment(self, **kwargs: object) -> None:
-                    Path(kwargs["output"]).write_bytes(input_image.read_bytes())
-            current = runs / "current"
-            current.mkdir()
-            adapter = production_runtime.ProductionTableAdapter(
-                run_id="current", run_dir=current, runs_root=runs,
-                state_root=state_root, base_service=Service(), ark_client=object(),
+            prior_record = prior_generated.parent
+            task_state.bind_manifest(
+                state_root=state_root, base_token="app_exact", table_id="tbl_exact",
+                record_id="rec_1", run_manifest=prior_record / "manifest.json",
             )
-            record = {"record_id": "rec_1", "fields": {
-                "原图": [{"file_token": "source_1", "name": "source.jpg"}],
-                "爆款图": [{"file_token": "target_1", "name": "target.jpg"}],
-                "输出图": [], "任务状态": ["失败"], "处理明细": "stopped",
-            }}
-            context = adapter._materialize(
-                TableScope("app_exact", "tbl_exact", "view_exact"), _table_schema(),
-                record, retry_failed=True, base=Base(),
+            identities = tuple(
+                entry["artifact_name"]
+                for entry in state["targets"]["target_1"]["attempt_history"]
             )
-            resumed = task_state.load_state(context.task_dir / "manifest.json")
-            self.assertEqual((resumed["current_target"], resumed["targets"]["target_1"]["attempts"]),
-                             ("target_1", 3))
 
             class Generator:
                 model = "model"
+                calls = 0
                 def artifact_path(self, ctx, history):
                     return ctx.task_dir / "generated_images" / history["artifact_name"]
                 def generate(self, _request):
-                    raise AssertionError("no fourth generation")
-            class QC:
-                calls = 0
-                def compare(self, request):
                     self.calls += 1
-                    reports = tuple(vision_qc.QCReport(
-                        alias, vision_qc.Scores(70 + int(alias[-1]), 80, 80, 80, None),
-                        (vision_qc.DefectCode.WRONG_COLOR,), vision_qc.DefectCode.WRONG_COLOR,
-                        0.9, "reject",
-                    ) for alias in request.aliases)
-                    ranking = tuple(reversed(request.aliases))
-                    return vision_qc.ComparativeReport(reports, ranking, ranking[0])
+                    raise AssertionError("no fourth generation")
+            class Events:
+                def append(self, *_args, **_kwargs): return None
+            remote = {"status": ["未开始"], "detail": None, "outputs": []}
             class Finalizer:
+                uploads = 0
+                writes: list[tuple[list[str], str]] = []
+                readbacks: list[tuple[list[str], str]] = []
                 def reconcile_record(self, *_args): return None
                 def finalize(self, request):
+                    self.uploads += 1
                     value = task_state.load_state(request.state_file)
                     token = value["target_tokens"][request.target_index]
                     name = task_state.promoted_output_name(request.candidate.name, token)
@@ -466,15 +448,99 @@ class ProductionRuntimeContractTest(unittest.TestCase):
                         updated_at="2026-08-19T00:01:01+00:00",
                     )
                     task_state.save_state(request.state_file, value)
-            class Events:
-                def append(self, *_args, **_kwargs): return None
+                    remote["outputs"] = [{"file_token": "uploaded", "name": name}]
+                def terminalize_record(self, _context, status):
+                    terminal = ["成功"] if status == "success" else ["失败"]
+                    detail = "success: 1/1" if status == "success" else "failed: comparative QC stopped"
+                    remote.update(status=terminal, detail=detail)
+                    self.writes.append((list(terminal), detail))
+                    observed = (list(remote["status"]), str(remote["detail"]))
+                    self.readbacks.append(observed)
+                    if observed != (terminal, detail):
+                        raise AssertionError("terminal Base exact readback failed")
+            class FailingQC:
+                calls = 0
+                def compare(self, _request):
+                    self.calls += 1
+                    raise ValueError("malformed comparative response")
+
+            generator = Generator()
+            finalizer = Finalizer()
+            failing_qc = FailingQC()
+            first = production_runtime._terminal_worker(
+                RecordContext(prior_record, "rec_1", (0,)),
+                RecordServices(generator, failing_qc, finalizer, Events(), GlobalStop()),
+            )
+            stopped = task_state.load_state(state_path)
+            self.assertEqual(first.status, "stopped")
+            self.assertEqual(remote["status"], ["失败"])
+            self.assertEqual(finalizer.writes[-1], finalizer.readbacks[-1])
+            self.assertIsNone(stopped["record_error"])
+            self.assertEqual(stopped["current_target"], "target_1")
+            self.assertEqual(tuple(
+                entry["artifact_name"] for entry in stopped["targets"]["target_1"]["attempt_history"]
+            ), identities)
+            self.assertEqual(generator.calls, 0)
+            self.assertEqual(failing_qc.calls, 1)
+
+            input_image = root / "input.png"
+            _write_png(input_image)
+            class Service:
+                def register_record(self, *_args: object) -> None: pass
+            class Base:
+                def list_records_page(self, **_kwargs: object) -> RecordPage:
+                    page = root / "failed-record.ndjson"
+                    page.write_text(json.dumps({"record_id": "rec_1", "fields": {
+                        "原图": [{"file_token": "source_1", "name": "source.jpg"}],
+                        "爆款图": [{"file_token": "target_1", "name": "target.jpg"}],
+                        "输出图": remote["outputs"], "任务状态": remote["status"],
+                        "处理明细": remote["detail"],
+                    }}) + "\n", encoding="utf-8")
+                    return RecordPage(page, 1, False)
+                def download_attachment(self, **kwargs: object) -> None:
+                    Path(kwargs["output"]).write_bytes(input_image.read_bytes())
+            current = runs / "current"
+            current.mkdir()
+            adapter = production_runtime.ProductionTableAdapter(
+                run_id="current", run_dir=current, runs_root=runs,
+                state_root=state_root, base_service=Service(), ark_client=object(),
+            )
+            contexts = tuple(adapter.list_records(
+                TableScope("app_exact", "tbl_exact", "view_exact"), _table_schema(),
+                retry_failed=True, qc_mode="automatic", base=Base(),
+            ))
+            self.assertEqual([item.record_id for item in contexts], ["rec_1"])
+            context = contexts[0]
+            resumed = task_state.load_state(context.task_dir / "manifest.json")
+            self.assertEqual((resumed["current_target"], resumed["targets"]["target_1"]["attempts"]),
+                             ("target_1", 3))
+
+            class QC:
+                calls = 0
+                def compare(self, request):
+                    self.calls += 1
+                    reports = tuple(vision_qc.QCReport(
+                        alias, vision_qc.Scores(70 + int(alias[-1]), 80, 80, 80, None),
+                        (vision_qc.DefectCode.WRONG_COLOR,), vision_qc.DefectCode.WRONG_COLOR,
+                        0.9, "reject",
+                    ) for alias in request.aliases)
+                    ranking = tuple(reversed(request.aliases))
+                    return vision_qc.ComparativeReport(reports, ranking, ranking[0])
             qc = QC()
-            result = run_record(context, RecordServices(
-                Generator(), qc, Finalizer(), Events(), GlobalStop(),
+            result = production_runtime._terminal_worker(context, RecordServices(
+                generator, qc, finalizer, Events(), GlobalStop(),
             ))
             self.assertEqual(result.status, "success")
             self.assertEqual(qc.calls, 1)
-            self.assertEqual(len(task_state.load_state(state_path)["targets"]["target_1"]["attempt_history"]), 3)
+            completed = task_state.load_state(state_path)
+            self.assertEqual(tuple(
+                entry["artifact_name"] for entry in completed["targets"]["target_1"]["attempt_history"]
+            ), identities)
+            self.assertEqual(generator.calls, 0)
+            self.assertEqual(finalizer.uploads, 1)
+            self.assertEqual((len(finalizer.writes), len(finalizer.readbacks)), (2, 2))
+            self.assertEqual(remote["status"], ["成功"])
+            self.assertEqual(finalizer.writes[-1], finalizer.readbacks[-1])
 
     def test_record_limit_validates_later_page_before_any_materialization(self) -> None:
         from scripts import production_runtime
