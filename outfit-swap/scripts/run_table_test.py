@@ -135,13 +135,16 @@ def _schema(*, missing: str | None = None, drift: str | None = None) -> TableSch
 def _record_scope(
         record_id: str = "rec_1", *,
         attachment_tokens: frozenset[str] = frozenset({"box_source_1"}),
+        payload_root: Path = Path.cwd(),
 ) -> RecordBaseScope:
     return RecordBaseScope(
         table=TableScope("app_exact", "tbl_exact", "vew_exact"),
         record_id=record_id,
         attachment_tokens=attachment_tokens,
         output_field_id="fld_output",
+        status_field_id="fld_status",
         detail_field_id="fld_detail",
+        payload_root=payload_root,
     )
 
 
@@ -207,7 +210,9 @@ class _Adapter:
             record_id=context.record_id,
             attachment_tokens=frozenset({"box_source_1", "box_target_1"}),
             output_field_id=schema.field("输出图").field_id,
+            status_field_id=schema.field("任务状态").field_id,
             detail_field_id=schema.field("处理明细").field_id,
+            payload_root=context.task_dir / "generated_images",
         )
 
 
@@ -518,49 +523,78 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(result, TableResult(4, 1, 0, 3))
 
     def test_global_stop_race_blocks_waiting_and_queued_qc_ten_times(self) -> None:
-        @dataclass
-        class Request:
-            on_review: object
-
         for iteration in range(10):
             with self.subTest(iteration=iteration):
-                root = Path(tempfile.mkdtemp())
-                contexts = [
-                    RecordContext(root / f"r{index}", f"rec_{index}", (0,))
-                    for index in range(4)
-                ]
-                adapter = _Adapter(contexts)
                 first_started = threading.Event()
+                release_first = threading.Event()
 
-                def worker(
-                        context: RecordContext, services: RecordServices,
-                ) -> RecordResult:
-                    if context.record_id != "rec_0":
-                        first_started.wait(timeout=1)
+                class InstrumentedSemaphore:
+                    def __init__(self) -> None:
+                        self._semaphore = threading.BoundedSemaphore(1)
+                        self._lock = threading.Lock()
+                        self.acquisition_attempts = 0
+                        self.second_waiting = threading.Event()
 
-                    def stop_after_first_start() -> None:
-                        first_started.set()
-                        services.stop_signal.set()
+                    def __enter__(self) -> "InstrumentedSemaphore":
+                        with self._lock:
+                            self.acquisition_attempts += 1
+                            if self.acquisition_attempts == 2:
+                                self.second_waiting.set()
+                        self._semaphore.acquire()
+                        return self
 
-                    callback = (
-                        stop_after_first_start
-                        if context.record_id == "rec_0" else lambda: None
-                    )
+                    def __exit__(self, *_args: object) -> None:
+                        self._semaphore.release()
+
+                class QCService:
+                    def __init__(self) -> None:
+                        self._lock = threading.Lock()
+                        self.calls = 0
+
+                    def review(self, request: object) -> object:
+                        with self._lock:
+                            self.calls += 1
+                            call = self.calls
+                        if call == 1:
+                            first_started.set()
+                            if not release_first.wait(timeout=2):
+                                raise AssertionError("first QC call was not released")
+                        return request
+
+                semaphore = InstrumentedSemaphore()
+                raw = QCService()
+                stop = GlobalStop()
+                qc = BoundedQC(
+                    raw, semaphore, stop, checkpoint=lambda _request: None,
+                )
+                outcomes: list[str] = []
+
+                def review() -> None:
                     try:
-                        services.qc.review(Request(callback))
+                        qc.review(object())
                     except PaidCallStopped:
-                        return RecordResult(context.record_id, "stopped", 0)
-                    return RecordResult(context.record_id, "success", 0)
+                        outcomes.append("stopped")
+                    else:
+                        outcomes.append("finished")
 
-                runtime = _runtime(adapter, worker)
-                result = TableScheduler(runtime, limits=ServiceLimits(
-                    record_workers=2, doubao_requests=2, qc_requests=1,
-                    lark_writes=1, lark_reads=2,
-                )).run(TableConfig(
-                    "https://base.example/table", record_concurrency=2,
-                ))
-                self.assertEqual(runtime.qc.calls, 1)
-                self.assertEqual(result, TableResult(4, 1, 0, 3))
+                first = threading.Thread(target=review)
+                second = threading.Thread(target=review)
+                first.start()
+                self.assertTrue(first_started.wait(timeout=1))
+                second.start()
+                self.assertTrue(semaphore.second_waiting.wait(timeout=1))
+                self.assertEqual(semaphore.acquisition_attempts, 2)
+                self.assertEqual(raw.calls, 1)
+
+                stop.set()
+                release_first.set()
+                first.join(timeout=2)
+                second.join(timeout=2)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(raw.calls, 1)
+                self.assertCountEqual(outcomes, ["finished", "stopped"])
 
 
 class ProductionAdapterTest(unittest.TestCase):
@@ -1002,6 +1036,13 @@ class SemaphoreTest(unittest.TestCase):
 
     def test_default_lark_read_and_write_maxima_and_exact_scope(self) -> None:
         limits = ServiceLimits()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        payload_root = Path(temporary.name)
+        (payload_root / "update.json").write_text(
+            '{"update_records":{"rec_1":{"处理明细":"observed"}}}',
+            encoding="utf-8",
+        )
 
         class Base:
             def __init__(self) -> None:
@@ -1019,7 +1060,7 @@ class SemaphoreTest(unittest.TestCase):
             raw,
             read_semaphore=threading.BoundedSemaphore(limits.lark_reads),
             write_semaphore=threading.BoundedSemaphore(limits.lark_writes),
-        ).scoped(_record_scope())
+        ).scoped(_record_scope(payload_root=payload_root))
 
         read_threads = [threading.Thread(target=base.get_record, kwargs={
             "app_token": "app_exact", "table_id": "tbl_exact",
@@ -1059,12 +1100,22 @@ class SemaphoreTest(unittest.TestCase):
             )
 
     def test_worker_base_capabilities_block_scope_escape_before_client_call(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        payload_root = Path(temporary.name)
+        (payload_root / "update.json").write_text(
+            '{"update_records":{"rec_1":{"处理明细":"observed"}}}',
+            encoding="utf-8",
+        )
         raw = _Base()
         base = BoundedBase(
             raw,
             read_semaphore=threading.BoundedSemaphore(2),
             write_semaphore=threading.BoundedSemaphore(1),
-        ).scoped(_record_scope(attachment_tokens=frozenset({"box_source_1"})))
+        ).scoped(_record_scope(
+            attachment_tokens=frozenset({"box_source_1"}),
+            payload_root=payload_root,
+        ))
 
         base.get_record(
             app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
@@ -1116,6 +1167,82 @@ class SemaphoreTest(unittest.TestCase):
         self.assertFalse(hasattr(base, "list_fields"))
         self.assertFalse(hasattr(base, "create_field"))
         self.assertFalse(hasattr(base, "resolve_base"))
+
+    def test_worker_update_payload_blocks_field_capability_escape_before_client_call(
+            self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = _Base()
+            base = BoundedBase(
+                raw,
+                read_semaphore=threading.BoundedSemaphore(2),
+                write_semaphore=threading.BoundedSemaphore(1),
+            ).scoped(_record_scope(payload_root=root))
+
+            def payload(name: str, value: str) -> Path:
+                path = root / name
+                path.write_text(value, encoding="utf-8")
+                return path
+
+            valid = payload(
+                "valid.json",
+                '{"update_records":{"rec_1":{"任务状态":["成功"],'
+                '"处理明细":"observed"}}}',
+            )
+            base.update_record(
+                app_token="app_exact", table_id="tbl_exact",
+                record_id="rec_1", payload=Path(valid.name),
+            )
+            self.assertEqual(len(raw.calls), 1)
+
+            malicious = {
+                "extra root": (
+                    '{"update_records":{"rec_1":{"处理明细":"x"}},'
+                    '"delete_records":["rec_1"]}'
+                ),
+                "cross record": (
+                    '{"update_records":{"rec_other":{"处理明细":"x"}}}'
+                ),
+                "source field": (
+                    '{"update_records":{"rec_1":{"原图":[]}}}'
+                ),
+                "output cross field": (
+                    '{"update_records":{"rec_1":{"输出图":[]}}}'
+                ),
+                "field id alias": (
+                    '{"update_records":{"rec_1":{"fld_detail":"x"}}}'
+                ),
+                "nested detail": (
+                    '{"update_records":{"rec_1":{"处理明细":'
+                    '{"任务状态":["成功"]}}}}'
+                ),
+                "nested status": (
+                    '{"update_records":{"rec_1":{"任务状态":[["成功"]]}}}'
+                ),
+                "duplicate root": (
+                    '{"update_records":{"rec_1":{"处理明细":"x"}},'
+                    '"update_records":{"rec_1":{"处理明细":"y"}}}'
+                ),
+                "duplicate record": (
+                    '{"update_records":{"rec_1":{"处理明细":"x"},'
+                    '"rec_1":{"处理明细":"y"}}}'
+                ),
+                "duplicate field": (
+                    '{"update_records":{"rec_1":{"处理明细":"x",'
+                    '"处理明细":"y"}}}'
+                ),
+            }
+            for index, (label, value) in enumerate(malicious.items()):
+                with self.subTest(label=label):
+                    before = len(raw.calls)
+                    path = payload(f"malicious-{index}.json", value)
+                    with self.assertRaises(PreflightError):
+                        base.update_record(
+                            app_token="app_exact", table_id="tbl_exact",
+                            record_id="rec_1", payload=Path(path.name),
+                        )
+                    self.assertEqual(len(raw.calls), before)
 
 
 if __name__ == "__main__":

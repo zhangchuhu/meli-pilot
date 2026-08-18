@@ -113,7 +113,9 @@ class RecordBaseScope:
     record_id: str
     attachment_tokens: frozenset[str]
     output_field_id: str
+    status_field_id: str
     detail_field_id: str
+    payload_root: Path
 
     def __post_init__(self) -> None:
         if (not isinstance(self.table, TableScope)
@@ -125,10 +127,21 @@ class RecordBaseScope:
                 )
                 or not isinstance(self.output_field_id, str)
                 or not self.output_field_id
+                or not isinstance(self.status_field_id, str)
+                or not self.status_field_id
                 or not isinstance(self.detail_field_id, str)
                 or not self.detail_field_id
-                or self.output_field_id == self.detail_field_id):
+                or len({
+                    self.output_field_id,
+                    self.status_field_id,
+                    self.detail_field_id,
+                }) != 3):
             raise PreflightError("record Base capability scope is invalid")
+        try:
+            payload_root = Path(self.payload_root).resolve(strict=False)
+        except (OSError, TypeError, ValueError):
+            raise PreflightError("record Base capability scope is invalid") from None
+        object.__setattr__(self, "payload_root", payload_root)
 
 
 @dataclass(frozen=True)
@@ -422,7 +435,74 @@ class ScopedBase:
         self._scope(kwargs, frozenset({
             "app_token", "table_id", "record_id", "payload",
         }))
+        self._validate_update_payload(kwargs["payload"])
         return self._base.update_record(**kwargs)
+
+    def _validate_update_payload(self, supplied: object) -> None:
+        invalid = False
+        path: Path | None = None
+        if isinstance(supplied, Path):
+            if (supplied.is_absolute() or len(supplied.parts) != 1
+                    or supplied.name in {"", ".", ".."}):
+                invalid = True
+            else:
+                path = self._scope_value.payload_root / supplied.name
+        else:
+            invalid = True
+        try:
+            if (path is None or path.is_symlink() or not path.is_file()
+                    or path.resolve().parent != self._scope_value.payload_root):
+                invalid = True
+                decoded = None
+            else:
+                decoded = json.loads(
+                    path.read_text(encoding="utf-8"),
+                    object_pairs_hook=self._unique_json_object,
+                )
+        except (OSError, UnicodeError, ValueError):
+            invalid = True
+            decoded = None
+
+        if not isinstance(decoded, dict) or set(decoded) != {"update_records"}:
+            invalid = True
+            updates = None
+        else:
+            updates = decoded["update_records"]
+        if (not isinstance(updates, dict)
+                or set(updates) != {self._scope_value.record_id}):
+            invalid = True
+            fields = None
+        else:
+            fields = updates[self._scope_value.record_id]
+        allowed = {"任务状态", "处理明细"}
+        if (not isinstance(fields, dict) or not fields
+                or not set(fields).issubset(allowed)):
+            invalid = True
+        else:
+            detail = fields.get("处理明细")
+            status = fields.get("任务状态")
+            if "处理明细" in fields and not isinstance(detail, str):
+                invalid = True
+            if ("任务状态" in fields
+                    and (not isinstance(status, list) or len(status) != 1
+                         or not isinstance(status[0], str)
+                         or status[0] not in {"未开始", "成功", "失败"})):
+                invalid = True
+        if invalid:
+            raise PreflightError(
+                "record update payload escaped field capability scope",
+            )
+
+    @staticmethod
+    def _unique_json_object(
+            pairs: list[tuple[object, object]],
+    ) -> dict[object, object]:
+        decoded: dict[object, object] = {}
+        for key, value in pairs:
+            if key in decoded:
+                raise ValueError("duplicate JSON key")
+            decoded[key] = value
+        return decoded
 
 
 class SeedreamGeneratorAdapter:
@@ -949,8 +1029,13 @@ class TableScheduler:
                     or record_scope.record_id != context.record_id
                     or record_scope.output_field_id
                     != schema.field("输出图").field_id
+                    or record_scope.status_field_id
+                    != schema.field("任务状态").field_id
                     or record_scope.detail_field_id
-                    != schema.field("处理明细").field_id):
+                    != schema.field("处理明细").field_id
+                    or record_scope.payload_root
+                    != (Path(context.task_dir).resolve()
+                        / "generated_images")):
                 raise TableSchedulerError("record Base scope escaped global preflight")
             scoped_base = base.scoped(record_scope)
             services = self._runtime.adapter.record_services(
