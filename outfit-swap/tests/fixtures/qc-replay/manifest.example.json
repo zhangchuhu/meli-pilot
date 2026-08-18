@@ -15,8 +15,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-1-attempt-1.png", "scores": {"garment_construction": 96, "color_material": 94, "garment_details": 93, "target_preservation": 92, "text_layout": null}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.94, "decision": "accept"}
           ]
@@ -37,8 +35,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-6-attempt-2.png", "scores": {"garment_construction": 95, "color_material": 93, "garment_details": 92, "target_preservation": 94, "text_layout": null}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.93, "decision": "accept"}
           ]
@@ -52,8 +48,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"invalid": "first response requires same-candidate review"},
             {"schema_version": 1, "candidate": "target-6-attempt-1.png", "scores": {"garment_construction": 62, "color_material": 92, "garment_details": 88, "target_preservation": 92, "text_layout": null}, "critical_defects": ["open_front"], "primary_defect": "open_front", "evidence": [], "confidence": 0.96, "decision": "retry"}
@@ -75,8 +69,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-7-attempt-1.png", "scores": {"garment_construction": 58, "color_material": 91, "garment_details": 86, "target_preservation": 90, "text_layout": null}, "critical_defects": ["open_front"], "primary_defect": "open_front", "evidence": [], "confidence": 0.97, "decision": "retry"}
           ]
@@ -90,8 +82,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-7-attempt-2.png", "scores": {"garment_construction": 94, "color_material": 92, "garment_details": 91, "target_preservation": 93, "text_layout": null}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.92, "decision": "accept"}
           ]
@@ -112,8 +102,6 @@
           "changed_text": ["FLOWY HEM"],
           "text_exact": false,
           "panels_exact": false,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare literal infographic text and panel layout on the same candidate.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-8-attempt-1.png", "scores": {"garment_construction": 92, "color_material": 92, "garment_details": 90, "target_preservation": 82, "text_layout": 72}, "critical_defects": ["text_changed", "layout_changed"], "primary_defect": "text_changed", "evidence": [], "confidence": 0.50, "decision": "retry"},
             {"schema_version": 1, "candidate": "target-8-attempt-1.png", "scores": {"garment_construction": 93, "color_material": 92, "garment_details": 91, "target_preservation": 91, "text_layout": 96}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.93, "decision": "accept"},
@@ -129,8 +117,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare literal infographic text and panel layout on the same candidate.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-8-attempt-2.png", "scores": {"garment_construction": 95, "color_material": 93, "garment_details": 92, "target_preservation": 94, "text_layout": 97}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.95, "decision": "accept"}
           ]
@@ -151,8 +137,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             "not JSON",
             {"schema_version": 1, "candidate": "target-9-attempt-1.png", "scores": {"garment_construction": 60, "color_material": 92, "garment_details": 87, "target_preservation": 92, "text_layout": null}, "critical_defects": ["open_front"], "primary_defect": "open_front", "evidence": [], "confidence": 0.96, "decision": "retry"}
@@ -167,8 +151,6 @@
           "changed_text": [],
           "text_exact": true,
           "panels_exact": true,
-          "system_prompt": "Return the strict visual-QC JSON schema.",
-          "user_prompt": "Compare the same candidate with its approved references.",
           "offline_responses": [
             {"schema_version": 1, "candidate": "target-9-attempt-2.png", "scores": {"garment_construction": 95, "color_material": 92, "garment_details": 91, "target_preservation": 93, "text_layout": null}, "critical_defects": [], "primary_defect": null, "evidence": [], "confidence": 0.94, "decision": "accept"}
           ]

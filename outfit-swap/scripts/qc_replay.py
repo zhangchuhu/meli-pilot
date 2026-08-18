@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -40,8 +41,6 @@ class ReplayCandidate:
     changed_text: tuple[str, ...]
     text_exact: bool
     panels_exact: bool
-    system_prompt: str
-    user_prompt: str
     offline_responses: tuple[str, ...]
 
 
@@ -137,13 +136,13 @@ _TARGET_FIELDS = frozenset({
 })
 _CANDIDATE_FIELDS = frozenset({
     "attempt", "name", "images", "expected_outcome", "expected_defects",
-    "changed_text", "text_exact", "panels_exact", "system_prompt",
-    "user_prompt", "offline_responses",
+    "changed_text", "text_exact", "panels_exact", "offline_responses",
 })
 _OUTCOMES = frozenset({"accept", "retry"})
 _FORBIDDEN_FEATURE_FIELDS = frozenset({
-    "aspect", "aspect_ratio", "dimension", "dimensions", "height",
-    "image_dimensions", "output_size", "pixel_dimensions", "width",
+    "aspect", "aspectratio", "dimension", "dimensions", "height",
+    "imagedimensions", "outputsize", "pixeldimensions", "pixelheight",
+    "pixelwidth", "ratio", "resolution", "width",
 })
 _CONSTRUCTION_DEFECTS = frozenset({
     vision_qc.DefectCode.WRONG_COLLAR,
@@ -159,6 +158,13 @@ _HISTORICAL_CONSTRUCTION_TARGETS = ("6", "7", "9")
 _HISTORICAL_INFOGRAPHIC_TARGET = "8"
 _HISTORICAL_CHANGED_LITERAL = "FLOWY HEM"
 _MAX_PAID_ATTEMPTS = 3
+_SAFE_PATH_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_SUPPORTED_IMAGE_SUFFIXES = frozenset({".gif", ".jpeg", ".jpg", ".png", ".webp"})
+_REPLAY_SYSTEM_PROMPT = (
+    "You are the visual quality reviewer. Return exactly one JSON object using "
+    "visual-QC schema version 1. Base every score and defect only on visible "
+    "image content."
+)
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -204,7 +210,10 @@ def _string_list(value: Any, label: str, *, allow_empty: bool) -> tuple[str, ...
 def _reject_dimension_features(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            normalized = key.casefold().replace("-", "_") if isinstance(key, str) else ""
+            normalized = (
+                "".join(character for character in key.casefold() if character.isalnum())
+                if isinstance(key, str) else ""
+            )
             if normalized in _FORBIDDEN_FEATURE_FIELDS:
                 raise ReplayError("dimension and aspect-ratio fields are forbidden")
             _reject_dimension_features(item)
@@ -224,12 +233,39 @@ def _response_text(value: Any) -> str:
     raise ReplayError("offline_responses entries must be JSON objects or strings")
 
 
+def _safe_image_path(value: str, root: Path) -> Path:
+    relative = Path(value)
+    if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(
+                part in {".", ".."} or _SAFE_PATH_PART.fullmatch(part) is None
+                for part in relative.parts
+            )
+            or relative.suffix.casefold() not in _SUPPORTED_IMAGE_SUFFIXES
+    ):
+        raise ReplayError("candidate images must be safe relative image paths")
+    approved_root = root.resolve()
+    resolved = (approved_root / relative).resolve(strict=False)
+    if not resolved.is_relative_to(approved_root):
+        raise ReplayError("candidate image resolves outside the approved manifest root")
+    return resolved
+
+
 def _candidate(value: Any, root: Path, *, infographic: bool) -> ReplayCandidate:
     raw = _object(value, _CANDIDATE_FIELDS, "candidate")
     attempt = _positive_integer(raw["attempt"], "candidate attempt")
     name = _nonempty_string(raw["name"], "candidate name")
+    if (
+            _SAFE_PATH_PART.fullmatch(name) is None
+            or Path(name).name != name
+            or Path(name).suffix.casefold() not in _SUPPORTED_IMAGE_SUFFIXES
+    ):
+        raise ReplayError("candidate name must be a sanitized image basename")
     raw_images = _string_list(raw["images"], "candidate images", allow_empty=False)
-    images = tuple((root / image).resolve() for image in raw_images)
+    images = tuple(_safe_image_path(image, root) for image in raw_images)
+    if name not in {image.name for image in images}:
+        raise ReplayError("candidate name must identify one configured candidate image")
     outcome = raw["expected_outcome"]
     if not isinstance(outcome, str) or outcome not in _OUTCOMES:
         raise ReplayError("expected_outcome must be accept or retry")
@@ -249,8 +285,19 @@ def _candidate(value: Any, root: Path, *, infographic: bool) -> ReplayCandidate:
     panels_exact = raw["panels_exact"]
     if not isinstance(text_exact, bool) or not isinstance(panels_exact, bool):
         raise ReplayError("text_exact and panels_exact must be booleans")
-    system_prompt = _nonempty_string(raw["system_prompt"], "system_prompt")
-    user_prompt = _nonempty_string(raw["user_prompt"], "user_prompt")
+    semantic_changes: set[vision_qc.DefectCode] = set()
+    if infographic:
+        if not text_exact or changed_text:
+            semantic_changes.add(vision_qc.DefectCode.TEXT_CHANGED)
+        if not panels_exact:
+            semantic_changes.add(vision_qc.DefectCode.LAYOUT_CHANGED)
+    elif not text_exact or not panels_exact:
+        raise ReplayError("ordinary candidates cannot declare text or panel changes")
+    annotated_changes = set(defects) & _INFOGRAPHIC_CHANGE_DEFECTS
+    if semantic_changes != annotated_changes:
+        raise ReplayError(
+            "infographic expected_defects must match text and panel change semantics",
+        )
     responses = raw["offline_responses"]
     if not isinstance(responses, list) or not responses:
         raise ReplayError("offline_responses must be a non-empty JSON array")
@@ -264,8 +311,6 @@ def _candidate(value: Any, root: Path, *, infographic: bool) -> ReplayCandidate:
         changed_text=changed_text,
         text_exact=text_exact,
         panels_exact=panels_exact,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
         offline_responses=offline_responses,
     )
 
@@ -326,7 +371,7 @@ def load_manifest(path: str | Path) -> ReplayManifest:
         raise ReplayError("replay manifest could not be read as strict JSON") from exc
     _reject_dimension_features(payload)
     raw = _object(payload, _MANIFEST_FIELDS, "manifest")
-    if raw["schema_version"] != 1 or isinstance(raw["schema_version"], bool):
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
         raise ReplayError("unsupported replay manifest schema version")
     raw_targets = raw["targets"]
     if not isinstance(raw_targets, list) or not raw_targets:
@@ -341,11 +386,27 @@ def load_manifest(path: str | Path) -> ReplayManifest:
     )
 
 
+def _replay_user_prompt(candidate: ReplayCandidate, *, infographic: bool) -> str:
+    kind_instruction = (
+        "It is an infographic; compare all visible text literally and verify the "
+        "panel arrangement."
+        if infographic else
+        "It is an ordinary fashion image."
+    )
+    return (
+        f"Review candidate file '{candidate.name}' against every preceding approved "
+        f"reference image. {kind_instruction} Return the candidate field exactly as "
+        f"'{candidate.name}'."
+    )
+
+
 class _OfflineClient:
-    def __init__(self, candidate: ReplayCandidate) -> None:
+    def __init__(
+            self, candidate: ReplayCandidate, *, system_prompt: str,
+    ) -> None:
         self._responses = list(candidate.offline_responses)
         self._expected_images = candidate.images
-        self._expected_system_prompt = candidate.system_prompt
+        self._expected_system_prompt = system_prompt
         self.calls = 0
 
     @property
@@ -373,19 +434,21 @@ def _review(
         candidate: ReplayCandidate, *, infographic: bool,
         live_ark: bool, client: ark_vision_qc.VisionClient | None,
 ) -> tuple[ark_vision_qc.QCReviewResult, int]:
+    system_prompt = _REPLAY_SYSTEM_PROMPT
+    user_prompt = _replay_user_prompt(candidate, infographic=infographic)
     if live_ark:
         if client is None:
             raise ReplayError("live Ark replay has no client")
         review_client = client
         offline_client = None
     else:
-        offline_client = _OfflineClient(candidate)
+        offline_client = _OfflineClient(candidate, system_prompt=system_prompt)
         review_client = offline_client
     try:
         result = ark_vision_qc.review_candidate(
             review_client,
-            system_prompt=candidate.system_prompt,
-            user_prompt=candidate.user_prompt,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             images=candidate.images,
             candidate=candidate.name,
             infographic=infographic,
@@ -396,6 +459,19 @@ def _review(
     if offline_client is not None and offline_client.remaining:
         raise ReplayError("offline_responses contains unused responses")
     return result, calls
+
+
+def _validate_live_images(manifest: ReplayManifest) -> None:
+    approved_root = manifest.path.parent.resolve()
+    for target in manifest.targets:
+        for candidate in target.candidates:
+            for image in candidate.images:
+                try:
+                    resolved = image.resolve(strict=True)
+                except OSError as exc:
+                    raise ReplayError("live Ark image is missing or inaccessible") from exc
+                if not resolved.is_relative_to(approved_root) or not resolved.is_file():
+                    raise ReplayError("live Ark images must be regular approved fixture files")
 
 
 def _coverage_misses(
@@ -419,8 +495,13 @@ def _coverage_misses(
                     critical_misses.append(
                         f"target {target.target_id} attempt {candidate.attempt}: {defect.value}",
                     )
-            if target.infographic and candidate.changed_text:
-                for defect in set(candidate.expected_defects) & _INFOGRAPHIC_CHANGE_DEFECTS:
+            if target.infographic:
+                expected_changes: set[vision_qc.DefectCode] = set()
+                if not candidate.text_exact or candidate.changed_text:
+                    expected_changes.add(vision_qc.DefectCode.TEXT_CHANGED)
+                if not candidate.panels_exact:
+                    expected_changes.add(vision_qc.DefectCode.LAYOUT_CHANGED)
+                for defect in expected_changes:
                     if defect.value not in reported:
                         infographic_misses.append(
                             f"target {target.target_id} attempt {candidate.attempt}: {defect.value}",
@@ -460,6 +541,8 @@ def replay_manifest(
         raise ReplayError("live_ark must be a boolean")
     if client is not None and not live_ark:
         raise ReplayError("a live client requires explicit live_ark=True")
+    if live_ark:
+        _validate_live_images(manifest)
 
     target_results: list[TargetReplayResult] = []
     expected_retries = 0
