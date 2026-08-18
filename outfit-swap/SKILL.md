@@ -14,10 +14,10 @@ python3 scripts/run_table.py '<table-url>'
 The complete interface is:
 
 ```bash
-python3 scripts/run_table.py '<table-url>' [--record-concurrency N] [--retry-failed] [--qc-mode automatic|shadow]
+python3 scripts/run_table.py '<table-url>' [--record-concurrency N] [--record-limit N] [--retry-failed] [--qc-mode automatic|shadow]
 ```
 
-Use automatic Ark QC by default. `--record-concurrency N` accepts a positive integer and defaults to `2`. Use `--retry-failed` only when the user explicitly requests failed-record retry. Use `--qc-mode shadow` only as the documented rollback control. Never select `成功` records for regeneration.
+Use automatic Ark QC by default. `--record-concurrency N` accepts a positive integer and defaults to `2`. `--record-limit N` accepts a positive integer and is unbounded by default; use it for a deliberately bounded canary without changing the exact Base view scope. Use `--retry-failed` only when the user explicitly requests failed-record retry. Use `--qc-mode shadow` only as the documented rollback control. Never select `成功` records for regeneration.
 
 ## Authorization
 
@@ -37,7 +37,7 @@ Stop before creating run/state directories when Python or required global config
 
 ## Normal workflow
 
-1. Run the table entry once with the requested flags. Let it complete one global preflight, materialize a stable record queue, and schedule records. Do not launch a second independent invocation for the same table.
+1. Run the table entry once with the requested flags. Let it complete one global preflight, validate every page and record envelope in the exact view, then apply any `--record-limit` and materialize the stable record queue. Do not launch a second independent invocation for the same table.
 2. Let records run concurrently at the configured limit. Keep targets within each record serial in original attachment order. Do not create a persistent run lock or parallelize targets.
 3. Let the pipeline reconcile state and Base first, drain accepted local uploads, inspect active artifacts, create immutable target plans, generate with fixed `--size 2K`, obtain automatic Ark decisions, select within the three-attempt budget, and call the idempotent finalizer.
 4. Read the backward-compatible `metrics_path` added to the command's four-count JSON result, then report its sanitized `metrics.json` summary. Never expose secrets, prompts, raw Base64, raw data URLs, authorization headers, or unsanitized external diagnostics.

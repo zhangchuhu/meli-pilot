@@ -22,6 +22,8 @@ List the exact resolved `view_id` without `--filter-json`: installed `lark-cli` 
 
 While `has_more` is true, advance listing offset by the returned record count, preserve every page artifact, and retain cross-page record order. Treat 2,000 as the per-page cap, not the run cap. Reject a zero-progress page. Complete all page, record-ID, status, attachment-envelope, and ordering validation before binding the first state or downloading the first attachment; a later page failure must leave every record untouched.
 
+`--record-limit N` is an optional positive bounded-canary control and is unbounded by default. Fetch and validate the complete exact-view inventory before applying the limit. Then select the first N eligible records in stable view order before binding the first state, creating a record directory, downloading an attachment, or materializing record services. The limit never changes `base_token`, `table_id`, `view_id`, status selection, pagination, or envelope validation; it only truncates the already validated local eligible queue.
+
 ## Typed Lark interface
 
 Use `scripts/lark_runner.py:LarkBaseClient` for Base transport. Its implemented operations are `resolve_base`, `list_fields`, `create_field`, `list_records`, `list_records_page`, `download_attachment`, `upload_attachment`, `update_record`, and `get_record`. `scripts/production_runtime.py` assembles these operations for bare `scripts/run_table.py`; no host-supplied dependency injection is required. Authenticate as the user. Never make direct Feishu HTTP calls.

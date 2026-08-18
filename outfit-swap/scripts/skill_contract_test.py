@@ -398,6 +398,8 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("table-level normal entry point", self.skill)
         self.assertIn("--record-concurrency N", self.skill)
         self.assertIn("defaults to `2`", self.skill)
+        self.assertIn("--record-limit N", self.skill)
+        self.assertIn("unbounded by default", self.skill)
         self.assertIn("--retry-failed", self.skill)
         self.assertIn("--qc-mode shadow", self.skill)
 
@@ -413,8 +415,24 @@ class SkillContractTest(unittest.TestCase):
         )
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].record_concurrency, 2)
+        self.assertIsNone(captured[0].record_limit)
         self.assertEqual(captured[0].qc_mode, "automatic")
         self.assertFalse(captured[0].retry_failed)
+
+        self.assertEqual(
+            run_table.main([
+                "https://example.invalid/table", "--record-limit", "2",
+            ], execute=execute),
+            0,
+        )
+        self.assertEqual(captured[1].record_limit, 2)
+
+    def test_bounded_canary_preserves_complete_exact_view_preflight(self) -> None:
+        base = self.references["feishu-base.md"]
+        self.assertIn("--record-limit N", self.skill)
+        self.assertIn("first N eligible records in stable view order", base)
+        self.assertIn("before applying the limit", base)
+        self.assertIn("before binding the first state", base)
 
     def test_scheduler_and_target_order_contract_is_explicit(self) -> None:
         state = self.references["task-state.md"]

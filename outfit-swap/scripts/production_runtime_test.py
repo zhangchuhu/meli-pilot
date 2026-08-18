@@ -16,7 +16,9 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from scripts.run_table import BaseField, TableConfig, TableSchema, TableScope, main
+from scripts.run_table import (
+    BaseField, PreflightError, TableConfig, TableSchema, TableScope, main,
+)
 from scripts.run_table import GlobalStop, PaidCallStopped
 from scripts.run_record import RecordContext, RecordResult, RecordServices
 
@@ -36,6 +38,19 @@ def _write_png(path: Path, width: int = 64, height: int = 64) -> None:
         + chunk(b"IDAT", zlib.compress(raw))
         + chunk(b"IEND", b"")
     )
+
+
+def _table_schema() -> TableSchema:
+    return TableSchema((
+        BaseField("原图", "fld_source", "attachment"),
+        BaseField("爆款图", "fld_target", "attachment"),
+        BaseField("输出图", "fld_output", "attachment"),
+        BaseField(
+            "任务状态", "fld_status", "single_select",
+            ("未开始", "成功", "失败"),
+        ),
+        BaseField("处理明细", "fld_detail", "text"),
+    ))
 
 
 class _FakeArk:
@@ -330,6 +345,178 @@ class StandaloneEntryTest(unittest.TestCase):
 
 
 class ProductionRuntimeContractTest(unittest.TestCase):
+    def test_record_limit_validates_later_page_before_any_materialization(self) -> None:
+        from scripts import production_runtime
+        from scripts.lark_runner import RecordPage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "run_1"
+            run_dir.mkdir(parents=True)
+
+            def record(record_id: str, status: list[str]) -> dict[str, object]:
+                return {
+                    "record_id": record_id,
+                    "fields": {
+                        "原图": [{"file_token": f"source_{record_id}", "name": "source.jpg"}],
+                        "爆款图": [{"file_token": f"target_{record_id}", "name": "target.jpg"}],
+                        "输出图": [], "任务状态": status, "处理明细": None,
+                    },
+                }
+
+            first = run_dir / "records-0.ndjson"
+            second = run_dir / "records-1.ndjson"
+            first.write_text(
+                json.dumps(record("rec_1", ["未开始"])) + "\n", encoding="utf-8",
+            )
+            second.write_text(
+                json.dumps(record("rec_2", ["invalid"])) + "\n", encoding="utf-8",
+            )
+
+            class Base:
+                calls: list[int] = []
+
+                def list_records_page(self, **kwargs: object) -> RecordPage:
+                    offset = int(kwargs["offset"])
+                    self.calls.append(offset)
+                    return (
+                        RecordPage(first, 1, True)
+                        if offset == 0 else RecordPage(second, 1, False)
+                    )
+
+            materialized: list[str] = []
+
+            class Adapter(production_runtime.ProductionTableAdapter):
+                def _materialize(self, _scope, _schema, item, **_kwargs):
+                    materialized.append(item["record_id"])
+                    return RecordContext(root / item["record_id"], item["record_id"], (0,))
+
+            adapter = Adapter(
+                run_id="run_1", run_dir=run_dir, runs_root=root / "runs",
+                state_root=root / "state", base_service=object(), ark_client=object(),
+            )
+            base = Base()
+            with self.assertRaisesRegex(PreflightError, "status is invalid"):
+                tuple(adapter.list_records(
+                    TableScope("app_exact", "tbl_exact", "vew_exact"), _table_schema(),
+                    retry_failed=False, qc_mode="automatic", record_limit=1,
+                    base=base,
+                ))
+            self.assertEqual(base.calls, [0, 1])
+            self.assertEqual(materialized, [])
+            self.assertFalse((root / "state").exists())
+
+    def test_record_limit_materializes_stable_first_n_after_all_pages(self) -> None:
+        from scripts import production_runtime
+        from scripts.lark_runner import RecordPage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "run_1"
+            run_dir.mkdir(parents=True)
+
+            def record(record_id: str) -> dict[str, object]:
+                return {
+                    "record_id": record_id,
+                    "fields": {
+                        "原图": [{"file_token": f"source_{record_id}", "name": "source.jpg"}],
+                        "爆款图": [{"file_token": f"target_{record_id}", "name": "target.jpg"}],
+                        "输出图": [], "任务状态": ["未开始"], "处理明细": None,
+                    },
+                }
+
+            pages = []
+            for offset, identifiers in ((0, ("rec_3", "rec_1")), (2, ("rec_2",))):
+                path = run_dir / f"records-{offset}.ndjson"
+                path.write_text(
+                    "".join(json.dumps(record(value)) + "\n" for value in identifiers),
+                    encoding="utf-8",
+                )
+                pages.append(path)
+
+            class Base:
+                calls: list[int] = []
+
+                def list_records_page(self, **kwargs: object) -> RecordPage:
+                    offset = int(kwargs["offset"])
+                    self.calls.append(offset)
+                    return (
+                        RecordPage(pages[0], 2, True)
+                        if offset == 0 else RecordPage(pages[1], 1, False)
+                    )
+
+            materialized: list[str] = []
+
+            class Adapter(production_runtime.ProductionTableAdapter):
+                def _materialize(self, _scope, _schema, item, **_kwargs):
+                    record_id = item["record_id"]
+                    materialized.append(record_id)
+                    return RecordContext(root / record_id, record_id, (0,))
+
+            adapter = Adapter(
+                run_id="run_1", run_dir=run_dir, runs_root=root / "runs",
+                state_root=root / "state", base_service=object(), ark_client=object(),
+            )
+            base = Base()
+            contexts = tuple(adapter.list_records(
+                TableScope("app_exact", "tbl_exact", "vew_exact"), _table_schema(),
+                retry_failed=False, qc_mode="automatic", record_limit=2,
+                base=base,
+            ))
+            self.assertEqual(base.calls, [0, 2])
+            self.assertEqual([item.record_id for item in contexts], ["rec_3", "rec_1"])
+            self.assertEqual(materialized, ["rec_3", "rec_1"])
+
+    def test_record_limit_validates_unselected_later_attachment_envelope(self) -> None:
+        from scripts import production_runtime
+        from scripts.lark_runner import RecordPage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "run_1"
+            run_dir.mkdir(parents=True)
+            first = run_dir / "records-0.ndjson"
+            second = run_dir / "records-1.ndjson"
+            first.write_text(json.dumps({
+                "record_id": "rec_1", "fields": {
+                    "原图": [{"file_token": "source_1", "name": "source.jpg"}],
+                    "爆款图": [{"file_token": "target_1", "name": "target.jpg"}],
+                    "输出图": [], "任务状态": ["未开始"], "处理明细": None,
+                },
+            }) + "\n", encoding="utf-8")
+            second.write_text(json.dumps({
+                "record_id": "rec_2", "fields": {
+                    "原图": "not-an-attachment-envelope", "爆款图": [],
+                    "输出图": [], "任务状态": ["成功"], "处理明细": None,
+                },
+            }) + "\n", encoding="utf-8")
+
+            class Base:
+                def list_records_page(self, **kwargs: object) -> RecordPage:
+                    return (
+                        RecordPage(first, 1, True)
+                        if kwargs["offset"] == 0 else RecordPage(second, 1, False)
+                    )
+
+            materialized: list[str] = []
+
+            class Adapter(production_runtime.ProductionTableAdapter):
+                def _materialize(self, _scope, _schema, item, **_kwargs):
+                    materialized.append(item["record_id"])
+                    return RecordContext(root / item["record_id"], item["record_id"], (0,))
+
+            adapter = Adapter(
+                run_id="run_1", run_dir=run_dir, runs_root=root / "runs",
+                state_root=root / "state", base_service=object(), ark_client=object(),
+            )
+            with self.assertRaisesRegex(PreflightError, "attachment field is invalid"):
+                tuple(adapter.list_records(
+                    TableScope("app_exact", "tbl_exact", "vew_exact"), _table_schema(),
+                    retry_failed=False, qc_mode="automatic", record_limit=1,
+                    base=Base(),
+                ))
+            self.assertEqual(materialized, [])
+
     def test_page_two_failure_precedes_record_state_or_download_mutation(self) -> None:
         from scripts import production_runtime
         from scripts.lark_runner import RecordPage

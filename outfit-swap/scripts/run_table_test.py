@@ -180,10 +180,10 @@ class _Adapter:
 
     def list_records(
             self, scope: TableScope, schema: TableSchema, *, retry_failed: bool,
-            qc_mode: str, base: object,
+            qc_mode: str, record_limit: int | None, base: object,
     ):
         self.trace.append((
-            "records", scope, schema, retry_failed, qc_mode, base,
+            "records", scope, schema, retry_failed, qc_mode, base, record_limit,
         ))
         for context in self.contexts:
             yield context
@@ -240,7 +240,7 @@ class CLIAndPreflightTest(unittest.TestCase):
             )), 0)
             self.assertEqual(main([
                 "https://base.example/table", "--record-concurrency", "1",
-                "--qc-mode", "shadow",
+                "--qc-mode", "shadow", "--record-limit", "3",
             ], execute=lambda c: (
                 seen.append(c) or TableResult(0, 0, 0, 0)
             )), 0)
@@ -248,9 +248,30 @@ class CLIAndPreflightTest(unittest.TestCase):
             TableConfig("https://base.example/table"),
             TableConfig(
                 "https://base.example/table", record_concurrency=1,
-                qc_mode="shadow",
+                qc_mode="shadow", record_limit=3,
             ),
         ])
+
+    def test_cli_rejects_invalid_record_limits_before_execution(self) -> None:
+        for value in ("0", "-1", "1.5", "many"):
+            with self.subTest(value=value):
+                calls: list[TableConfig] = []
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        main([
+                            "https://base.example/table", "--record-limit", value,
+                        ], execute=lambda config: (
+                            calls.append(config) or TableResult(0, 0, 0, 0)
+                        ))
+                self.assertEqual(raised.exception.code, 2)
+                self.assertEqual(calls, [])
+
+        for value in (0, -1, 1.5, True):
+            with self.subTest(config_value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "record_limit must be a positive integer",
+                ):
+                    TableConfig("https://base.example/table", record_limit=value)
 
     def test_cli_rejects_nonpositive_or_noninteger_concurrency_before_execution(self) -> None:
         for value in ("0", "-1", "1.5", "many"):
@@ -294,6 +315,7 @@ class CLIAndPreflightTest(unittest.TestCase):
         self.assertEqual(adapter.trace[2][1], scope)
         self.assertEqual(adapter.trace[3][1], scope)
         self.assertEqual(adapter.trace[3][3:5], (True, "shadow"))
+        self.assertIsNone(adapter.trace[3][6])
         self.assertCountEqual(worker_calls, [
             ("rec_0", (0, 1)), ("rec_1", (0, 1)), ("rec_2", (0, 1)),
         ])

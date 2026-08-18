@@ -73,6 +73,7 @@ class TableConfig:
     record_concurrency: int = 2
     retry_failed: bool = False
     qc_mode: str = "automatic"
+    record_limit: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.base_url, str) or not self.base_url.strip():
@@ -85,6 +86,11 @@ class TableConfig:
             raise ValueError("retry_failed must be boolean")
         if self.qc_mode not in {"automatic", "shadow"}:
             raise ValueError("qc_mode must be automatic or shadow")
+        if (self.record_limit is not None
+                and (not isinstance(self.record_limit, int)
+                     or isinstance(self.record_limit, bool)
+                     or self.record_limit <= 0)):
+            raise ValueError("record_limit must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -1108,6 +1114,7 @@ class TableScheduler:
                 scope, schema,
                 retry_failed=config.retry_failed,
                 qc_mode=config.qc_mode,
+                record_limit=config.record_limit,
                 base=base,
             ))
         except PreflightError:
@@ -1199,6 +1206,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-concurrency", type=_positive_integer, default=2,
     )
+    parser.add_argument("--record-limit", type=_positive_integer)
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument(
         "--qc-mode", choices=("automatic", "shadow"), default="automatic",
@@ -1223,6 +1231,7 @@ def _production_execute(config: TableConfig) -> TableResult:
         record_concurrency=config.record_concurrency,
         retry_failed=config.retry_failed,
         qc_mode=config.qc_mode,
+        record_limit=config.record_limit,
     )
     result = production_runtime.execute(module_config)
     return TableResult(
@@ -1242,6 +1251,7 @@ def main(
         record_concurrency=args.record_concurrency,
         retry_failed=args.retry_failed,
         qc_mode=args.qc_mode,
+        record_limit=args.record_limit,
     )
     try:
         result = (execute or _production_execute)(config)

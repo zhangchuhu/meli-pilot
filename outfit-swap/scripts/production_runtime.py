@@ -962,9 +962,13 @@ class ProductionTableAdapter:
 
     def list_records(
             self, scope: TableScope, schema: TableSchema, *, retry_failed: bool,
-            qc_mode: str, base: object,
+            qc_mode: str, base: object, record_limit: int | None = None,
     ) -> Iterable[RecordContext]:
         del qc_mode
+        if (record_limit is not None
+                and (not isinstance(record_limit, int)
+                     or isinstance(record_limit, bool) or record_limit <= 0)):
+            raise PreflightError("record limit must be a positive integer")
         selected_status = "失败" if retry_failed else "未开始"
         offset = 0
         selected_records: list[dict[str, Any]] = []
@@ -996,22 +1000,25 @@ class ProductionTableAdapter:
                 status = fields.get("任务状态") if isinstance(fields, dict) else None
                 if status not in (["未开始"], ["失败"], ["成功"]):
                     raise PreflightError("Base record status is invalid")
-                if status != [selected_status]:
-                    continue
                 _attachments(fields.get("原图"))
                 _attachments(fields.get("爆款图"))
                 _outputs(fields.get("输出图"))
-                selected_records.append(record)
+                if status == [selected_status]:
+                    selected_records.append(record)
             if not page.has_more:
                 break
             if page.records_count <= 0:
                 raise PreflightError("Base record pagination did not advance")
             offset += page.records_count
+        materialization_queue = (
+            selected_records if record_limit is None
+            else selected_records[:record_limit]
+        )
         return tuple(
             self._materialize(
                 scope, schema, record, retry_failed=retry_failed, base=base,
             )
-            for record in selected_records
+            for record in materialization_queue
         )
 
     def _materialize(

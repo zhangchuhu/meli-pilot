@@ -6,6 +6,8 @@ Use this reference when inspecting record ordering, target plans, canonical stat
 
 Records may run concurrently. Record concurrency is configurable with `--record-concurrency N` and defaults to two. Completion order across records is not guaranteed. Targets within one record remain serial in original attachment order; never overlap their paid attempts or finalization.
 
+For a bounded canary, `--record-limit N` takes the first N eligible records in stable exact-view order only after the complete view inventory and every record envelope have passed global preflight. It is unbounded by default. Records beyond the limit are not bound, downloaded, or materialized.
+
 The scheduler owns a stable process-local queue and an in-process active-record set. It has no persistent or cross-process run lock. Therefore simultaneous independent invocations are unsupported for the same table: do not launch them. The active set prevents duplicate assignment only inside one invocation.
 
 Default service limits are two record workers, two Seedream requests, two shared Ark requests across planning and QC, one Lark write, and two Lark reads. `--record-concurrency 1` is the throughput rollback control. A global stop prevents new dispatch and rechecks durable state after a waiting Seedream/Ark call acquires its shared gate and before transport starts.
