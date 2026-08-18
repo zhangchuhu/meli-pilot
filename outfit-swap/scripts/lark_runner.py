@@ -89,12 +89,11 @@ class LarkBaseClient:
 
     def list_records(
             self, *, app_token: str, table_id: str, field_ids: Sequence[str],
-            filter_payload: Path, output: Path, limit: int = 2000, offset: int = 0,
+            filter_payload: Path | None, output: Path, limit: int = 2000, offset: int = 0,
             view_id: str | None = None, retry_failed: bool = False,
     ) -> Path:
         """Write one NDJSON record listing to a new task-local artifact."""
-        filter_path, filter_arg = self._input_path(filter_payload)
-        self._validate_status_filter(filter_path, retry_failed=retry_failed)
+        filter_arg = self._optional_filter(filter_payload, retry_failed=retry_failed)
         output_path, output_arg = self._output_path(output)
         command = self._record_list_command(
             app_token=app_token, table_id=table_id, field_ids=field_ids,
@@ -106,13 +105,12 @@ class LarkBaseClient:
 
     def list_records_page(
             self, *, app_token: str, table_id: str, field_ids: Sequence[str],
-            filter_payload: Path, output: Path, limit: int = 2000,
+            filter_payload: Path | None, output: Path, limit: int = 2000,
             offset: int = 0, view_id: str | None = None,
             retry_failed: bool = False,
     ) -> RecordPage:
         """Write one NDJSON page and return its validated minimal summary."""
-        filter_path, filter_arg = self._input_path(filter_payload)
-        self._validate_status_filter(filter_path, retry_failed=retry_failed)
+        filter_arg = self._optional_filter(filter_payload, retry_failed=retry_failed)
         output_path, output_arg = self._output_path(output)
         command = self._record_list_command(
             app_token=app_token, table_id=table_id, field_ids=field_ids,
@@ -137,7 +135,7 @@ class LarkBaseClient:
 
     def _record_list_command(
             self, *, app_token: str, table_id: str,
-            field_ids: Sequence[str], filter_arg: str, output_arg: str,
+            field_ids: Sequence[str], filter_arg: str | None, output_arg: str,
             limit: int, offset: int, view_id: str | None,
     ) -> list[str]:
         command = [
@@ -148,12 +146,23 @@ class LarkBaseClient:
             command.extend(["--view-id", self._required(view_id, "view ID")])
         for field_id in self._required_values(field_ids, "field IDs"):
             command.extend(["--field-id", field_id])
+        if filter_arg is not None:
+            command.extend(["--filter-json", f"@{filter_arg}"])
         command.extend([
-            "--filter-json", f"@{filter_arg}", "--format", "ndjson", "--limit",
+            "--format", "ndjson", "--limit",
             str(self._page_limit(limit)), "--offset", str(self._page_offset(offset)),
             "--output", output_arg, "--minimal-stdout", "--as", "user",
         ])
         return command
+
+    def _optional_filter(
+            self, supplied: Path | None, *, retry_failed: bool,
+    ) -> str | None:
+        if supplied is None:
+            return None
+        filter_path, filter_arg = self._input_path(supplied)
+        self._validate_status_filter(filter_path, retry_failed=retry_failed)
+        return filter_arg
 
     def download_attachment(
             self, *, app_token: str, table_id: str, record_id: str, token: str,

@@ -18,19 +18,9 @@ Require these fields:
 
 Treat a missing/mistyped field or status option as a global preflight failure. The only schema mutation allowed is creating absent `处理明细`. Immediately before creating absent `处理明细`, repeat the full absence check.
 
-Select `未开始` by default:
+List the exact resolved `view_id` without `--filter-json`: installed `lark-cli` makes that filter override the view and could broaden scope. Validate the exact status shape for every returned record, then select `未开始` locally by default or `失败` locally only for explicit `--retry-failed`. Skip `成功` in both modes.
 
-```json
-{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]]}
-```
-
-Select `失败` only for explicit `--retry-failed`:
-
-```json
-{"logic":"and","conditions":[["任务状态","intersects",["失败"]]]}
-```
-
-Skip `成功` in both modes. While `has_more` is true, advance listing offset by the returned record count, preserve every page artifact, and retain cross-page record order. Treat 2,000 as the per-page cap, not the run cap.
+While `has_more` is true, advance listing offset by the returned record count, preserve every page artifact, and retain cross-page record order. Treat 2,000 as the per-page cap, not the run cap. Reject a zero-progress page. Complete all page, record-ID, status, attachment-envelope, and ordering validation before binding the first state or downloading the first attachment; a later page failure must leave every record untouched.
 
 ## Typed Lark interface
 
@@ -46,7 +36,7 @@ For every file-backed call, pass one task-local basename. Run `lark-cli` with th
 
 Reject absolute file arguments, `..`, path separators, pre-existing output files, and symlink escapes. Keep argv as a list and `shell=False`; never construct `cd`, shell interpolation, or a shell pipeline.
 
-Treat remote attachment names as untrusted metadata. Build local names only from the opaque role, attachment order, and token digest. Download to a safe provisional raster basename, validate the actual bytes, and use a canonical suffix derived from the decoded codec before Seedream or Ark transfer. A path-like remote name or an extension that disagrees with the bytes must neither escape the record directory nor become a MIME-label mismatch.
+Treat remote attachment names as untrusted metadata. Build local names only from the opaque role, attachment order, and token digest. Download to a safe provisional raster basename, validate the actual bytes, and use a canonical suffix derived from the decoded codec before Seedream or Ark transfer. Preserve directly supported JPEG, PNG, WebP, and GIF with their content-derived suffix; transcode other supported static raster codecs such as BMP, TIFF, HEIF, and AVIF to a verified PNG. A path-like remote name or an extension that disagrees with the bytes must neither escape the record directory nor become a MIME-label mismatch.
 
 Use these record-keyed CellValue envelopes internally:
 

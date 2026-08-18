@@ -22,7 +22,11 @@ Never compare a generated artifact's pixel dimensions or aspect ratio with its t
 
 ## Ark multimodal QC
 
-Use `scripts/ark_vision_qc.py` with `ARK_API_KEY` and the configured `ARK_VISION_MODEL`. Its only direct HTTP target is `https://ark.cn-beijing.volces.com/api/v3/chat/completions`. Send only the relevant target, candidate, and ordered reference images authorized for this invocation. Never log credentials, authorization headers, raw Base64, request bodies, response bodies, or raw evidence.
+Use `scripts/ark_vision_qc.py` with `ARK_API_KEY` and the configured `ARK_VISION_MODEL`. Its only direct HTTP target is `https://ark.cn-beijing.volces.com/api/v3/chat/completions`. Send QC images in exact target, candidate, ordered-reference order. Never log credentials, authorization headers, raw Base64, request bodies, response bodies, or raw evidence.
+
+Route every Ark classification, source-evidence, infographic-inventory, adjudication, and QC request through the same stop-aware bounded gate. The default shared Ark concurrency is two even when record concurrency is higher. Recheck the global stop and durable record ownership after acquiring the gate and before transport. Any Ark transport exception, including authentication/model rejection, sets the global stop before another queued request or paid call can begin.
+
+Validate that the key and model are nonempty before directory creation. Ark offers no separate no-cost authentication boundary here, so actual credentials can only be authenticated by the first invocation-authorized image-bearing request; never add a speculative paid probe. Treat an authentication/model failure at that first request as systemic, not as one failure per record.
 
 Require one strict schema-version-1 JSON report with the exact candidate identity, five named scores, enumerated critical defects, optional primary defect, evidence array, confidence, and decision. Reject Markdown wrappers, trailing prose, duplicate/missing/unknown fields, wrong candidates, unknown defect codes, non-finite/out-of-range values, truncation, and content-filter responses.
 
@@ -82,7 +86,7 @@ Use `scripts/qc_replay.py` to validate shadow gates read-only by default. Requir
 
 ### Global preflight failure
 
-Treat an invalid/ambiguous table URL, missing dependency/key/model ID, authentication failure, schema mismatch, or invalid selected-record materialization as global preflight failure. Mutate no record and incur no image cost.
+Treat an invalid/ambiguous table URL, missing dependency/key/model ID, schema mismatch, or invalid exact-view record inventory as global preflight failure. Mutate no record and incur no image cost. Treat the first real Ark authentication/model rejection as a systemic runtime stop because credentials cannot be authenticated without an authorized image-bearing request.
 
 ### Record data failure
 

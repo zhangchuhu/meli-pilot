@@ -33,14 +33,14 @@ Read these contracts before execution:
 - [State, planning, recovery, and events](references/task-state.md)
 - [Automatic QC and failure policy](references/qc-and-failures.md)
 
-Stop before mutation or paid work when the exact URL, dependencies, authentication, schema, or selected-record materialization fails preflight.
+Stop before creating run/state directories when Python or required global configuration is invalid. Fetch and validate the complete exact-view record inventory before binding any record state or downloading any attachment. Treat an input-byte failure discovered after that boundary as record-local and terminalize that record.
 
 ## Normal workflow
 
 1. Run the table entry once with the requested flags. Let it complete one global preflight, materialize a stable record queue, and schedule records. Do not launch a second independent invocation for the same table.
 2. Let records run concurrently at the configured limit. Keep targets within each record serial in original attachment order. Do not create a persistent run lock or parallelize targets.
 3. Let the pipeline reconcile state and Base first, drain accepted local uploads, inspect active artifacts, create immutable target plans, generate with fixed `--size 2K`, obtain automatic Ark decisions, select within the three-attempt budget, and call the idempotent finalizer.
-4. Report the table result and sanitized event metrics. Never expose secrets, prompts, raw Base64, raw data URLs, authorization headers, or unsanitized external diagnostics.
+4. Report the table result and sanitized `metrics.json` from the run directory. Never expose secrets, prompts, raw Base64, raw data URLs, authorization headers, or unsanitized external diagnostics.
 
 Do not substitute direct Feishu HTTP, another image-generation path, `generate-batch`, manual per-image approval, or a sequence of target-level shell commands for the normal entry.
 

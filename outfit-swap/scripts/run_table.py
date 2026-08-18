@@ -1029,6 +1029,10 @@ class TableScheduler:
             )
         )
         stop_signal = GlobalStop()
+        ark_semaphore = threading.BoundedSemaphore(limits.qc_requests)
+        bind_ark = getattr(self._runtime.adapter, "bind_shared_ark", None)
+        if callable(bind_ark):
+            bind_ark(stop_signal, ark_semaphore)
         bounded_base = BoundedBase(
             self._runtime.base,
             read_semaphore=threading.BoundedSemaphore(limits.lark_reads),
@@ -1203,10 +1207,27 @@ def _parser() -> argparse.ArgumentParser:
 
 def _production_execute(config: TableConfig) -> TableResult:
     try:
-        from scripts.production_runtime import execute
+        from scripts import production_runtime
     except ImportError:  # pragma: no cover - direct script-directory execution
-        from production_runtime import execute  # type: ignore[no-redef]
-    return execute(config)
+        import sys
+        package_root = str(Path(__file__).resolve().parents[1])
+        if package_root not in sys.path:
+            sys.path.insert(0, package_root)
+        from scripts import production_runtime  # type: ignore[no-redef]
+    # Direct-file execution defines this module as ``__main__`` while the
+    # production assembly imports ``scripts.run_table``.  Normalize at that
+    # boundary so dataclass identity cannot make the documented command fail.
+    module_config = production_runtime.TableConfig(
+        config.base_url,
+        record_concurrency=config.record_concurrency,
+        retry_failed=config.retry_failed,
+        qc_mode=config.qc_mode,
+    )
+    result = production_runtime.execute(module_config)
+    return TableResult(
+        selected=result.selected, succeeded=result.succeeded,
+        failed=result.failed, stopped=result.stopped,
+    )
 
 
 def main(

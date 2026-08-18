@@ -759,14 +759,10 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("Reject Base-only, record-share, BaseApp, Wiki", base)
         self.assertIn("While `has_more` is true", base)
         self.assertIn("Immediately before creating absent `处理明细`, repeat", base)
-        self.assertIn(
-            '{"logic":"and","conditions":[["任务状态","intersects",["未开始"]]]}',
-            base,
-        )
-        self.assertIn(
-            '{"logic":"and","conditions":[["任务状态","intersects",["失败"]]]}',
-            base,
-        )
+        self.assertIn("without `--filter-json`", base)
+        self.assertIn("select `未开始` locally", base)
+        self.assertIn("`失败` locally only for explicit `--retry-failed`", base)
+        self.assertIn("before binding the first state", base)
         self.assertIn(
             '{"update_records":{"<record-id>":{"处理明细":"<compact-json>"}}}',
             base,

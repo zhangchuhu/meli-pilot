@@ -7,9 +7,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import parse_qs, urlsplit
 
 from scripts import (
     ark_vision_qc,
@@ -24,6 +30,7 @@ from scripts.lark_runner import LarkBaseClient, RecordPage
 from scripts.run_record import QCRequest, RecordContext, RecordResult, RecordServices, run_record
 from scripts.run_table import (
     BaseField,
+    PaidCallStopped,
     PreflightError,
     ProductionRecordServicesFactory,
     RecordBaseScope,
@@ -35,6 +42,7 @@ from scripts.run_table import (
     TableSchedulerError,
     TableScope,
     run_table,
+    _qc_paid_checkpoint,
 )
 
 
@@ -46,6 +54,36 @@ _CLASSIFICATIONS = _ORDINARY | frozenset({"detail or flat lay", "infographic"})
 _DETAIL_DEFINITION = {
     "name": "处理明细", "type": "text", "style": {"type": "plain"},
 }
+_FACT_CODES = frozenset({
+    "garment_type:dress", "garment_type:top", "garment_type:skirt",
+    "garment_type:pants", "garment_type:set", "garment_type:jacket",
+    "garment_type:coat", "garment_type:other",
+    "sleeves:sleeveless", "sleeves:short", "sleeves:three-quarter",
+    "sleeves:long", "sleeves:not-applicable", "sleeves:unclear",
+    "neckline:crew", "neckline:v-neck", "neckline:square",
+    "neckline:collar", "neckline:strapless", "neckline:other",
+    "neckline:not-applicable", "neckline:unclear",
+    "closure:closed", "closure:button", "closure:zip", "closure:wrap",
+    "closure:open-front", "closure:other", "closure:not-visible",
+    "closure:unclear", "silhouette:fitted", "silhouette:straight",
+    "silhouette:a-line", "silhouette:flared", "silhouette:oversized",
+    "silhouette:other", "silhouette:unclear", "material:woven",
+    "material:knit", "material:denim", "material:leather",
+    "material:lace", "material:sheer", "material:other", "material:unclear",
+    "color:black", "color:white", "color:gray", "color:red", "color:orange",
+    "color:yellow", "color:green", "color:blue", "color:purple",
+    "color:pink", "color:brown", "color:beige", "color:multicolor",
+    "color:other", "color:unclear",
+})
+_FACT_LABELS = {
+    "garment_type": "Garment type evidence",
+    "sleeves": "Sleeve construction evidence",
+    "neckline": "Neckline evidence",
+    "closure": "Closure evidence",
+    "silhouette": "Silhouette evidence",
+    "material": "Material-family evidence",
+    "color": "Color-family evidence",
+}
 
 
 class RecordMaterializationError(ValueError):
@@ -54,6 +92,63 @@ class RecordMaterializationError(ValueError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class SharedArkGate:
+    """Bound every planning and QC request to one stop-aware semaphore."""
+
+    def __init__(
+            self, client: object, *, semaphore: threading.BoundedSemaphore,
+            stop_signal: object,
+    ) -> None:
+        self._client = client
+        self._semaphore = semaphore
+        self._stop = stop_signal
+
+    def complete_json(
+            self, *, system_prompt: str, user_prompt: str,
+            images: Sequence[Path], checkpoint: object,
+    ) -> str:
+        if not callable(checkpoint):
+            raise TableSchedulerError("Ark request checkpoint is missing")
+        complete = getattr(self._client, "complete_json", None)
+        if not callable(complete):
+            raise TableSchedulerError("Ark client has no JSON completion boundary")
+        with self._semaphore:
+            try:
+                checkpoint()
+            except Exception:
+                self._set_stop()
+                raise PaidCallStopped("durable state changed before Ark request") from None
+            if not self._start_paid():
+                raise PaidCallStopped("global stop blocked Ark request")
+            try:
+                return complete(
+                    system_prompt=system_prompt, user_prompt=user_prompt,
+                    images=images,
+                )
+            except Exception:
+                self._set_stop()
+                raise
+            finally:
+                self._finish_paid()
+
+    def _start_paid(self) -> bool:
+        start = getattr(self._stop, "try_start_paid", None)
+        if callable(start):
+            return bool(start())
+        check = getattr(self._stop, "is_set", None)
+        return callable(check) and not bool(check())
+
+    def _finish_paid(self) -> None:
+        finish = getattr(self._stop, "finish_paid", None)
+        if callable(finish):
+            finish()
+
+    def _set_stop(self) -> None:
+        setter = getattr(self._stop, "set", None)
+        if callable(setter):
+            setter()
 
 
 def _now() -> str:
@@ -106,8 +201,117 @@ def _require_dependencies(environ: Mapping[str, str]) -> str:
     return _executable_from_env(environ, "OUTFIT_SWAP_LARK_CLI", "lark-cli")
 
 
+def _require_python(version_info: Sequence[int]) -> None:
+    if tuple(version_info[:2]) < (3, 10):
+        raise TableSchedulerError("Python 3.10 or newer is required")
+
+
 def _make_ark_client() -> ark_vision_qc.ArkVisionClient:
     return ark_vision_qc.ArkVisionClient()
+
+
+def _transcode_to_png(source: Path, output: Path) -> Path:
+    if output.exists() or output.is_symlink():
+        raise RecordMaterializationError("invalid-source")
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-n", "-i", str(source),
+                "-frames:v", "1", "-f", "image2", str(output),
+            ],
+            shell=False, capture_output=True, text=True, check=False, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise RecordMaterializationError("invalid-source") from None
+    if result.returncode != 0 or not output.is_file():
+        raise RecordMaterializationError("invalid-source")
+    try:
+        verified = image_qc.validate_decodable_raster(output)
+    except image_qc.ImageQCError:
+        raise RecordMaterializationError("invalid-source") from None
+    if verified.codec_name != "png":
+        raise RecordMaterializationError("invalid-source")
+    return output
+
+
+def _canonicalize_download(
+        provisional: Path, info: image_qc.ImageInfo,
+) -> Path:
+    suffix = {
+        "mjpeg": ".jpg", "png": ".png", "webp": ".webp", "gif": ".gif",
+    }.get(info.codec_name)
+    if suffix is not None:
+        output = provisional.with_suffix(suffix)
+        if output != provisional:
+            if output.exists() or output.is_symlink():
+                raise RecordMaterializationError("invalid-source")
+            provisional.rename(output)
+        return output
+    output = provisional.with_name(provisional.stem + "-normalized.png")
+    converted = _transcode_to_png(provisional, output)
+    try:
+        provisional.unlink()
+    except OSError:
+        raise RecordMaterializationError("invalid-source") from None
+    return converted
+
+
+def _bounded_garment_facts(
+        required: tuple[str, ...], forbidden: tuple[str, ...],
+) -> prompt_builder.GarmentFacts:
+    codes = required + forbidden
+    if (not codes or any(code not in _FACT_CODES for code in codes)
+            or len(set(codes)) != len(codes)):
+        raise TableSchedulerError("Ark garment facts are not bounded evidence codes")
+    seen_categories: set[str] = set()
+    for code in codes:
+        category, _value = code.split(":", 1)
+        if category in seen_categories:
+            raise TableSchedulerError("Ark garment facts duplicate an evidence category")
+        seen_categories.add(category)
+
+    def render(values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            f"{_FACT_LABELS[category]}: {value}."
+            for category, value in (code.split(":", 1) for code in values)
+        )
+
+    return prompt_builder.GarmentFacts(
+        required=render(required), forbidden=render(forbidden),
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class TimingEventLog:
+    """Add local monotonic durations while preserving the sanitized event schema."""
+
+    def __init__(self, path: Path) -> None:
+        self._delegate = event_log.EventLog(path)
+        self._starts: dict[tuple[object, ...], int] = {}
+        self._lock = threading.Lock()
+
+    def append(self, event: str, /, **fields: Any) -> dict[str, Any]:
+        stem = event.removesuffix("_started").removesuffix("_finished")
+        key = (
+            stem, fields.get("record_id"), fields.get("target_id"),
+            fields.get("attempt"), fields.get("phase"),
+        )
+        now = time.monotonic_ns()
+        with self._lock:
+            if event.endswith("_started"):
+                self._starts[key] = now
+            elif event.endswith("_finished") and "duration_ms" not in fields:
+                started = self._starts.pop(key, None)
+                if started is not None:
+                    fields["duration_ms"] = max(0, (now - started) // 1_000_000)
+        return self._delegate.append(event, **fields)
 
 
 class ProductionLarkService:
@@ -217,19 +421,24 @@ class ArkPlanner:
     ) -> prompt_builder.TargetPlan:
         target = self._adapter.image_path(context.record_id, target_token, "target")
         sources = self._adapter.source_paths(context.record_id)
-        classification = self._classify(target)
+        checkpoint = lambda: self._adapter.planning_checkpoint(
+            context, target_index, target_token,
+        )
+        classification = self._classify(target, checkpoint)
         inventory = None
         instances: Sequence[str] = ()
         if classification == "infographic":
             inventory = infographic_text.settle_inventory(
                 target_token,
-                read=lambda token: self._read_inventory(token, target),
+                read=lambda token: self._read_inventory(token, target, checkpoint),
                 adjudicate=lambda token, first, second: self._adjudicate_inventory(
-                    token, target, first, second,
+                    token, target, first, second, checkpoint,
                 ),
             )
             instances = inventory.garment_instances
-        evidence, facts, unique = self._source_evidence(sources, instances=instances)
+        evidence, facts, unique = self._source_evidence(
+            sources, instances=instances, checkpoint=checkpoint,
+        )
         if classification in _ORDINARY or classification == "infographic":
             selection = reference_selector.select_references(
                 evidence, classification=classification,
@@ -272,15 +481,19 @@ class ArkPlanner:
             fifth_reference_reason=fifth_reason,
         )
 
-    def _complete(self, *, system: str, user: str, images: Sequence[Path]) -> Any:
-        complete = getattr(self._client, "complete_json", None)
+    def _complete(
+            self, *, system: str, user: str, images: Sequence[Path],
+            checkpoint: object,
+    ) -> Any:
+        complete = getattr(self._adapter, "ark_complete", None)
         if not callable(complete):
-            raise TableSchedulerError("Ark client has no JSON completion boundary")
+            raise TableSchedulerError("shared Ark request gate is unavailable")
         return _strict_json(complete(
             system_prompt=system, user_prompt=user, images=tuple(images),
+            checkpoint=checkpoint,
         ))
 
-    def _classify(self, target: Path) -> str:
+    def _classify(self, target: Path, checkpoint: object) -> str:
         value = _object(self._complete(
             system=(
                 "Determine one target classification from visible content. Return "
@@ -291,6 +504,7 @@ class ArkPlanner:
                 "three-quarter, back, detail or flat lay, infographic."
             ),
             images=(target,),
+            checkpoint=checkpoint,
         ), frozenset({"schema_version", "classification"}), "target classification")
         classification = value["classification"]
         if value["schema_version"] != 1 or classification not in _CLASSIFICATIONS:
@@ -299,7 +513,7 @@ class ArkPlanner:
 
     def _source_evidence(
             self, sources: tuple[tuple[str, Path], ...], *,
-            instances: Sequence[str],
+            instances: Sequence[str], checkpoint: object,
     ) -> tuple[
         tuple[reference_selector.SourceEvidence, ...],
         prompt_builder.GarmentFacts,
@@ -315,11 +529,16 @@ class ArkPlanner:
                 "Tokens in image order: " + json.dumps(tokens, separators=(",", ":"))
                 + ". Roles may include model, upper_construction, "
                   "full_outfit_flat_lay, skirt_hem, size_chart, and instance:<literal>. "
+                + "Garment facts must use only these enumerated codes, with at most "
+                  "one code per category across required and forbidden: "
+                + json.dumps(sorted(_FACT_CODES), separators=(",", ":"))
+                + ". "
                 + "Required infographic instances: "
                 + json.dumps(list(instances), ensure_ascii=False, separators=(",", ":"))
                 + "."
             ),
             images=tuple(path for _token, path in sources),
+            checkpoint=checkpoint,
         ), frozenset({
             "schema_version", "sources", "garment_facts", "unique_requirement",
         }), "source garment evidence")
@@ -350,11 +569,11 @@ class ArkPlanner:
             value["garment_facts"], frozenset({"required", "forbidden"}),
             "garment facts",
         )
-        facts = prompt_builder.GarmentFacts(
-            required=_string_list(
+        facts = _bounded_garment_facts(
+            _string_list(
                 facts_value["required"], "required garment facts", allow_empty=True,
             ),
-            forbidden=_string_list(
+            _string_list(
                 facts_value["forbidden"], "forbidden garment facts", allow_empty=True,
             ),
         )
@@ -370,17 +589,18 @@ class ArkPlanner:
         return tuple(evidence), facts, unique
 
     def _read_inventory(
-            self, target_token: str, target: Path,
+            self, target_token: str, target: Path, checkpoint: object,
     ) -> infographic_text.InventoryReading:
         value = self._inventory_response(
-            target, "Read every literal text item, panel, and garment instance once."
+            target, "Read every literal text item, panel, and garment instance once.",
+            checkpoint,
         )
         return infographic_text.InventoryReading(target_token=target_token, **value)
 
     def _adjudicate_inventory(
             self, target_token: str, target: Path,
             first: infographic_text.InventoryReading,
-            second: infographic_text.InventoryReading,
+            second: infographic_text.InventoryReading, checkpoint: object,
     ) -> infographic_text.InventoryReading:
         evidence = json.dumps({
             "first": {
@@ -394,15 +614,18 @@ class ArkPlanner:
         }, ensure_ascii=False, separators=(",", ":"))
         value = self._inventory_response(
             target, "Adjudicate these two readings against the same image: " + evidence,
+            checkpoint,
         )
         return infographic_text.InventoryReading(target_token=target_token, **value)
 
-    def _inventory_response(self, target: Path, user: str) -> dict[str, tuple[str, ...]]:
+    def _inventory_response(
+            self, target: Path, user: str, checkpoint: object,
+    ) -> dict[str, tuple[str, ...]]:
         value = _object(self._complete(
             system=(
                 "Return an exact infographic inventory as strict JSON with "
                 "visible_text, panels, and garment_instances only."
-            ), user=user, images=(target,),
+            ), user=user, images=(target,), checkpoint=checkpoint,
         ), frozenset({"visible_text", "panels", "garment_instances"}), "inventory")
         return {
             key: _string_list(value[key], key, allow_empty=False)
@@ -426,8 +649,20 @@ class ArkQCAdapter:
             + "Return the candidate field exactly as '"
             + request.candidate.name + "'."
         )
+        adapter = self._adapter
+
+        class RequestClient:
+            def complete_json(
+                    self, *, system_prompt: str, user_prompt: str,
+                    images: Sequence[Path],
+            ) -> str:
+                return adapter.ark_complete(
+                    system_prompt=system_prompt, user_prompt=user_prompt,
+                    images=images, checkpoint=lambda: _qc_paid_checkpoint(request),
+                )
+
         return ark_vision_qc.review_candidate(
-            self._client,
+            RequestClient(),
             system_prompt=(
                 "You are the visual quality reviewer. Return exactly one JSON object "
                 "using visual-QC schema version 1. Base every score and defect only "
@@ -456,8 +691,55 @@ class ProductionTableAdapter:
         self._schema: TableSchema | None = None
         self._attachments: dict[str, dict[str, dict[str, Path]]] = {}
         self._table_events = event_log.EventLog(self._run_dir / "events.ndjson")
+        self._ark_gate: SharedArkGate | None = None
+
+    def bind_shared_ark(
+            self, stop_signal: object, semaphore: threading.BoundedSemaphore,
+    ) -> None:
+        if self._ark_gate is not None:
+            raise TableSchedulerError("shared Ark gate is already bound")
+        self._ark_gate = SharedArkGate(
+            self._ark_client, semaphore=semaphore, stop_signal=stop_signal,
+        )
+
+    def ark_complete(self, **kwargs: object) -> str:
+        if self._ark_gate is None:
+            raise TableSchedulerError("shared Ark gate is not bound")
+        return self._ark_gate.complete_json(**kwargs)
+
+    @staticmethod
+    def planning_checkpoint(
+            context: RecordContext, target_index: int, target_token: str,
+    ) -> None:
+        try:
+            state = task_state.load_state(
+                Path(context.task_dir).resolve() / "manifest.json",
+            )
+            valid = (
+                state["record_id"] == context.record_id
+                and state["target_tokens"][target_index] == target_token
+                and state["record_error"] is None
+                and state["targets"][target_token]["status"] == "pending"
+                and state["targets"][target_token]["target_plan"] is None
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            raise TableSchedulerError("target planning ownership changed")
 
     def resolve_base(self, base_url: str, base: object) -> TableScope:
+        parsed = urlsplit(base_url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        parts = tuple(part for part in parsed.path.split("/") if part)
+        if (parsed.scheme != "https" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.fragment or len(parts) != 2 or parts[0] != "base"
+                or _SAFE_ID.fullmatch(parts[1]) is None
+                or set(query) != {"table", "view"}
+                or any(len(query[name]) != 1 for name in ("table", "view"))
+                or any(_SAFE_ID.fullmatch(query[name][0]) is None
+                       for name in ("table", "view"))):
+            raise PreflightError("input is not one direct exact Base table-view URL")
         response = base.resolve_base(base_url)
         if not isinstance(response, dict) or _contains_key(response, "record_id"):
             raise PreflightError("Base URL did not resolve to an exact table view")
@@ -469,11 +751,10 @@ class ProductionTableAdapter:
         ))
         if not all(isinstance(value, str) and value for value in values):
             raise PreflightError("Base URL did not resolve to an exact table view")
+        if values != (parts[1], query["table"][0], query["view"][0]):
+            raise PreflightError("Base resolver identity did not match the direct URL")
         scope = TableScope(*values)
         self._scope = scope
-        self._table_events.append(
-            "table_started", table_id=scope.table_id, status="running",
-        )
         return scope
 
     def authenticate(self, scope: TableScope, base: object) -> None:
@@ -515,15 +796,10 @@ class ProductionTableAdapter:
             qc_mode: str, base: object,
     ) -> Iterable[RecordContext]:
         del qc_mode
-        filter_name = "status-filter.json"
-        filter_path = self._run_dir / filter_name
         selected_status = "失败" if retry_failed else "未开始"
-        filter_path.write_text(json.dumps({
-            "logic": "and",
-            "conditions": [["任务状态", "intersects", [selected_status]]],
-        }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         offset = 0
-        contexts: list[RecordContext] = []
+        selected_records: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         field_ids = [schema.field(name).field_id for name in (
             "原图", "爆款图", "输出图", "任务状态", "处理明细",
         )]
@@ -532,7 +808,7 @@ class ProductionTableAdapter:
             page = base.list_records_page(
                 app_token=scope.app_token, table_id=scope.table_id,
                 view_id=scope.view_id, field_ids=field_ids,
-                filter_payload=Path(filter_name), output=output,
+                filter_payload=None, output=output,
                 limit=2000, offset=offset, retry_failed=retry_failed,
             )
             if not isinstance(page, RecordPage):
@@ -542,17 +818,32 @@ class ProductionTableAdapter:
                 raise PreflightError("Base record page count does not match its artifact")
             for record in records:
                 fields = record.get("fields")
+                record_id = record.get("record_id")
+                if (not isinstance(record_id, str)
+                        or _SAFE_ID.fullmatch(record_id) is None
+                        or record_id in seen_ids or not isinstance(fields, dict)):
+                    raise PreflightError("Base record identity or fields are invalid")
+                seen_ids.add(record_id)
                 status = fields.get("任务状态") if isinstance(fields, dict) else None
-                if status == ["成功"]:
+                if status not in (["未开始"], ["失败"], ["成功"]):
+                    raise PreflightError("Base record status is invalid")
+                if status != [selected_status]:
                     continue
-                contexts.append(self._materialize(
-                    scope, schema, record, retry_failed=retry_failed, base=base,
-                ))
+                _attachments(fields.get("原图"))
+                _attachments(fields.get("爆款图"))
+                _outputs(fields.get("输出图"))
+                selected_records.append(record)
             if not page.has_more:
-                return tuple(contexts)
+                break
             if page.records_count <= 0:
                 raise PreflightError("Base record pagination did not advance")
             offset += page.records_count
+        return tuple(
+            self._materialize(
+                scope, schema, record, retry_failed=retry_failed, base=base,
+            )
+            for record in selected_records
+        )
 
     def _materialize(
             self, scope: TableScope, schema: TableSchema, record: dict[str, Any], *,
@@ -611,7 +902,7 @@ class ProductionTableAdapter:
                     state, source_tokens=source_tokens, target_tokens=target_tokens,
                     outputs=outputs, run_id=self._run_id, started_at=started,
                     updated_at=started,
-                    resumable_artifacts=self._resumable_artifacts(state),
+                    resumable_artifacts=self._resumable_artifacts(state, generated),
                 )
             if retry_failed and sources and targets:
                 task_state.prepare_retry(state, updated_at=started)
@@ -660,20 +951,15 @@ class ProductionTableAdapter:
                 info = image_qc.validate_decodable_raster(provisional)
             except image_qc.ImageQCError:
                 raise RecordMaterializationError(f"corrupt-{role}") from None
-            suffixes = {
-                "mjpeg": ".jpg", "png": ".png", "webp": ".webp", "gif": ".gif",
-            }
-            suffix = suffixes.get(info.codec_name)
-            if suffix is None:
-                raise RecordMaterializationError(f"invalid-{role}")
-            output = provisional.with_suffix(suffix)
-            if output != provisional:
-                if output.exists() or output.is_symlink():
-                    raise TableSchedulerError("canonical attachment path already exists")
-                provisional.rename(output)
+            try:
+                output = _canonicalize_download(provisional, info)
+            except RecordMaterializationError:
+                raise RecordMaterializationError(f"invalid-{role}") from None
             paths[role][token] = output
 
-    def _resumable_artifacts(self, state: dict[str, Any]) -> tuple[dict[str, str], ...]:
+    def _resumable_artifacts(
+            self, state: dict[str, Any], current_generated: Path,
+    ) -> tuple[dict[str, str], ...]:
         result: list[dict[str, str]] = []
         record_id = state["record_id"]
         for target in state["targets"].values():
@@ -683,6 +969,18 @@ class ProductionTableAdapter:
                     / "generated_images" / history["artifact_name"]
                 )
                 if path.is_file() and not path.is_symlink():
+                    current = current_generated / history["artifact_name"]
+                    if not current.exists() and not current.is_symlink():
+                        try:
+                            os.link(path, current)
+                        except OSError:
+                            try:
+                                shutil.copyfile(path, current)
+                            except OSError:
+                                continue
+                    if (not current.is_file() or current.is_symlink()
+                            or _sha256_file(current) != _sha256_file(path)):
+                        continue
                     result.append({
                         "run_id": history["run_id"],
                         "artifact_name": history["artifact_name"],
@@ -714,7 +1012,7 @@ class ProductionTableAdapter:
             raise TableSchedulerError("record services precede table preflight")
         factory = ProductionRecordServicesFactory(
             scope=self._scope, schema=self._schema,
-            events_factory=lambda current: event_log.EventLog(
+            events_factory=lambda current: TimingEventLog(
                 current.task_dir / "events.ndjson",
             ),
         )
@@ -752,8 +1050,8 @@ class ProductionTableAdapter:
 
     def qc_images(self, request: QCRequest) -> tuple[Path, ...]:
         return (
-            request.candidate,
             self.image_path(request.context.record_id, request.target_token, "target"),
+            request.candidate,
             *(self.image_path(request.context.record_id, token, "source")
               for token in request.plan.reference_tokens),
         )
@@ -873,9 +1171,50 @@ def _terminal_worker(context: RecordContext, services: RecordServices) -> Record
     return result
 
 
-def execute(config: TableConfig, *, environ: Mapping[str, str] | None = None) -> TableResult:
+def _persist_metrics(
+        run_dir: Path, *, record_concurrency: int,
+) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    for path in sorted(run_dir.rglob("events.ndjson")):
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line:
+                    value = json.loads(line)
+                    if not isinstance(value, dict):
+                        raise ValueError
+                    events.append(value)
+        except (OSError, UnicodeError, ValueError):
+            raise TableSchedulerError("event metrics could not be aggregated") from None
+    metrics = {
+        **event_log.summarize_events(events),
+        "record_concurrency": record_concurrency,
+    }
+    descriptor, name = tempfile.mkstemp(
+        prefix=".metrics-", suffix=".json", dir=run_dir,
+    )
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(metrics, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, run_dir / "metrics.json")
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return metrics
+
+
+def execute(
+        config: TableConfig, *, environ: Mapping[str, str] | None = None,
+        version_info: Sequence[int] | None = None,
+) -> TableResult:
     """Assemble and run the production scheduler for one documented invocation."""
     env = os.environ if environ is None else environ
+    _require_python(sys.version_info if version_info is None else version_info)
     executable = _require_dependencies(env)
     state_root = _directory_from_env(
         env, "OUTFIT_SWAP_STATE_ROOT",
@@ -910,14 +1249,30 @@ def execute(config: TableConfig, *, environ: Mapping[str, str] | None = None) ->
         adapter=adapter, base=base, generator=generator,
         qc=ArkQCAdapter(adapter, ark), worker=_terminal_worker,
     )
-    result = run_table(config, runtime)
-    scope = adapter._scope
-    if scope is not None:
-        adapter._table_events.append(
-            "table_finished", table_id=scope.table_id,
-            status=(
-                "stopped" if result.stopped
+    table_started = time.monotonic_ns()
+    adapter._table_events.append(
+        "table_started", status="running",
+        concurrency=config.record_concurrency,
+    )
+    result: TableResult | None = None
+    try:
+        result = run_table(config, runtime)
+        return result
+    finally:
+        scope = adapter._scope
+        fields: dict[str, Any] = {
+            "status": (
+                "failed" if result is None
+                else "stopped" if result.stopped
                 else "failed" if result.failed else "success"
             ),
+            "duration_ms": max(
+                0, (time.monotonic_ns() - table_started) // 1_000_000,
+            ),
+        }
+        if scope is not None:
+            fields["table_id"] = scope.table_id
+        adapter._table_events.append("table_finished", **fields)
+        _persist_metrics(
+            run_dir, record_concurrency=config.record_concurrency,
         )
-    return result
