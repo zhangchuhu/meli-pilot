@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 
 class LarkRunnerError(RuntimeError):
     """Raised when a Base command cannot be safely run or parsed."""
+
+
+@dataclass(frozen=True)
+class _PrivateUpdate:
+    directory: Path
+    directory_fd: int
+    directory_identity: tuple[int, int]
+    payload_identity: tuple[int, int]
 
 
 class LarkBaseClient:
@@ -93,14 +105,33 @@ class LarkBaseClient:
             self, *, app_token: str, table_id: str, record_id: str, payload: Path,
     ) -> dict:
         """Apply a record-keyed batch update stored in a task-local JSON file."""
-        payload_path, payload_arg = self._input_path(payload)
+        payload_path, _payload_arg = self._input_path(payload)
         record_id = self._required(record_id, "record ID")
-        self._validate_update_payload(payload_path, record_id)
-        return self._json([
-            "base", "+record-batch-update", "--base-token",
-            self._required(app_token, "app token"), "--table-id",
-            self._required(table_id, "table ID"), "--json", f"@{payload_arg}", "--as", "user",
-        ], cwd=payload_path.parent)
+        canonical_payload = self._canonical_update_file(payload_path, record_id)
+        return self.update_record_canonical(
+            app_token=app_token, table_id=table_id, record_id=record_id,
+            canonical_payload=canonical_payload,
+        )
+
+    def update_record_canonical(
+            self, *, app_token: str, table_id: str, record_id: str,
+            canonical_payload: bytes,
+    ) -> dict:
+        """Consume validated canonical bytes from a locked transport-owned file."""
+        record_id = self._required(record_id, "record ID")
+        canonical_payload = self._validated_canonical_update(
+            canonical_payload, record_id,
+        )
+        private = self._stage_private_update(canonical_payload)
+        try:
+            return self._json([
+                "base", "+record-batch-update", "--base-token",
+                self._required(app_token, "app token"), "--table-id",
+                self._required(table_id, "table ID"), "--json",
+                "@./record-update.json", "--as", "user",
+            ], cwd=private.directory)
+        finally:
+            self._cleanup_private_update(private)
 
     def get_record(
             self, *, app_token: str, table_id: str, record_id: str,
@@ -203,22 +234,157 @@ class LarkBaseClient:
             raise LarkRunnerError("record list offset is invalid")
         return offset
 
-    @staticmethod
-    def _validate_update_payload(payload: Path, record_id: str) -> None:
+    @classmethod
+    def _canonical_update_file(cls, payload: Path, record_id: str) -> bytes:
         invalid_payload = False
         try:
-            decoded = json.loads(payload.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            decoded = json.loads(
+                payload.read_text(encoding="utf-8"),
+                object_pairs_hook=cls._unique_object,
+            )
+        except (OSError, UnicodeError, ValueError):
             invalid_payload = True
             decoded = None
-        if not isinstance(decoded, dict):
-            invalid_payload = True
-        update_records = decoded.get("update_records") if isinstance(decoded, dict) else None
-        if (not isinstance(update_records, dict) or set(update_records) != {record_id}
-                or not isinstance(update_records.get(record_id), dict)):
+        if not cls._is_exact_record_update(decoded, record_id):
             invalid_payload = True
         if invalid_payload:
             raise LarkRunnerError("record update payload is invalid")
+        return cls._encode_canonical_update(decoded)
+
+    @classmethod
+    def _validated_canonical_update(
+            cls, supplied: bytes, record_id: str,
+    ) -> bytes:
+        invalid_payload = type(supplied) is not bytes
+        try:
+            decoded = json.loads(
+                supplied.decode("utf-8") if type(supplied) is bytes else "",
+                object_pairs_hook=cls._unique_object,
+            )
+        except (UnicodeError, ValueError):
+            invalid_payload = True
+            decoded = None
+        if (not cls._is_exact_record_update(decoded, record_id)
+                or (isinstance(decoded, dict)
+                    and supplied != cls._encode_canonical_update(decoded))):
+            invalid_payload = True
+        if invalid_payload:
+            raise LarkRunnerError("canonical record update payload is invalid")
+        return supplied
+
+    @staticmethod
+    def _is_exact_record_update(decoded: object, record_id: str) -> bool:
+        update_records = decoded.get("update_records") if isinstance(decoded, dict) else None
+        return (
+            isinstance(decoded, dict)
+            and set(decoded) == {"update_records"}
+            and isinstance(update_records, dict)
+            and set(update_records) == {record_id}
+            and isinstance(update_records.get(record_id), dict)
+        )
+
+    @staticmethod
+    def _encode_canonical_update(decoded: dict) -> bytes:
+        return (
+            json.dumps(
+                decoded, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
+        ).encode("utf-8")
+
+    @staticmethod
+    def _stage_private_update(canonical_payload: bytes) -> _PrivateUpdate:
+        directory: Path | None = None
+        directory_fd = payload_fd = -1
+        try:
+            directory = Path(tempfile.mkdtemp(prefix=".lark-update-"))
+            no_follow = getattr(os, "O_NOFOLLOW", 0)
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0) | no_follow,
+            )
+            directory_stat = os.fstat(directory_fd)
+            if (not stat.S_ISDIR(directory_stat.st_mode)
+                    or directory_stat.st_mode & 0o777 != 0o700):
+                raise OSError("private update directory is invalid")
+            payload_fd = os.open(
+                "record-update.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0) | no_follow,
+                stat.S_IRUSR | stat.S_IWUSR,
+                dir_fd=directory_fd,
+            )
+            payload_stat = os.fstat(payload_fd)
+            if not stat.S_ISREG(payload_stat.st_mode):
+                raise OSError("private update payload is invalid")
+            offset = 0
+            while offset < len(canonical_payload):
+                offset += os.write(payload_fd, canonical_payload[offset:])
+            os.fsync(payload_fd)
+            os.fchmod(payload_fd, stat.S_IRUSR)
+            os.close(payload_fd)
+            payload_fd = -1
+            os.fsync(directory_fd)
+            os.fchmod(directory_fd, stat.S_IRUSR | stat.S_IXUSR)
+            return _PrivateUpdate(
+                directory=directory,
+                directory_fd=directory_fd,
+                directory_identity=(directory_stat.st_dev, directory_stat.st_ino),
+                payload_identity=(payload_stat.st_dev, payload_stat.st_ino),
+            )
+        except OSError:
+            if payload_fd >= 0:
+                os.close(payload_fd)
+            if directory_fd >= 0:
+                try:
+                    os.fchmod(directory_fd, stat.S_IRWXU)
+                    os.unlink("record-update.json", dir_fd=directory_fd)
+                except OSError:
+                    pass
+                os.close(directory_fd)
+            if directory is not None:
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+            raise LarkRunnerError("cannot stage private record update") from None
+
+    @staticmethod
+    def _cleanup_private_update(private: _PrivateUpdate) -> None:
+        cleanup_failed = False
+        try:
+            directory_stat = os.fstat(private.directory_fd)
+            if (not stat.S_ISDIR(directory_stat.st_mode)
+                    or (directory_stat.st_dev, directory_stat.st_ino)
+                    != private.directory_identity):
+                raise OSError("private update directory identity changed")
+            os.fchmod(private.directory_fd, stat.S_IRWXU)
+            payload_stat = os.stat(
+                "record-update.json", dir_fd=private.directory_fd,
+                follow_symlinks=False,
+            )
+            if (not stat.S_ISREG(payload_stat.st_mode)
+                    or (payload_stat.st_dev, payload_stat.st_ino)
+                    != private.payload_identity):
+                raise OSError("private update payload identity changed")
+            os.unlink("record-update.json", dir_fd=private.directory_fd)
+            os.fsync(private.directory_fd)
+        except OSError:
+            cleanup_failed = True
+        finally:
+            os.close(private.directory_fd)
+        try:
+            directory_stat = private.directory.stat(follow_symlinks=False)
+            if (not stat.S_ISDIR(directory_stat.st_mode)
+                    or (directory_stat.st_dev, directory_stat.st_ino)
+                    != private.directory_identity):
+                raise OSError("private update directory entry changed")
+            private.directory.rmdir()
+        except OSError:
+            cleanup_failed = True
+        if cleanup_failed:
+            raise LarkRunnerError("cannot clean private record update") from None
 
     @staticmethod
     def _validate_status_filter(filter_payload: Path, *, retry_failed: bool) -> None:

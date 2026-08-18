@@ -105,6 +105,10 @@ class _Base:
         self.calls.append(("update_record", dict(kwargs)))
         return {"ok": True}
 
+    def update_record_canonical(self, **kwargs: object) -> dict:
+        self.calls.append(("update_record_canonical", dict(kwargs)))
+        return {"ok": True}
+
     def get_record(self, **kwargs: object) -> dict:
         self.calls.append(("get_record", dict(kwargs)))
         return {"ok": True}
@@ -1052,7 +1056,7 @@ class SemaphoreTest(unittest.TestCase):
             def get_record(self, **kwargs: object) -> object:
                 return self.read_probe.call(**kwargs)
 
-            def update_record(self, **kwargs: object) -> object:
+            def update_record_canonical(self, **kwargs: object) -> object:
                 return self.write_probe.call(**kwargs)
 
         raw = Base()
@@ -1244,7 +1248,7 @@ class SemaphoreTest(unittest.TestCase):
                         )
                     self.assertEqual(len(raw.calls), before)
 
-    def test_worker_update_uses_validated_private_snapshot_during_rename_race(
+    def test_worker_update_passes_canonical_bytes_during_caller_rename_race(
             self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1281,21 +1285,16 @@ class SemaphoreTest(unittest.TestCase):
 
             class ConsumingBase:
                 def __init__(self) -> None:
-                    self.payload_name: str | None = None
-                    self.payload_mode: int | None = None
                     self.consumed: bytes | None = None
 
-                def update_record(self, **kwargs: object) -> dict:
-                    supplied = kwargs["payload"]
-                    if not isinstance(supplied, Path):
-                        raise AssertionError("payload must remain a filename")
-                    self.payload_name = supplied.name
+                def update_record_canonical(self, **kwargs: object) -> dict:
                     raw_entered.set()
                     if not allow_raw_read.wait(timeout=2):
-                        raise AssertionError("raw Base read was not released")
-                    path = root / supplied.name
-                    self.payload_mode = path.stat().st_mode & 0o777
-                    self.consumed = path.read_bytes()
+                        raise AssertionError("raw Base consumption was not released")
+                    supplied = kwargs["canonical_payload"]
+                    if not isinstance(supplied, bytes):
+                        raise AssertionError("validated update must be immutable bytes")
+                    self.consumed = supplied
                     return {"ok": True}
 
             gate = WriteGate()
@@ -1332,14 +1331,14 @@ class SemaphoreTest(unittest.TestCase):
 
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
-            self.assertNotEqual(raw.payload_name, original.name)
-            self.assertEqual(raw.payload_mode, 0o400)
             self.assertEqual(
                 raw.consumed,
                 '{"update_records":{"rec_1":{"处理明细":"allowed"}}}\n'.encode(),
             )
-            self.assertIsNotNone(raw.payload_name)
-            self.assertFalse((root / raw.payload_name).exists())
+            self.assertEqual(
+                [path for path in root.iterdir() if path.name.startswith(".scoped-update-")],
+                [],
+            )
             self.assertIn("输出图", original.read_text(encoding="utf-8"))
 
     def test_worker_update_rejects_symlink_payload_before_client_call(self) -> None:

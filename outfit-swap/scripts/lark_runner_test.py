@@ -24,8 +24,21 @@ class LarkBaseClientTest(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
             "trace = pathlib.Path(os.environ['LARK_TEST_TRACE'])\n"
-            "trace.open('a', encoding='utf-8').write(json.dumps(\n"
-            "    {'argv': sys.argv[1:], 'cwd': os.getcwd()}) + '\\n')\n"
+            "call = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
+            "if '--json' in sys.argv and os.environ.get('LARK_TEST_SWAP_UPDATE'):\n"
+            "    payload_arg = sys.argv[sys.argv.index('--json') + 1]\n"
+            "    payload = pathlib.Path(payload_arg.removeprefix('@'))\n"
+            "    replacement = pathlib.Path(os.environ['LARK_TEST_SWAP_UPDATE'])\n"
+            "    call['payload_mode'] = oct(payload.stat().st_mode & 0o777)\n"
+            "    call['directory_mode'] = oct(pathlib.Path.cwd().stat().st_mode & 0o777)\n"
+            "    try:\n"
+            "        replacement.replace(payload)\n"
+            "        call['replacement_succeeded'] = True\n"
+            "    except OSError as error:\n"
+            "        call['replacement_succeeded'] = False\n"
+            "        call['replacement_errno'] = error.errno\n"
+            "    call['payload_bytes'] = payload.read_bytes().hex()\n"
+            "trace.open('a', encoding='utf-8').write(json.dumps(call) + '\\n')\n"
             "if os.environ.get('LARK_TEST_TIMEOUT') == '1':\n"
             "    import time\n"
             "    time.sleep(1)\n"
@@ -97,7 +110,13 @@ class LarkBaseClientTest(unittest.TestCase):
         )
 
         calls = self._calls()
-        self.assertEqual([call["cwd"] for call in calls], [str(self.task_dir.resolve())] * 4)
+        task_cwd = str(self.task_dir.resolve())
+        self.assertEqual(
+            [calls[index]["cwd"] for index in (0, 1, 3)],
+            [task_cwd] * 3,
+        )
+        self.assertNotEqual(calls[2]["cwd"], task_cwd)
+        self.assertFalse(Path(calls[2]["cwd"]).exists())
         self.assertEqual(calls[0]["argv"], [
             "base", "+record-upload-attachment", "--base-token", "app-token",
             "--table-id", "tbl123", "--record-id", "rec123", "--field-id", "fld-output",
@@ -110,7 +129,7 @@ class LarkBaseClientTest(unittest.TestCase):
         ])
         self.assertEqual(calls[2]["argv"], [
             "base", "+record-batch-update", "--base-token", "app-token",
-            "--table-id", "tbl123", "--json", "@./update.json", "--as", "user",
+            "--table-id", "tbl123", "--json", "@./record-update.json", "--as", "user",
         ])
         self.assertEqual(calls[3]["argv"], [
             "base", "+record-list", "--base-token", "app-token", "--table-id", "tbl123",
@@ -185,6 +204,100 @@ class LarkBaseClientTest(unittest.TestCase):
                 payload=Path("update.json"),
             )
         self.assertFalse(self.trace.exists())
+
+    def test_canonical_update_locks_actual_downstream_entry_against_substitution(self) -> None:
+        """Fails if the subprocess can reopen caller-replaceable validated bytes."""
+        allowed = b'{"update_records":{"rec123":{"detail":"allowed"}}}\n'
+        replacement = self.root / "forbidden.json"
+        replacement.write_bytes(
+            b'{"update_records":{"rec123":{"output":[]}}}\n',
+        )
+        old_swap = os.environ.get("LARK_TEST_SWAP_UPDATE")
+        os.environ["LARK_TEST_SWAP_UPDATE"] = str(replacement)
+        try:
+            self.assertEqual(
+                self.client.update_record_canonical(
+                    app_token="app-token", table_id="tbl123", record_id="rec123",
+                    canonical_payload=allowed,
+                ),
+                {"ok": True},
+            )
+        finally:
+            if old_swap is None:
+                os.environ.pop("LARK_TEST_SWAP_UPDATE", None)
+            else:
+                os.environ["LARK_TEST_SWAP_UPDATE"] = old_swap
+
+        call = self._calls()[-1]
+        staging = Path(call["cwd"])
+        self.assertNotEqual(staging, self.task_dir.resolve())
+        self.assertEqual(call["argv"], [
+            "base", "+record-batch-update", "--base-token", "app-token",
+            "--table-id", "tbl123", "--json", "@./record-update.json", "--as", "user",
+        ])
+        self.assertEqual(call["directory_mode"], "0o500")
+        self.assertEqual(call["payload_mode"], "0o400")
+        self.assertFalse(call["replacement_succeeded"])
+        self.assertEqual(bytes.fromhex(call["payload_bytes"]), allowed)
+        self.assertTrue(replacement.exists())
+        self.assertFalse(staging.exists())
+
+    def test_canonical_update_rejects_mutable_noncanonical_or_cross_record_bytes(self) -> None:
+        """Fails if the trusted transport stages bytes outside its typed contract."""
+        invalid_payloads = (
+            bytearray(b'{"update_records":{"rec123":{}}}\n'),
+            b'{ "update_records": {"rec123": {}} }\n',
+            b'{"update_records":{"rec456":{}}}\n',
+            b'{"update_records":{"rec123":{}},"update_records":{"rec123":{}}}\n',
+        )
+        for supplied in invalid_payloads:
+            with self.subTest(supplied=supplied):
+                with self.assertRaisesRegex(
+                        LarkRunnerError, "canonical record update payload is invalid",
+                ):
+                    self.client.update_record_canonical(
+                        app_token="app-token", table_id="tbl123", record_id="rec123",
+                        canonical_payload=supplied,  # type: ignore[arg-type]
+                    )
+        self.assertFalse(self.trace.exists())
+
+    def test_canonical_update_cleans_private_entry_after_transport_exception(self) -> None:
+        """Fails if a failed subprocess leaves canonical Base-update bytes behind."""
+        allowed = b'{"update_records":{"rec123":{"detail":"allowed"}}}\n'
+        replacement = self.root / "forbidden.json"
+        replacement.write_bytes(
+            b'{"update_records":{"rec123":{"output":[]}}}\n',
+        )
+        old_swap = os.environ.get("LARK_TEST_SWAP_UPDATE")
+        old_fail = os.environ.get("LARK_TEST_FAIL")
+        old_secret = os.environ.get("LARK_TEST_SECRET")
+        os.environ["LARK_TEST_SWAP_UPDATE"] = str(replacement)
+        os.environ["LARK_TEST_FAIL"] = "1"
+        os.environ["LARK_TEST_SECRET"] = "must-not-escape"
+        try:
+            with self.assertRaisesRegex(
+                    LarkRunnerError, "lark-cli command failed with status 7",
+            ):
+                self.client.update_record_canonical(
+                    app_token="app-token", table_id="tbl123", record_id="rec123",
+                    canonical_payload=allowed,
+                )
+        finally:
+            for name, old in (
+                    ("LARK_TEST_SWAP_UPDATE", old_swap),
+                    ("LARK_TEST_FAIL", old_fail),
+                    ("LARK_TEST_SECRET", old_secret),
+            ):
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
+
+        call = self._calls()[-1]
+        self.assertFalse(call["replacement_succeeded"])
+        self.assertEqual(bytes.fromhex(call["payload_bytes"]), allowed)
+        self.assertTrue(replacement.exists())
+        self.assertFalse(Path(call["cwd"]).exists())
 
     def test_list_rejects_filter_outside_the_selected_status_scope(self) -> None:
         """Fails if a listing can include records outside pending or retry-failed scope."""

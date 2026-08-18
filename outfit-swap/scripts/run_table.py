@@ -387,21 +387,22 @@ class BoundedBase:
     def _update_scoped_record(
             self, scope: RecordBaseScope, **kwargs: object,
     ) -> object:
-        method = getattr(self._service, "update_record", None)
+        method = getattr(self._service, "update_record_canonical", None)
         if not callable(method):
-            raise TableSchedulerError("Base service has no update_record boundary")
+            raise TableSchedulerError(
+                "Base service has no canonical update_record boundary",
+            )
         with self._write_semaphore:
             decoded = _read_scoped_update(scope, kwargs["payload"])
-            snapshot, identity = _private_update_snapshot(scope, decoded)
-            transport = dict(kwargs)
-            transport["payload"] = Path(snapshot.name)
-            try:
-                _verify_private_snapshot(snapshot, identity)
-                result = method(**transport)
-                _verify_private_snapshot(snapshot, identity)
-                return result
-            finally:
-                _cleanup_private_snapshot(snapshot, identity)
+            canonical_payload = (
+                json.dumps(
+                    decoded, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n"
+            ).encode("utf-8")
+            transport = {key: value for key, value in kwargs.items() if key != "payload"}
+            transport["canonical_payload"] = canonical_payload
+            return method(**transport)
 
 
 class ScopedBase:
@@ -540,87 +541,6 @@ def _unique_json_object(
             raise ValueError("duplicate JSON key")
         decoded[key] = value
     return decoded
-
-
-def _private_update_snapshot(
-        scope: RecordBaseScope, decoded: dict[object, object],
-) -> tuple[Path, tuple[int, int, str]]:
-    descriptor = -1
-    snapshot: Path | None = None
-    try:
-        descriptor, filename = tempfile.mkstemp(
-            prefix=".scoped-update-", suffix=".json",
-            dir=scope.payload_root,
-        )
-        snapshot = Path(filename)
-        identity = os.fstat(descriptor)
-        canonical = (
-            json.dumps(
-                decoded, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":"),
-            ) + "\n"
-        ).encode("utf-8")
-        with os.fdopen(descriptor, "wb") as stream:
-            descriptor = -1
-            stream.write(canonical)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), stat.S_IRUSR)
-        return snapshot, (
-            identity.st_dev, identity.st_ino,
-            hashlib.sha256(canonical).hexdigest(),
-        )
-    except (OSError, TypeError, ValueError):
-        if descriptor >= 0:
-            os.close(descriptor)
-        if snapshot is not None:
-            try:
-                snapshot.unlink()
-            except OSError:
-                pass
-        raise PreflightError("private record update snapshot failed") from None
-
-
-def _verify_private_snapshot(
-        snapshot: Path, identity: tuple[int, int, str],
-) -> None:
-    descriptor = -1
-    try:
-        no_follow = getattr(os, "O_NOFOLLOW", None)
-        if no_follow is None:
-            raise OSError("no-follow file opens are unavailable")
-        descriptor = os.open(
-            snapshot,
-            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
-        )
-        observed = os.fstat(descriptor)
-        digest = hashlib.sha256()
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
-        if (not stat.S_ISREG(observed.st_mode)
-                or (observed.st_dev, observed.st_ino) != identity[:2]
-                or observed.st_mode & 0o777 != stat.S_IRUSR
-                or digest.hexdigest() != identity[2]):
-            raise OSError("private update snapshot identity changed")
-    except OSError:
-        raise PreflightError("private record update snapshot changed") from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _cleanup_private_snapshot(
-        snapshot: Path, identity: tuple[int, int, str],
-) -> None:
-    try:
-        observed = snapshot.stat(follow_symlinks=False)
-        if (stat.S_ISREG(observed.st_mode)
-                and (observed.st_dev, observed.st_ino) == identity[:2]):
-            snapshot.unlink()
-    except FileNotFoundError:
-        pass
 
 
 class SeedreamGeneratorAdapter:
