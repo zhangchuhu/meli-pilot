@@ -305,14 +305,23 @@ def _nonempty_string(value: Any, name: str) -> str:
 
 
 def _json_object(value: Any, name: str) -> dict[str, Any]:
-    """Validate and detach a JSON object kept in durable target metadata."""
+    """Validate and normalize a JSON object kept in durable target metadata."""
     if not isinstance(value, dict):
         raise TaskStateError(f"{name} must be a JSON object")
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            if not all(isinstance(key, str) for key in current):
+                raise TaskStateError(f"{name} must contain only string keys")
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
     try:
-        json.dumps(value, allow_nan=False)
+        normalized = json.loads(json.dumps(value, allow_nan=False))
     except (TypeError, ValueError) as error:
         raise TaskStateError(f"{name} must contain JSON values") from error
-    return copy.deepcopy(value)
+    return normalized
 
 
 def _qc_report(value: Any) -> dict[str, Any]:
@@ -849,6 +858,7 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
             replacement = _target_template(updated_at)
             replacement["attempt_history"] = history
             replacement["stale_output_tokens"] = stale_tokens
+            replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
             candidate["targets"][token] = replacement
     else:
@@ -1004,6 +1014,7 @@ def reconcile_error(
             replacement = _target_template(updated_at)
             replacement["attempt_history"] = history
             replacement["stale_output_tokens"] = stale_output_tokens
+            replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
             candidate["targets"][token] = replacement
     _validate_state(candidate)

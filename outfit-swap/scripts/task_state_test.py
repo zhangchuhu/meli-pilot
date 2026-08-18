@@ -662,6 +662,32 @@ class TaskStateTest(unittest.TestCase):
             task_state.record_target_plan(state, 0, {"classification": "side"})
         self.assertEqual(state, before)
 
+    def test_source_reconciliation_preserves_an_immutable_target_plan(self) -> None:
+        state = self.make_state()
+        plan = {"classification": "front", "reference_tokens": ["box_s1"]}
+        task_state.record_target_plan(state, 0, plan)
+
+        task_state.reconcile(
+            state, source_tokens=["box_s2"], target_tokens=["box_t1"], outputs=[],
+            run_id="run_2", started_at="2026-08-15T11:00:00+08:00",
+            updated_at="2026-08-15T11:00:01+08:00",
+        )
+
+        self.assertEqual(state["targets"]["box_t1"]["target_plan"], plan)
+        with self.assertRaisesRegex(task_state.TaskStateError, "target plan"):
+            task_state.record_target_plan(state, 0, {"classification": "side"})
+
+    def test_checkpoint_payloads_reject_non_string_keys_recursively(self) -> None:
+        state = self.make_state()
+        before = json.loads(json.dumps(state))
+
+        with self.assertRaisesRegex(task_state.TaskStateError, "string keys"):
+            task_state.record_target_plan(
+                state, 0, {"references": [{1: "box_s1"}]},
+            )
+
+        self.assertEqual(state, before)
+
     def test_qc_reports_append_with_artifact_digest_and_attempt_number(self) -> None:
         state = self.make_state()
         first = {
