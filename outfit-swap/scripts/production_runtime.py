@@ -165,6 +165,13 @@ class SharedArkGate:
         self._client = client
         self._semaphore = semaphore
         self._stop = stop_signal
+        self._count = 0
+        self._count_lock = threading.Lock()
+
+    @property
+    def request_count(self) -> int:
+        with self._count_lock:
+            return self._count
 
     def complete_json(
             self, *, system_prompt: str, user_prompt: str,
@@ -183,6 +190,8 @@ class SharedArkGate:
                 raise PaidCallStopped("durable state changed before Ark request") from None
             if not self._start_paid():
                 raise PaidCallStopped("global stop blocked Ark request")
+            with self._count_lock:
+                self._count += 1
             try:
                 return complete(
                     system_prompt=system_prompt, user_prompt=user_prompt,
@@ -906,14 +915,31 @@ class ArkQCAdapter:
         try:
             state = task_state.load_state(Path(request.context.task_dir) / "manifest.json")
             target = state["targets"][request.target_token]
-            names = {path.name for path in request.candidates}
-            durable = {entry["artifact_name"] for entry in task_state.current_attempt_cycle(
+            cycle = task_state.current_attempt_cycle(
                 state, request.target_index,
-            )}
+            )
+            durable = {entry["attempt"]: entry for entry in cycle}
+            supplied = tuple(zip(
+                request.aliases, request.candidates, request.candidate_sha256, strict=True,
+            ))
             valid = (state["record_id"] == request.context.record_id
                      and state["current_target"] == request.target_token
                      and target["status"] == "running" and target["attempts"] == 3
-                     and names == durable and len(names) == len(request.candidates))
+                     and bool(supplied)
+                     and len({alias for alias, _path, _digest in supplied}) == len(supplied)
+                     and all(
+                         alias == f"candidate_{attempt}"
+                         and attempt in durable
+                         and path.name == durable[attempt]["artifact_name"]
+                         and path.resolve() == (
+                             Path(request.context.task_dir).resolve()
+                             / "generated_images" / durable[attempt]["artifact_name"]
+                         )
+                         and path.is_file() and not path.is_symlink()
+                         and _sha256_file(path) == digest
+                         for alias, path, digest in supplied
+                         for attempt in [int(alias.removeprefix("candidate_"))]
+                     ))
         except Exception:
             valid = False
         if not valid:
@@ -961,6 +987,10 @@ class ProductionTableAdapter:
         if self._ark_gate is None:
             raise TableSchedulerError("shared Ark gate is not bound")
         return self._ark_gate.complete_json(**kwargs)
+
+    @property
+    def ark_request_count(self) -> int:
+        return 0 if self._ark_gate is None else self._ark_gate.request_count
 
     @staticmethod
     def planning_checkpoint(
@@ -1453,6 +1483,7 @@ def _terminal_worker(context: RecordContext, services: RecordServices) -> Record
 
 def _persist_metrics(
         run_dir: Path, *, record_concurrency: int,
+        ark_request_count: int | None = None,
 ) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     for path in sorted(run_dir.rglob("events.ndjson")):
@@ -1469,6 +1500,9 @@ def _persist_metrics(
         **event_log.summarize_events(events),
         "record_concurrency": record_concurrency,
     }
+    if ark_request_count is not None:
+        metrics["qc_calls"] = ark_request_count
+        metrics["ark_calls"] = ark_request_count
     descriptor, name = tempfile.mkstemp(
         prefix=".metrics-", suffix=".json", dir=run_dir,
     )
@@ -1556,6 +1590,7 @@ def execute(
         table_events.append("table_finished", **fields)
         _persist_metrics(
             run_dir, record_concurrency=config.record_concurrency,
+            ark_request_count=(None if adapter is None else adapter.ark_request_count),
         )
     if result is None:  # pragma: no cover - an exception above remains active.
         raise TableSchedulerError("table scheduler returned no result")

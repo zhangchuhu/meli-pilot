@@ -169,6 +169,7 @@ def new_state(
                 "target_plan": None,
                 "qc_reports": [],
                 "selection_reason": None,
+                "selection_reason_history": [],
             }
             for token in target_tokens
         },
@@ -181,7 +182,8 @@ def _target_template(updated_at: str) -> dict[str, Any]:
             "prompt_sha256": None, "model": None,
             "error": None, "stale_output_tokens": [],
             "updated_at": updated_at, "attempt_history": [],
-            "target_plan": None, "qc_reports": [], "selection_reason": None}
+            "target_plan": None, "qc_reports": [], "selection_reason": None,
+            "selection_reason_history": []}
 
 
 def _token_list(value: Any, name: str, *, allow_empty: bool = False) -> list[str]:
@@ -487,10 +489,11 @@ def _validate_state(state: Any) -> dict[str, Any]:
             raise TaskStateError("state has an invalid target token")
         if not isinstance(target, dict):
             raise TaskStateError(f"target entry is invalid: {token}")
+        target.setdefault("selection_reason_history", [])
         required = ("status", "classification", "reference_tokens", "attempts", "output",
                     "local_acceptance", "prompt_sha256", "model", "error", "stale_output_tokens",
                     "updated_at", "attempt_history", "target_plan", "qc_reports",
-                    "selection_reason")
+                    "selection_reason", "selection_reason_history")
         if any(key not in target for key in required):
             raise TaskStateError(f"target entry is incomplete: {token}")
         if (not isinstance(target["status"], str)
@@ -506,12 +509,15 @@ def _validate_state(state: Any) -> dict[str, Any]:
                 != len(set(target["stale_output_tokens"]))
                 or not isinstance(target["attempt_history"], list)
                 or not all(isinstance(entry, dict) for entry in target["attempt_history"])
-                or not isinstance(target["qc_reports"], list)):
+                or not isinstance(target["qc_reports"], list)
+                or not isinstance(target["selection_reason_history"], list)):
             raise TaskStateError(f"target entry has invalid fields: {token}")
         if target["target_plan"] is not None:
             _json_object(target["target_plan"], "target_plan")
         if target["selection_reason"] is not None:
             _json_object(target["selection_reason"], "selection_reason")
+        for reason in target["selection_reason_history"]:
+            _json_object(reason, "selection_reason_history")
         for report in target["qc_reports"]:
             _qc_report(report)
         if (target["status"] not in {
@@ -756,6 +762,20 @@ def _migrate_v2_state(value: Any) -> Any:
         target.setdefault("target_plan", None)
         target.setdefault("qc_reports", [])
         target.setdefault("selection_reason", None)
+        target.setdefault("selection_reason_history", [])
+    return state
+
+
+def _migrate_v3_state(value: Any) -> Any:
+    """Add append-only selection history to schema-three manifests."""
+    if not isinstance(value, dict) or value.get("schema_version") != 3:
+        return value
+    state = copy.deepcopy(value)
+    targets = state.get("targets")
+    if isinstance(targets, dict):
+        for target in targets.values():
+            if isinstance(target, dict):
+                target.setdefault("selection_reason_history", [])
     return state
 
 
@@ -774,7 +794,7 @@ def load_state(path: str | Path) -> dict[str, Any]:
     try:
         with Path(path).open(encoding="utf-8") as handle:
             state = _validate_state(
-                _migrate_v2_state(_migrate_v1_state(json.load(handle))),
+                _migrate_v3_state(_migrate_v2_state(_migrate_v1_state(json.load(handle)))),
             )
         state = _normalize_legacy_budget(state)
         return _validate_state(state)
@@ -882,7 +902,13 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
             replacement["stale_output_tokens"] = stale_tokens
             replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
-            replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
+            replacement["selection_reason_history"] = copy.deepcopy(
+                target["selection_reason_history"],
+            )
+            if target["selection_reason"] is not None:
+                replacement["selection_reason_history"].append(
+                    copy.deepcopy(target["selection_reason"]),
+                )
             candidate["targets"][token] = replacement
     else:
         for token, target in candidate["targets"].items():
@@ -1039,7 +1065,13 @@ def reconcile_error(
             replacement["stale_output_tokens"] = stale_output_tokens
             replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
-            replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
+            replacement["selection_reason_history"] = copy.deepcopy(
+                target["selection_reason_history"],
+            )
+            if target["selection_reason"] is not None:
+                replacement["selection_reason_history"].append(
+                    copy.deepcopy(target["selection_reason"]),
+                )
             candidate["targets"][token] = replacement
     _validate_state(candidate)
     state.clear()
@@ -1069,7 +1101,13 @@ def prepare_retry(state: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
         replacement["stale_output_tokens"] = stale_output_tokens
         replacement["target_plan"] = copy.deepcopy(target["target_plan"])
         replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
-        replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
+        replacement["selection_reason_history"] = copy.deepcopy(
+            target["selection_reason_history"],
+        )
+        if target["selection_reason"] is not None:
+            replacement["selection_reason_history"].append(
+                copy.deepcopy(target["selection_reason"]),
+            )
         candidate["targets"][token] = replacement
     candidate["current_target"] = None
     candidate["record_error"] = None

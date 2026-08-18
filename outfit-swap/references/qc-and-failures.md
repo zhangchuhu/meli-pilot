@@ -62,7 +62,7 @@ Each current source-identity and explicit retry cycle has one initial call plus 
 
 ## Third-attempt garment-best selection
 
-Use third-attempt garment-first selection. After the third initiated generation call, send the target, every complete current-cycle candidate, and ordered references in one shared-gated Ark comparative request, including a candidate previously visually rejected on attempt one or two. Use opaque `candidate_N` aliases and require the response alias set exactly. Persist the validated comparative reports, claimed ranking, and locally verified ranking as the durable `selection_reason` before finalization; reuse that checkpoint after a crash without another Ark call. Reject a missing/extra alias or any claimed order that conflicts with local garment-first ranking. Garment fidelity outranks the earlier visual-rejection rationale. Compare every complete decodable candidate lexicographically in this order:
+Use third-attempt garment-first selection. After the third initiated generation call, send the target, the verified nonempty subset of complete current-cycle candidates, and ordered references in one shared-gated Ark comparative request, including a candidate previously visually rejected on attempt one or two. Missing or corrupt earlier artifacts may be omitted; aliases retain actual attempt numbers such as `candidate_2` and `candidate_3`. Require each supplied path and digest to match its durable attempt and require the response alias set exactly. Persist the validated comparative reports, claimed ranking, and locally verified ranking as the durable `selection_reason` before finalization; reuse that checkpoint after a crash without another Ark call. Reject a missing/extra alias or any claimed order that conflicts with local garment-first ranking. Garment fidelity outranks the earlier visual-rejection rationale. Compare every complete decodable candidate lexicographically in this order:
 
 1. garment construction and silhouette;
 2. color and material appearance;
@@ -75,6 +75,8 @@ Do not use a weighted sum. The selected artifact may come from attempt one or tw
 If attempt three is invalid but an earlier candidate is valid, select the best earlier candidate. If no complete decodable current-cycle candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` while the final checkpoint remains active.
 
 On restart from an exhausted checkpoint, preserve a non-callable final-selection checkpoint. Revalidate all current-cycle artifacts, then choose an existing revalidated current-cycle candidate with `accept-local`; otherwise record terminal `record-error --code external-call` without another `attempt`. Never call `failure`, `retry`, or `attempt` from that exhausted checkpoint.
+
+A comparative transport or strict-schema failure is recoverable: set the shared stop, preserve the exhausted running checkpoint and artifacts, return stopped, and issue no fourth generation. A later invocation compares the same surviving artifacts again.
 
 ## Shadow rollback
 

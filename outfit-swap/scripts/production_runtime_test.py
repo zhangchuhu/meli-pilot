@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -20,7 +21,7 @@ from scripts.run_table import (
     BaseField, PreflightError, TableConfig, TableSchema, TableScope, main,
 )
 from scripts.run_table import GlobalStop, PaidCallStopped
-from scripts.run_record import RecordContext, RecordResult, RecordServices
+from scripts.run_record import ComparativeQCRequest, RecordContext, RecordResult, RecordServices
 
 
 def _write_png(path: Path, width: int = 64, height: int = 64) -> None:
@@ -230,7 +231,8 @@ class StandaloneEntryTest(unittest.TestCase):
             self.assertEqual(metrics["records"], 1)
             self.assertEqual(metrics["targets"], 1)
             self.assertEqual(metrics["paid_generation_calls"], 1)
-            self.assertEqual(metrics["qc_calls"], 1)
+            self.assertEqual(metrics["qc_calls"], 3)
+            self.assertEqual(metrics["ark_calls"], 3)
             self.assertGreaterEqual(metrics["total_wall_time_ms"], 0)
             self.assertGreater(metrics["input_bytes"]["total"], 0)
             self.assertTrue({
@@ -761,6 +763,7 @@ class ProductionRuntimeContractTest(unittest.TestCase):
         first.join(timeout=2)
         second.join(timeout=2)
         self.assertEqual(blocking.calls, 1)
+        self.assertEqual(gate.request_count, 1)
         self.assertEqual(outcome, ["stopped"])
 
     def test_ark_transport_failure_sets_the_shared_global_stop(self) -> None:
@@ -780,6 +783,42 @@ class ProductionRuntimeContractTest(unittest.TestCase):
                 checkpoint=lambda: None,
             )
         self.assertTrue(stop.is_set())
+        self.assertEqual(gate.request_count, 1)
+
+    def test_comparative_checkpoint_accepts_verified_sparse_attempt_subset(self) -> None:
+        from scripts import production_runtime, task_state
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generated = root / "generated_images"
+            generated.mkdir()
+            state = task_state.new_state(
+                record_id="rec_1", run_id="run_1", source_tokens=["source_1"],
+                target_tokens=["target_1"], started_at="2026-08-19T00:00:00+00:00",
+            )
+            paths = []
+            for attempt in (1, 2, 3):
+                task_state.begin_attempt(
+                    state, target_token="target_1", classification="front",
+                    reference_tokens=["source_1"], prompt="prompt", model="model",
+                    updated_at=f"2026-08-19T00:00:0{attempt}+00:00",
+                )
+                path = generated / state["targets"]["target_1"]["attempt_history"][-1]["artifact_name"]
+                path.write_bytes(f"candidate-{attempt}".encode())
+                paths.append(path)
+                if attempt < 3:
+                    task_state.record_failure(
+                        state, target_token="target_1", error="rejected",
+                        updated_at=f"2026-08-19T00:00:1{attempt}+00:00",
+                    )
+            task_state.save_state(root / "manifest.json", state)
+            request = ComparativeQCRequest(
+                RecordContext(root, "rec_1", (0,)), 0, "target_1",
+                (paths[1], paths[2]), ("candidate_2", "candidate_3"),
+                tuple(hashlib.sha256(path.read_bytes()).hexdigest() for path in paths[1:]),
+                object(),  # plan content is irrelevant to the ownership checkpoint
+            )
+            production_runtime.ArkQCAdapter._comparative_checkpoint(request)
 
     def test_prior_run_artifact_is_staged_into_current_record_for_resume(self) -> None:
         from scripts import production_runtime, task_state

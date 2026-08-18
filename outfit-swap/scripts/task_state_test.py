@@ -606,6 +606,7 @@ class TaskStateTest(unittest.TestCase):
             "target_plan": None,
             "qc_reports": [],
             "selection_reason": None,
+            "selection_reason_history": [],
         })
 
     def test_load_migrates_v2_checkpoints_without_changing_attempt_history(self) -> None:
@@ -791,6 +792,23 @@ class TaskStateTest(unittest.TestCase):
                 state, 0, {"artifact_sha256": "d" * 64, "reason": "different"},
             )
         self.assertEqual(state, before)
+
+    def test_retry_archives_selection_reason_and_opens_new_cycle_slot(self) -> None:
+        state = self.make_state()
+        state["targets"]["box_t1"]["status"] = "failed"
+        reason = {"artifact_sha256": "c" * 64, "reason": "cycle one"}
+        task_state.record_selection_reason(state, 0, reason)
+
+        task_state.prepare_retry(state, updated_at="2026-08-18T10:03:00+08:00")
+        target = state["targets"]["box_t1"]
+        self.assertIsNone(target["selection_reason"])
+        self.assertEqual(target["selection_reason_history"], [reason])
+        task_state.record_selection_reason(
+            state, 0, {"artifact_sha256": "d" * 64, "reason": "cycle two"},
+        )
+        self.assertEqual(
+            state["targets"]["box_t1"]["selection_reason"]["reason"], "cycle two",
+        )
 
     def test_cli_persists_schema_v3_qc_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

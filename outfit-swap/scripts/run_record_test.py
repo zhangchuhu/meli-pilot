@@ -493,11 +493,71 @@ class RunRecordTest(unittest.TestCase):
         checkpoint = task_state.load_state(self.state_file)["targets"]["box_target_1"]["selection_reason"]
         self.assertEqual(checkpoint["reason"], "verified comparative garment-first selection")
         self.assertEqual(len(self.qc.comparisons), 1)
-
         self.finalizer.finalize = original_finalize  # type: ignore[method-assign]
         result = run_record(context, self.services())
         self.assertEqual(result.status, "success")
         self.assertEqual(len(self.qc.comparisons), 1)
+
+    def test_sparse_valid_attempts_compare_with_actual_attempt_aliases(self) -> None:
+        context = self.initialize()
+        self.qc = ComparativeFakeQC(self.trace)
+        for attempt in (1, 2):
+            self.qc.responses[(0, attempt)] = lambda request: report(
+                request.candidate.name, garment=70,
+                defects=(vision_qc.DefectCode.WRONG_COLOR,), decision="reject",
+            )
+        def third(request: QCRequest) -> vision_qc.QCReport:
+            first = sorted((self.root / "generated_images").glob("attempt-*.png"))[0]
+            first.unlink()
+            return report(request.candidate.name, garment=70,
+                          defects=(vision_qc.DefectCode.WRONG_COLOR,), decision="reject")
+        self.qc.responses[(0, 3)] = third
+
+        result = run_record(context, self.services())
+        self.assertEqual(result.status, "success")
+        self.assertEqual(self.qc.comparisons[0].aliases, ("candidate_2", "candidate_3"))
+        selected = task_state.load_state(self.state_file)["targets"]["box_target_1"]["selection_reason"]
+        self.assertEqual(selected["attempt"], 3)
+        self.assertEqual([item["attempt"] for item in selected["comparative_reports"]], [2, 3])
+
+    def test_comparative_failure_preserves_exhausted_checkpoint_for_rerun(self) -> None:
+        context = self.initialize()
+        self.qc = ComparativeFakeQC(self.trace)
+        for attempt in (1, 2, 3):
+            self.qc.responses[(0, attempt)] = lambda request: report(
+                request.candidate.name, garment=70,
+                defects=(vision_qc.DefectCode.WRONG_COLOR,), decision="reject",
+            )
+        self.qc.compare = lambda _request: (_ for _ in ()).throw(ValueError("malformed"))  # type: ignore[method-assign]
+        result = run_record(context, self.services())
+        state = task_state.load_state(self.state_file)
+        target = state["targets"]["box_target_1"]
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual((target["status"], target["attempts"]), ("running", 3))
+        self.assertIsNone(state["record_error"])
+        self.assertEqual(len(self.generator.calls), 3)
+
+    def test_persisted_v2_plan_is_canonicalized_before_candidate_recovery(self) -> None:
+        context = self.initialize()
+        state = task_state.load_state(self.state_file)
+        current = json.loads(prompt_builder.serialize_plan(plan()))
+        current["schema_version"] = 2
+        current.pop("garment_instances")
+        task_state.record_target_plan(state, 0, current)
+        task_state.begin_attempt(
+            state, target_token="box_target_1", classification="front",
+            reference_tokens=["box_source_1"], prompt="legacy", model=self.generator.model,
+            updated_at=self.clock(),
+        )
+        candidate = self.active_artifact(state)
+        write_png(candidate)
+        task_state.save_state(self.state_file, state)
+
+        result = run_record(context, self.services())
+        persisted = task_state.load_state(self.state_file)["targets"]["box_target_1"]["target_plan"]
+        self.assertEqual(result.status, "success")
+        self.assertEqual(persisted["schema_version"], 3)
+        self.assertEqual(persisted["garment_instances"], ["primary clothing"])
 
     def test_invalid_artifact_spends_attempt_while_transport_retries_stay_inside_next_attempt(self) -> None:
         context = self.initialize()

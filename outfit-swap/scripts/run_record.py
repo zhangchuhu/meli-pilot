@@ -88,6 +88,7 @@ class ComparativeQCRequest:
     target_token: str
     candidates: tuple[Path, ...]
     aliases: tuple[str, ...]
+    candidate_sha256: tuple[str, ...]
     plan: prompt_builder.TargetPlan
 
 
@@ -254,6 +255,10 @@ def _resolve_target_plan(
     persisted = target["target_plan"]
     if persisted is not None:
         plan = prompt_builder.deserialize_plan(persisted)
+        canonical = json.loads(prompt_builder.serialize_plan(plan))
+        if canonical != persisted:
+            state["targets"][target_token]["target_plan"] = canonical
+            task_state.save_state(state_file, state)
     else:
         planner = getattr(services.generator, "plan_target", None)
         if not callable(planner):
@@ -767,12 +772,16 @@ def _select_after_third_attempt(
                target_id=token, status="running", phase="qc")
         try:
             comparison = compare(ComparativeQCRequest(
-                context, target_index, token, alias_paths, aliases, plan,
+                context, target_index, token, alias_paths, aliases,
+                tuple(digests[report.candidate] for report in reports), plan,
             ))
             if not isinstance(comparison, vision_qc.ComparativeReport):
                 raise RecordWorkerError("comparative QC returned an invalid report")
         except Exception:
-            return _terminal_external_call(state_file, state, services, "comparative QC failed")
+            _set_stop(services.stop_signal)
+            _event(services, "comparative_qc_finished", record_id=context.record_id,
+                   target_id=token, status="stopped", phase="qc", error_category="qc")
+            return "stopped"
         _event(services, "comparative_qc_finished", record_id=context.record_id,
                target_id=token, status="success", phase="qc", ark_request_count=1)
         alias_to_report = dict(zip(aliases, reports, strict=True))
@@ -789,10 +798,15 @@ def _select_after_third_attempt(
         "reason": ("verified comparative garment-first selection" if comparison else
                    "third-attempt garment-first lexicographic selection"),
         "scores": _event_scores(selected),
-        **({"aliases": list(comparison.ranking), "verified_local_order": list(comparison.ranking),
-            "comparative_reports": [_report_payload(
-                {"attempt": index + 1, "artifact_name": report.candidate}, "0" * 64, report,
-            )["report"] for index, report in enumerate(comparison.reports)]}
+        **({"aliases": list(aliases), "model_order": list(comparison.ranking),
+            "verified_local_order": list(comparison.ranking),
+            "comparative_reports": [{
+                "attempt": int(report.candidate.removeprefix("candidate_")),
+                "report": _report_payload(
+                    {"attempt": int(report.candidate.removeprefix("candidate_")),
+                     "artifact_name": report.candidate}, "0" * 64, report,
+                )["report"],
+            } for report in comparison.reports]}
            if comparison else {}),
     })
     task_state.save_state(state_file, state)
