@@ -16,7 +16,7 @@ Classify every useful source and target as exactly one of:
 
 Treat size charts as infographic evidence, never angle evidence. Process detail, flat-lay, and infographic targets like every other target.
 
-Use `scripts/image_qc.py` before Ark. It proves that an artifact exists, is complete, and fully decodes. For every initialized record, run `scripts/image_qc.py empty-contact-sheet` before any output is accepted and before record validation can fail. Build source/target contact sheets after classification and refresh the output contact sheet after acceptance; never upload contact sheets to `输出图`.
+Use full `scripts/image_qc.py validate` constraints for every downloaded source and target before any paid call. Derive canonical codec/MIME from decoded bytes, not the remote filename; a misleading suffix remains valid when its raster bytes are supported. Record tiny, oversized, extreme-aspect, or otherwise invalid inputs as precise record-local `invalid-source`/`invalid-target` failures. Generated candidates and finalization use complete decode-only validation and never compare their dimensions/aspect with the target. For every initialized record, run `scripts/image_qc.py empty-contact-sheet` before any output is accepted and before record validation can fail. Build source/target contact sheets after classification and refresh the output contact sheet after acceptance; never upload contact sheets to `输出图`.
 
 Never compare a generated artifact's pixel dimensions or aspect ratio with its target `爆款图`. Never reject, retry, fail, or rank candidates by a target/output dimension or aspect-ratio difference. Continue complete/decodable artifact validation and full visual QC for garment fidelity and target-preservation invariants.
 
@@ -28,7 +28,7 @@ Route every Ark classification, source-evidence, infographic-inventory, adjudica
 
 Validate that the key and model are nonempty before directory creation. Ark offers no separate no-cost authentication boundary here, so actual credentials can only be authenticated by the first invocation-authorized image-bearing request; never add a speculative paid probe. Treat an authentication/model failure at that first request as systemic, not as one failure per record.
 
-Require one strict schema-version-1 JSON report with the exact candidate identity, five named scores, enumerated critical defects, optional primary defect, evidence array, confidence, and decision. Reject Markdown wrappers, trailing prose, duplicate/missing/unknown fields, wrong candidates, unknown defect codes, non-finite/out-of-range values, truncation, and content-filter responses.
+Require one strict schema-version-1 JSON report with the exact candidate identity, five named scores, enumerated critical defects, optional primary defect, evidence array, confidence, decision, and all six exactness fields: `exact_text`, `added_text`, `missing_text`, `instances_exact`, `panel_count_exact`, and `panel_layout_exact`. Infographics require explicit booleans and exact literal arrays; ordinary reports require nulls. Never default an absent exactness gate to true. Reject Markdown wrappers, trailing prose, duplicate/missing/unknown fields, wrong candidates, unknown defect codes, non-finite/out-of-range values, truncation, and content-filter responses.
 
 Retry an invalid or low-confidence response on the same candidate; this does not consume a Seedream generation attempt. If two valid same-candidate decisions disagree, adjudicate once on that same candidate. Persist only the validated structured report and sanitized metadata. If Ark remains unavailable, preserve the active candidate and return a recoverable QC stop; do not generate a replacement.
 
@@ -62,7 +62,7 @@ Each current source-identity and explicit retry cycle has one initial call plus 
 
 ## Third-attempt garment-best selection
 
-After the third initiated generation call, run third-attempt garment-first selection across every complete decodable current-cycle candidate with a valid Ark report, including a candidate previously visually rejected on attempt one or two. Garment fidelity outranks the earlier visual-rejection rationale. Compare every complete decodable candidate lexicographically in this order:
+Use third-attempt garment-first selection. After the third initiated generation call, send the target, every complete current-cycle candidate, and ordered references in one shared-gated Ark comparative request, including a candidate previously visually rejected on attempt one or two. Use opaque `candidate_N` aliases and require the response alias set exactly. Persist the validated comparative reports, claimed ranking, and locally verified ranking as the durable `selection_reason` before finalization; reuse that checkpoint after a crash without another Ark call. Reject a missing/extra alias or any claimed order that conflicts with local garment-first ranking. Garment fidelity outranks the earlier visual-rejection rationale. Compare every complete decodable candidate lexicographically in this order:
 
 1. garment construction and silhouette;
 2. color and material appearance;

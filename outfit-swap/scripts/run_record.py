@@ -81,6 +81,16 @@ class QCRequest:
     plan: prompt_builder.TargetPlan
 
 
+@dataclass(frozen=True)
+class ComparativeQCRequest:
+    context: RecordContext
+    target_index: int
+    target_token: str
+    candidates: tuple[Path, ...]
+    aliases: tuple[str, ...]
+    plan: prompt_builder.TargetPlan
+
+
 def run_record(context: RecordContext, services: RecordServices) -> RecordResult:
     """Run or resume exactly one record, never overlapping its target attempts."""
     root, state_file = _validate_context(context, services)
@@ -609,6 +619,11 @@ def _request_qc(
         if (not isinstance(report, vision_qc.QCReport)
                 or report.candidate != history["artifact_name"]):
             raise RecordWorkerError("QC report does not identify the candidate")
+        _event(
+            services, "qc_request_accounted", record_id=context.record_id,
+            target_id=token, run_id=history["run_id"], attempt=history["attempt"],
+            status="success", ark_request_count=(value.request_count if isinstance(value, QCReviewResult) else 1),
+        )
     except Exception:
         state = task_state.load_state(state_file)
         task_state.record_qc_failure(
@@ -705,6 +720,15 @@ def _select_after_third_attempt(
     target = state["targets"][token]
     if target["attempts"] < task_state.MAX_ATTEMPTS:
         raise RecordWorkerError("final selection started before the paid budget was used")
+    prior = target.get("selection_reason")
+    if isinstance(prior, dict) and prior.get("reason") == "verified comparative garment-first selection":
+        name = prior.get("artifact_name")
+        digest = prior.get("artifact_sha256")
+        for history in task_state.current_attempt_cycle(state, target_index):
+            if history.get("artifact_name") == name:
+                path = _artifact_path(context, history, services)
+                if _validate_candidate(path, history, target) == digest:
+                    return _finalize_candidate(context, state_file, target_index, path, digest, services) or "completed"
     reports: list[vision_qc.QCReport] = []
     attempts: dict[str, int] = {}
     paths: dict[str, Path] = {}
@@ -734,7 +758,27 @@ def _select_after_third_attempt(
             state_file, task_state.load_state(state_file), services,
             "third attempt has no complete decodable current-cycle candidate",
         )
-    selected = vision_qc.select_best(reports, attempts)
+    compare = getattr(services.qc, "compare", None)
+    comparison = None
+    if callable(compare):
+        aliases = tuple(f"candidate_{attempts[report.candidate]}" for report in reports)
+        alias_paths = tuple(paths[report.candidate] for report in reports)
+        _event(services, "comparative_qc_started", record_id=context.record_id,
+               target_id=token, status="running", phase="qc")
+        try:
+            comparison = compare(ComparativeQCRequest(
+                context, target_index, token, alias_paths, aliases, plan,
+            ))
+            if not isinstance(comparison, vision_qc.ComparativeReport):
+                raise RecordWorkerError("comparative QC returned an invalid report")
+        except Exception:
+            return _terminal_external_call(state_file, state, services, "comparative QC failed")
+        _event(services, "comparative_qc_finished", record_id=context.record_id,
+               target_id=token, status="success", phase="qc", ark_request_count=1)
+        alias_to_report = dict(zip(aliases, reports, strict=True))
+        selected = alias_to_report[comparison.selected_alias]
+    else:
+        selected = vision_qc.select_best(reports, attempts)
     selected_attempt = attempts[selected.candidate]
     selected_digest = digests[selected.candidate]
     state = task_state.load_state(state_file)
@@ -742,8 +786,14 @@ def _select_after_third_attempt(
         "artifact_name": selected.candidate,
         "artifact_sha256": selected_digest,
         "attempt": selected_attempt,
-        "reason": "third-attempt garment-first lexicographic selection",
+        "reason": ("verified comparative garment-first selection" if comparison else
+                   "third-attempt garment-first lexicographic selection"),
         "scores": _event_scores(selected),
+        **({"aliases": list(comparison.ranking), "verified_local_order": list(comparison.ranking),
+            "comparative_reports": [_report_payload(
+                {"attempt": index + 1, "artifact_name": report.candidate}, "0" * 64, report,
+            )["report"] for index, report in enumerate(comparison.reports)]}
+           if comparison else {}),
     })
     task_state.save_state(state_file, state)
     _event(
@@ -893,6 +943,12 @@ def _report_payload(
             "evidence": [],
             "confidence": report.confidence,
             "decision": report.decision,
+            "exact_text": report.exact_text,
+            "added_text": None if report.added_text is None else list(report.added_text),
+            "missing_text": None if report.missing_text is None else list(report.missing_text),
+            "instances_exact": report.instances_exact,
+            "panel_count_exact": report.panel_count_exact,
+            "panel_layout_exact": report.panel_layout_exact,
         },
     }
 
@@ -910,6 +966,9 @@ def _persisted_report(
                 and payload.get("artifact_sha256", payload.get("artifact_digest")) == digest
                 and isinstance(body, dict)):
             try:
+                body = _migrate_persisted_qc_body(
+                    body, infographic=target["classification"] == "infographic",
+                )
                 return vision_qc.parse_report(
                     json.dumps(body, ensure_ascii=False, separators=(",", ":")),
                     infographic=target["classification"] == "infographic",
@@ -931,6 +990,9 @@ def _persisted_report_without_digest(
                 and artifact_name == history["artifact_name"]
                 and isinstance(body, dict)):
             try:
+                body = _migrate_persisted_qc_body(
+                    body, infographic=target["classification"] == "infographic",
+                )
                 return vision_qc.parse_report(
                     json.dumps(body, ensure_ascii=False, separators=(",", ":")),
                     infographic=target["classification"] == "infographic",
@@ -938,6 +1000,19 @@ def _persisted_report_without_digest(
             except vision_qc.VisionQCError as error:
                 raise RecordWorkerError("persisted QC report is invalid") from error
     return None
+
+
+def _migrate_persisted_qc_body(body: dict[str, Any], *, infographic: bool) -> dict[str, Any]:
+    """Read legacy ordinary reports; never invent infographic exactness evidence."""
+    if infographic or "exact_text" in body:
+        return body
+    migrated = dict(body)
+    migrated.update({
+        "exact_text": None, "added_text": None, "missing_text": None,
+        "instances_exact": None, "panel_count_exact": None,
+        "panel_layout_exact": None,
+    })
+    return migrated
 
 
 def _event_scores(report: vision_qc.QCReport) -> dict[str, int]:

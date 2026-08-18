@@ -57,6 +57,7 @@ class TargetPlan:
     garment_facts: GarmentFacts
     infographic_inventory: infographic_text.InfographicInventory | None
     fifth_reference_reason: str | None = None
+    garment_instances: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         classifications = frozenset({
@@ -80,6 +81,16 @@ class TargetPlan:
             raise PromptPlanError("selected reference tokens must be unique")
         if not isinstance(self.garment_facts, GarmentFacts):
             raise PromptPlanError("garment facts are invalid")
+        if not self.garment_instances:
+            inferred = (
+                self.infographic_inventory.garment_instances
+                if isinstance(self.infographic_inventory, infographic_text.InfographicInventory)
+                else ("primary clothing",)
+            )
+            object.__setattr__(self, "garment_instances", inferred)
+        _string_tuple(self.garment_instances, "garment instances", allow_empty=False)
+        if len(self.garment_instances) > 12:
+            raise PromptPlanError("garment instances must contain at most twelve entries")
         if self.classification == "infographic":
             if not isinstance(
                     self.infographic_inventory, infographic_text.InfographicInventory,
@@ -87,6 +98,8 @@ class TargetPlan:
                 raise PromptPlanError(
                     "infographic targets require a typed settled inventory",
                 )
+            if self.garment_instances != self.infographic_inventory.garment_instances:
+                raise PromptPlanError("infographic garment instances must match settled inventory")
         elif self.infographic_inventory is not None:
             raise PromptPlanError(
                 "ordinary targets cannot carry an infographic inventory",
@@ -164,7 +177,7 @@ def serialize_plan(plan: TargetPlan) -> str:
     if not isinstance(plan, TargetPlan):
         raise PromptPlanError("target plan is invalid")
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "classification": plan.classification,
         "selected_references": [
             {"token": reference.token, "role": reference.role}
@@ -179,6 +192,7 @@ def serialize_plan(plan: TargetPlan) -> str:
             None if plan.infographic_inventory is None
             else plan.infographic_inventory.plan_dict()
         ),
+        "garment_instances": list(plan.garment_instances),
     }
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -187,17 +201,20 @@ def serialize_plan(plan: TargetPlan) -> str:
 
 def deserialize_plan(value: object) -> TargetPlan:
     """Reconstruct one canonical persisted plan through the typed validators."""
-    plan_fields = frozenset({
+    plan_fields_v2 = frozenset({
         "schema_version", "classification", "selected_references",
         "fifth_reference_reason", "garment_facts", "infographic_inventory",
     })
+    plan_fields_v3 = plan_fields_v2 | {"garment_instances"}
     inventory_fields = frozenset({
         "target_token", "visible_text", "panels", "garment_instances",
         "reading_count", "adjudicated", "settled",
     })
-    if (not isinstance(value, dict) or set(value) != plan_fields
-            or value.get("schema_version") != 2
-            or isinstance(value.get("schema_version"), bool)):
+    if not isinstance(value, dict):
+        raise PromptPlanError("persisted target plan fields are invalid")
+    version = value.get("schema_version")
+    if (type(version) is not int or version not in (2, 3)
+            or set(value) != (plan_fields_v2 if version == 2 else plan_fields_v3)):
         raise PromptPlanError("persisted target plan fields are invalid")
     references_value = value["selected_references"]
     facts_value = value["garment_facts"]
@@ -262,18 +279,25 @@ def deserialize_plan(value: object) -> TargetPlan:
                 adjudicated=inventory_value["adjudicated"],
                 settled=inventory_value["settled"],
             )
+        instances = (
+            inventory.garment_instances
+            if version == 2 and inventory is not None else
+            ("primary clothing",) if version == 2 else
+            string_list(value["garment_instances"], "garment instances", allow_empty=False)
+        )
         plan = TargetPlan(
             classification=value["classification"],
             selected_references=references,
             garment_facts=facts,
             infographic_inventory=inventory,
             fifth_reference_reason=value["fifth_reference_reason"],
+            garment_instances=instances,
         )
     except PromptPlanError:
         raise
     except (KeyError, TypeError, infographic_text.InventoryError) as error:
         raise PromptPlanError("persisted target plan values are invalid") from error
-    if json.loads(serialize_plan(plan)) != value:
+    if version == 3 and json.loads(serialize_plan(plan)) != value:
         raise PromptPlanError("persisted target plan is not canonical")
     return plan
 
@@ -285,9 +309,12 @@ def plan_digest(plan: TargetPlan) -> str:
 
 def _base_prompt(plan: TargetPlan) -> str:
     lines = [
-        "Edit only the clothing in the target image.",
+        "Replace the target's clothing with these ordered garment instances:",
+        *(f"{index}. {instance}" for index, instance in enumerate(plan.garment_instances, 1)),
+        "Remove all original clothing, including every visible remnant of the replaced garments.",
         f"Target classification: {plan.classification}.",
-        "Preserve the target person's identity, pose, anatomy, accessories, framing, and background.",
+        "Preserve face, identity, body, skin, hair, hands, feet, shoes, and carried objects exactly.",
+        "Preserve pose, composition, framing, background, lighting, shadows, and color grade exactly.",
         "Use garment references in this exact order: "
         + ", ".join(plan.reference_tokens) + ".",
     ]

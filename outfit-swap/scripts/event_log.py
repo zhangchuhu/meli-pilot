@@ -21,6 +21,8 @@ EVENT_NAMES = frozenset({
     "target_started", "target_finished",
     "generation_started", "generation_finished",
     "qc_started", "qc_finished",
+    "comparative_qc_started", "comparative_qc_finished",
+    "qc_request_accounted",
     "finalize_started", "finalize_finished",
     "download_started", "download_finished",
     "classification_started", "classification_finished",
@@ -33,7 +35,7 @@ EVENT_NAMES = frozenset({
 FIELD_NAMES = frozenset({
     "table_id", "record_id", "target_id", "run_id", "attempt", "duration_ms",
     "status", "defect", "score", "scores", "candidate_digest", "concurrency",
-    "error_category", "reference_count", "input_bytes", "phase",
+    "error_category", "reference_count", "input_bytes", "phase", "ark_request_count",
 })
 STATUSES = frozenset({
     "pending", "running", "success", "failed", "interrupted", "accepted",
@@ -188,7 +190,7 @@ def summarize_events(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             totals["doubao"] += event["duration_ms"]
         elif phase == "qc":
             totals["qc"] += event["duration_ms"]
-        elif phase in {"finalize", "upload", "detail_update", "readback", "lark_read", "lark_write"}:
+        elif phase in {"upload", "detail_update", "readback", "lark_read", "lark_write"}:
             totals["lark"] += event["duration_ms"]
 
     starts = [event["timestamp_ms"] for event in normalized if event["event"] == "table_started"]
@@ -203,6 +205,9 @@ def summarize_events(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     }
     accepted_count = len(accepted_targets)
     target_count = len(targets)
+    actual_qc_requests = sum(event.get("ark_request_count", 0) for event in normalized)
+    if not any("ark_request_count" in event for event in normalized):
+        actual_qc_requests = sum(event["event"] == "qc_started" for event in normalized)
     return {
         "total_wall_time_ms": max(finishes) - min(starts) if starts and finishes else None,
         "records": len({event.get("record_id") for event in normalized if event["event"] == "record_finished" and "record_id" in event}),
@@ -213,7 +218,11 @@ def summarize_events(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             sum(event["event"] == "generation_started" for event in normalized) / accepted_count
             if accepted_count else None
         ),
-        "qc_calls": sum(event["event"] == "qc_started" for event in normalized),
+        "qc_calls": actual_qc_requests,
+        "comparative_qc_calls": sum(
+            event.get("ark_request_count", 0) for event in normalized
+            if event["event"] == "comparative_qc_finished"
+        ),
         "early_pass_rate": len(early_accepted) / accepted_count if accepted_count else None,
         "retry_rate": len(retry_targets & targets) / target_count if target_count else None,
         "failure_rate": len(failed_targets) / target_count if target_count else None,
@@ -286,7 +295,9 @@ def _validated_event(value: Mapping[str, Any]) -> dict[str, Any]:
     if "reference_count" in event:
         _bounded_integer(event["reference_count"], "reference_count", minimum=0, maximum=5)
     if "input_bytes" in event:
-        _bounded_integer(event["input_bytes"], "input_bytes", minimum=0, maximum=100_000_000)
+        _bounded_integer(event["input_bytes"], "input_bytes", minimum=0, maximum=512_000_000)
+    if "ark_request_count" in event:
+        _bounded_integer(event["ark_request_count"], "ark_request_count", minimum=0, maximum=10)
     if "phase" in event and event["phase"] not in PHASES:
         raise EventLogError("phase is invalid")
     return event

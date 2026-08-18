@@ -16,6 +16,7 @@ from scripts import prompt_builder, task_state, vision_qc
 from scripts.event_log import EventLog
 from scripts.finalize_target import TargetFinalizer
 from scripts.run_record import (
+    ComparativeQCRequest,
     GenerationRequest,
     QCRequest,
     RecordContext,
@@ -263,6 +264,21 @@ class FakeQC:
         return report(request.candidate.name)
 
 
+class ComparativeFakeQC(FakeQC):
+    def __init__(self, trace: list[tuple]) -> None:
+        super().__init__(trace)
+        self.comparisons: list[ComparativeQCRequest] = []
+
+    def compare(self, request: ComparativeQCRequest) -> vision_qc.ComparativeReport:
+        self.comparisons.append(request)
+        reports = tuple(
+            report(alias, garment=90 + index, color=90, details=90, preservation=90)
+            for index, alias in enumerate(request.aliases)
+        )
+        ranking = tuple(reversed(request.aliases))
+        return vision_qc.ComparativeReport(reports, ranking, ranking[0])
+
+
 class RunRecordTest(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -461,6 +477,27 @@ class RunRecordTest(unittest.TestCase):
         ]["selection_reason"]
         self.assertEqual(selected["attempt"], 1)
         self.assertTrue(selected["artifact_name"].endswith("-01.png"))
+
+    def test_comparison_checkpoint_survives_crash_before_finalize_without_second_call(self) -> None:
+        context = self.initialize()
+        self.qc = ComparativeFakeQC(self.trace)
+        for attempt in (1, 2, 3):
+            self.qc.responses[(0, attempt)] = lambda request: report(
+                request.candidate.name, garment=70,
+                defects=(vision_qc.DefectCode.WRONG_COLOR,), decision="reject",
+            )
+        original_finalize = self.finalizer.finalize
+        self.finalizer.finalize = lambda _request: (_ for _ in ()).throw(KeyboardInterrupt())  # type: ignore[method-assign]
+        with self.assertRaises(KeyboardInterrupt):
+            run_record(context, self.services())
+        checkpoint = task_state.load_state(self.state_file)["targets"]["box_target_1"]["selection_reason"]
+        self.assertEqual(checkpoint["reason"], "verified comparative garment-first selection")
+        self.assertEqual(len(self.qc.comparisons), 1)
+
+        self.finalizer.finalize = original_finalize  # type: ignore[method-assign]
+        result = run_record(context, self.services())
+        self.assertEqual(result.status, "success")
+        self.assertEqual(len(self.qc.comparisons), 1)
 
     def test_invalid_artifact_spends_attempt_while_transport_retries_stay_inside_next_attempt(self) -> None:
         context = self.initialize()

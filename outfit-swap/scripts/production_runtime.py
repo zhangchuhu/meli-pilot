@@ -26,9 +26,12 @@ from scripts import (
     prompt_builder,
     reference_selector,
     task_state,
+    vision_qc,
 )
 from scripts.lark_runner import LarkBaseClient, RecordPage
-from scripts.run_record import QCRequest, RecordContext, RecordResult, RecordServices, run_record
+from scripts.run_record import (
+    ComparativeQCRequest, QCRequest, RecordContext, RecordResult, RecordServices, run_record,
+)
 from scripts.run_table import (
     BaseField,
     PaidCallStopped,
@@ -90,6 +93,25 @@ _FACT_CODES = frozenset({
     "undergarment_visibility:exposed-straps",
     "trim:lace", "trim:ruffle", "trim:piping", "trim:none",
 })
+_INSTANCE_CODES = {
+    "dress": "dress", "top": "upper garment", "skirt": "skirt",
+    "pants": "pants", "jacket": "jacket", "coat": "coat",
+    "undergarment": "undergarment", "other": "garment",
+}
+
+
+def _qc_schema_contract() -> str:
+    return (
+        "Each visual-QC object has exactly schema_version(integer 1), candidate, scores, "
+        "critical_defects, primary_defect, evidence, confidence, decision, exact_text, "
+        "added_text, missing_text, instances_exact, panel_count_exact, panel_layout_exact. "
+        "scores has garment_construction, color_material, garment_details, target_preservation "
+        "integer 0..100 and text_layout integer 0..100 for infographic or null otherwise. "
+        "decision is accept, reject, or retry. Defects use only "
+        + json.dumps(sorted(code.value for code in vision_qc.DefectCode), separators=(",", ":"))
+        + ". For infographic exactness booleans are required and added_text/missing_text are "
+          "literal arrays; for ordinary all six exactness fields are null."
+    )
 _FACT_LABELS = {
     "garment_type": "Garment type evidence",
     "sleeves": "Sleeve construction evidence",
@@ -594,13 +616,16 @@ class ArkPlanner:
                     ),
                 )
                 instances = inventory.garment_instances
-            evidence, facts, unique = self._source_evidence(
+            evidence, facts, unique, detected_instances = self._source_evidence(
                 sources, instances=instances, checkpoint=checkpoint,
             )
+            if not instances:
+                instances = detected_instances
             if classification in _ORDINARY or classification == "infographic":
                 selection = reference_selector.select_references(
                     evidence, classification=classification,
-                    garment_instances=instances, unique_requirement=unique,
+                    garment_instances=(instances if classification == "infographic" else ()),
+                    unique_requirement=unique,
                 )
                 chosen = list(selection.selected)
                 roles = list(selection.roles)
@@ -637,6 +662,7 @@ class ArkPlanner:
             garment_facts=facts,
             infographic_inventory=inventory,
             fifth_reference_reason=fifth_reason,
+            garment_instances=tuple(instances),
         )
 
     def _complete(
@@ -676,6 +702,7 @@ class ArkPlanner:
         tuple[reference_selector.SourceEvidence, ...],
         prompt_builder.GarmentFacts,
         reference_selector.UniqueEvidenceRequirement | None,
+        tuple[str, ...],
     ]:
         tokens = [token for token, _path in sources]
         value = _object(self._complete(
@@ -687,6 +714,8 @@ class ArkPlanner:
                 "Tokens in image order: " + json.dumps(tokens, separators=(",", ":"))
                 + ". Roles may include model, upper_construction, "
                   "full_outfit_flat_lay, skirt_hem, size_chart, and instance:<literal>. "
+                + "Return garment_instances in visible dressing order using only: "
+                + json.dumps(sorted(_INSTANCE_CODES), separators=(",", ":")) + ". "
                 + "Garment facts must use only these enumerated codes. Multiple "
                   "compatible codes are allowed; list each exact code at most once "
                   "across required and forbidden: "
@@ -700,6 +729,7 @@ class ArkPlanner:
             checkpoint=checkpoint,
         ), frozenset({
             "schema_version", "sources", "garment_facts", "unique_requirement",
+            "garment_instances",
         }), "source garment evidence")
         if value["schema_version"] != 1 or not isinstance(value["sources"], list):
             raise TableSchedulerError("Ark source garment evidence response is invalid")
@@ -728,14 +758,18 @@ class ArkPlanner:
             value["garment_facts"], frozenset({"required", "forbidden"}),
             "garment facts",
         )
-        facts = _bounded_garment_facts(
-            _string_list(
+        required_codes = _string_list(
                 facts_value["required"], "required garment facts", allow_empty=True,
-            ),
-            _string_list(
+            )
+        forbidden_codes = _string_list(
                 facts_value["forbidden"], "forbidden garment facts", allow_empty=True,
-            ),
+            )
+        facts = _bounded_garment_facts(required_codes, forbidden_codes)
+        instance_codes = _string_list(
+            value["garment_instances"], "garment instances", allow_empty=False,
         )
+        if len(instance_codes) > 12 or any(code not in _INSTANCE_CODES for code in instance_codes):
+            raise TableSchedulerError("Ark garment instances are not bounded codes")
         unique_value = value["unique_requirement"]
         unique = None
         if unique_value is not None:
@@ -745,7 +779,7 @@ class ArkPlanner:
             unique = reference_selector.UniqueEvidenceRequirement(
                 role=unique_object["role"], reason=unique_object["reason"],
             )
-        return tuple(evidence), facts, unique
+        return tuple(evidence), facts, unique, tuple(_INSTANCE_CODES[code] for code in instance_codes)
 
     def _read_inventory(
             self, target_token: str, target: Path, checkpoint: object,
@@ -802,9 +836,13 @@ class ArkQCAdapter:
             raise TableSchedulerError("QC request is invalid")
         images = self._adapter.qc_images(request)
         infographic = request.plan.classification == "infographic"
+        inventory = request.plan.infographic_inventory
         user = (
-            "Review the candidate against the target and ordered garment references. "
-            + ("Verify every settled literal and panel. " if infographic else "")
+            "Images are target, candidate, then ordered garment references. "
+            "Review candidate alias " + json.dumps(request.candidate.name) + ". "
+            + ("Settled infographic inventory: " + json.dumps(
+                inventory.to_dict(), ensure_ascii=False, separators=(",", ":"),
+            ) + ". " if inventory is not None else "All infographic gate fields must be null. ")
             + "Return the candidate field exactly as '"
             + request.candidate.name + "'."
         )
@@ -823,15 +861,63 @@ class ArkQCAdapter:
         return ark_vision_qc.review_candidate(
             RequestClient(),
             system_prompt=(
-                "You are the visual quality reviewer. Return exactly one JSON object "
-                "using visual-QC schema version 1. Base every score and defect only "
-                "on visible image content."
+                "You are the visual quality reviewer. Return exactly one JSON object. "
+                + _qc_schema_contract()
             ),
             user_prompt=user,
             images=images,
             candidate=request.candidate.name,
             infographic=infographic,
         )
+
+    def compare(self, request: ComparativeQCRequest) -> vision_qc.ComparativeReport:
+        if not isinstance(request, ComparativeQCRequest):
+            raise TableSchedulerError("comparative QC request is invalid")
+        images = (
+            self._adapter.image_path(request.context.record_id, request.target_token, "target"),
+            *request.candidates,
+            *(self._adapter.image_path(request.context.record_id, token, "source")
+              for token in request.plan.reference_tokens),
+        )
+        raw = self._adapter.ark_complete(
+            system_prompt=(
+                "Compare all candidate aliases in one response. Return exactly schema_version, "
+                "candidates, ranking, selected_alias. " + _qc_schema_contract() + " "
+                "Rank garment_construction, color_material, garment_details, "
+                "target_preservation, text_layout, then earlier alias attempt, lexicographically."
+            ),
+            user_prompt=(
+                "Image order is target, candidates " + json.dumps(request.aliases) +
+                ", then ordered references. Candidate fields must use only those opaque aliases. "
+                "Settled inventory: " + json.dumps(
+                    None if request.plan.infographic_inventory is None else
+                    request.plan.infographic_inventory.to_dict(), ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            ), images=images, checkpoint=lambda: self._comparative_checkpoint(request),
+        )
+        return vision_qc.parse_comparative_report(
+            raw, aliases=request.aliases,
+            infographic=request.plan.classification == "infographic",
+        )
+
+    @staticmethod
+    def _comparative_checkpoint(request: ComparativeQCRequest) -> None:
+        try:
+            state = task_state.load_state(Path(request.context.task_dir) / "manifest.json")
+            target = state["targets"][request.target_token]
+            names = {path.name for path in request.candidates}
+            durable = {entry["artifact_name"] for entry in task_state.current_attempt_cycle(
+                state, request.target_index,
+            )}
+            valid = (state["record_id"] == request.context.record_id
+                     and state["current_target"] == request.target_token
+                     and target["status"] == "running" and target["attempts"] == 3
+                     and names == durable and len(names) == len(request.candidates))
+        except Exception:
+            valid = False
+        if not valid:
+            raise TableSchedulerError("comparative QC ownership changed")
 
 
 class ProductionTableAdapter:
@@ -1128,12 +1214,17 @@ class ProductionTableAdapter:
                     record_id=record_id, token=token, output=provisional,
                 )
                 try:
+                    if provisional.stat().st_size > image_qc.MAX_FILE_BYTES:
+                        raise RecordMaterializationError(f"invalid-{role}")
                     info = image_qc.validate_decodable_raster(provisional)
                 except image_qc.ImageQCError:
                     raise RecordMaterializationError(f"corrupt-{role}") from None
                 try:
                     output = _canonicalize_download(provisional, info)
+                    image_qc.validate_image(output)
                 except RecordMaterializationError:
+                    raise RecordMaterializationError(f"invalid-{role}") from None
+                except image_qc.ImageQCError:
                     raise RecordMaterializationError(f"invalid-{role}") from None
             paths[role][token] = output
 

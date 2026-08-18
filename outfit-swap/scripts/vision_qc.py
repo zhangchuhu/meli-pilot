@@ -49,11 +49,70 @@ class QCReport:
     primary_defect: DefectCode | None
     confidence: float
     decision: str
+    exact_text: bool | None = None
+    added_text: tuple[str, ...] | None = None
+    missing_text: tuple[str, ...] | None = None
+    instances_exact: bool | None = None
+    panel_count_exact: bool | None = None
+    panel_layout_exact: bool | None = None
+
+
+@dataclass(frozen=True)
+class ComparativeReport:
+    reports: tuple[QCReport, ...]
+    ranking: tuple[str, ...]
+    selected_alias: str
+
+
+def parse_comparative_report(
+        raw: str, *, aliases: tuple[str, ...], infographic: bool,
+) -> ComparativeReport:
+    """Parse and locally verify one third-attempt comparative response."""
+    try:
+        payload = json.loads(raw, object_pairs_hook=_object_without_duplicate_keys)
+    except (TypeError, ValueError) as exc:
+        raise VisionQCError("comparative report must be strict JSON") from exc
+    value = _require_exact_fields(
+        payload, frozenset({"schema_version", "candidates", "ranking", "selected_alias"}),
+        "comparative report",
+    )
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+        raise VisionQCError("unsupported comparative schema version")
+    if not isinstance(value["candidates"], list):
+        raise VisionQCError("comparative candidates must be an array")
+    reports = tuple(parse_report(
+        json.dumps(item, ensure_ascii=False), infographic=infographic,
+    ) for item in value["candidates"])
+    returned = tuple(report.candidate for report in reports)
+    if set(returned) != set(aliases) or len(returned) != len(aliases):
+        raise VisionQCError("comparative candidate alias set changed")
+    ranking = value["ranking"]
+    if (not isinstance(ranking, list) or tuple(ranking) != tuple(dict.fromkeys(ranking))
+            or set(ranking) != set(aliases)):
+        raise VisionQCError("comparative ranking alias set changed")
+    try:
+        attempts = {alias: int(alias.removeprefix("candidate_")) for alias in aliases}
+    except ValueError as exc:
+        raise VisionQCError("comparative aliases must encode attempt order") from exc
+    if any(alias != f"candidate_{attempt}" or not 1 <= attempt <= 3
+           for alias, attempt in attempts.items()):
+        raise VisionQCError("comparative aliases must encode attempt order")
+    remaining = list(reports)
+    local: list[str] = []
+    while remaining:
+        chosen = select_best(remaining, attempts)
+        local.append(chosen.candidate)
+        remaining.remove(chosen)
+    if tuple(ranking) != tuple(local) or value["selected_alias"] != local[0]:
+        raise VisionQCError("comparative claimed order conflicts with local ranking")
+    return ComparativeReport(reports, tuple(ranking), local[0])
 
 
 _REPORT_FIELDS = frozenset({
     "schema_version", "candidate", "scores", "critical_defects",
     "primary_defect", "evidence", "confidence", "decision",
+    "exact_text", "added_text", "missing_text", "instances_exact",
+    "panel_count_exact", "panel_layout_exact",
 })
 _SCORE_FIELDS = frozenset({
     "garment_construction", "color_material", "garment_details",
@@ -131,7 +190,7 @@ def parse_report(raw: str, *, infographic: bool) -> QCReport:
         raise VisionQCError("visual-QC report must contain exactly one JSON value") from exc
 
     report = _require_exact_fields(payload, _REPORT_FIELDS, "report")
-    if report["schema_version"] != 1 or isinstance(report["schema_version"], bool):
+    if type(report["schema_version"]) is not int or report["schema_version"] != 1:
         raise VisionQCError("unsupported visual-QC schema version")
     candidate = report["candidate"]
     if not isinstance(candidate, str) or not candidate:
@@ -171,6 +230,18 @@ def parse_report(raw: str, *, infographic: bool) -> QCReport:
     decision = report["decision"]
     if not isinstance(decision, str) or decision not in _DECISIONS:
         raise VisionQCError("decision must be accept, reject, or retry")
+    gate_names = (
+        "exact_text", "instances_exact", "panel_count_exact", "panel_layout_exact",
+    )
+    if infographic:
+        if any(type(report[name]) is not bool for name in gate_names):
+            raise VisionQCError("infographic exactness gates must be booleans")
+        for name in ("added_text", "missing_text"):
+            if (not isinstance(report[name], list)
+                    or not all(isinstance(item, str) and item for item in report[name])):
+                raise VisionQCError(f"{name} must be an array of literal strings")
+    elif any(report[name] is not None for name in gate_names + ("added_text", "missing_text")):
+        raise VisionQCError("ordinary exactness gates must be null")
     return QCReport(
         candidate=candidate,
         scores=scores,
@@ -178,12 +249,18 @@ def parse_report(raw: str, *, infographic: bool) -> QCReport:
         primary_defect=primary,
         confidence=float(confidence),
         decision=decision,
+        exact_text=report["exact_text"],
+        added_text=None if report["added_text"] is None else tuple(report["added_text"]),
+        missing_text=None if report["missing_text"] is None else tuple(report["missing_text"]),
+        instances_exact=report["instances_exact"],
+        panel_count_exact=report["panel_count_exact"],
+        panel_layout_exact=report["panel_layout_exact"],
     )
 
 
 def early_accept(
-        report: QCReport, *, infographic: bool, text_exact: bool = True,
-        panels_exact: bool = True,
+        report: QCReport, *, infographic: bool,
+        text_exact: bool | None = None, panels_exact: bool | None = None,
 ) -> bool:
     """Return whether a first- or second-attempt report clears all gates."""
     scores = report.scores
@@ -201,8 +278,12 @@ def early_accept(
     return (
         scores.text_layout is not None
         and scores.text_layout >= 95
-        and text_exact
-        and panels_exact
+        and (report.exact_text if text_exact is None else text_exact) is True
+        and report.added_text == ()
+        and report.missing_text == ()
+        and report.instances_exact is True
+        and report.panel_count_exact is True
+        and (report.panel_layout_exact if panels_exact is None else panels_exact) is True
     )
 
 

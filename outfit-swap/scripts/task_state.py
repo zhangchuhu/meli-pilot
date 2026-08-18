@@ -312,6 +312,11 @@ def _json_object(value: Any, name: str) -> dict[str, Any]:
     active_containers: set[int] = set()
     while pending:
         current, entering = pending.pop()
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8", "strict")
+            except UnicodeError as error:
+                raise TaskStateError(f"{name} must contain valid Unicode") from error
         if not isinstance(current, (dict, list, tuple)):
             continue
         identity = id(current)
@@ -329,8 +334,8 @@ def _json_object(value: Any, name: str) -> dict[str, Any]:
         else:
             pending.extend((child, True) for child in current)
     try:
-        normalized = json.loads(json.dumps(value, allow_nan=False))
-    except (TypeError, ValueError) as error:
+        normalized = json.loads(json.dumps(value, allow_nan=False, ensure_ascii=False))
+    except (TypeError, ValueError, UnicodeError) as error:
         raise TaskStateError(f"{name} must contain JSON values") from error
     return normalized
 
@@ -800,7 +805,7 @@ def _atomic_write(path: str | Path, state: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         os.replace(temporary_name, target)
         _fsync_directory(target.parent)
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
@@ -877,6 +882,7 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
             replacement["stale_output_tokens"] = stale_tokens
             replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+            replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
             candidate["targets"][token] = replacement
     else:
         for token, target in candidate["targets"].items():
@@ -1033,6 +1039,7 @@ def reconcile_error(
             replacement["stale_output_tokens"] = stale_output_tokens
             replacement["target_plan"] = copy.deepcopy(target["target_plan"])
             replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+            replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
             candidate["targets"][token] = replacement
     _validate_state(candidate)
     state.clear()
@@ -1062,6 +1069,7 @@ def prepare_retry(state: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
         replacement["stale_output_tokens"] = stale_output_tokens
         replacement["target_plan"] = copy.deepcopy(target["target_plan"])
         replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+        replacement["selection_reason"] = copy.deepcopy(target["selection_reason"])
         candidate["targets"][token] = replacement
     candidate["current_target"] = None
     candidate["record_error"] = None

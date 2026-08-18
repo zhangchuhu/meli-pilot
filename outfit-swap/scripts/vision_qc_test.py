@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import sys
 import unittest
@@ -24,6 +25,12 @@ def report_payload(**changes: object) -> dict[str, object]:
         "evidence": [],
         "confidence": 0.94,
         "decision": "accept",
+        "exact_text": None,
+        "added_text": None,
+        "missing_text": None,
+        "instances_exact": None,
+        "panel_count_exact": None,
+        "panel_layout_exact": None,
     }
     payload.update(changes)
     return payload
@@ -54,6 +61,13 @@ def make_report(
 
 class ParseReportTest(unittest.TestCase):
     def parse(self, payload: dict[str, object], *, infographic: bool = False) -> vision_qc.QCReport:
+        if infographic:
+            payload = dict(payload)
+            payload.update({
+                "exact_text": True, "added_text": [], "missing_text": [],
+                "instances_exact": True, "panel_count_exact": True,
+                "panel_layout_exact": True,
+            })
         return vision_qc.parse_report(json.dumps(payload), infographic=infographic)
 
     def test_parses_only_the_complete_strict_schema(self) -> None:
@@ -133,6 +147,10 @@ class ParseReportTest(unittest.TestCase):
                 with self.assertRaises(vision_qc.VisionQCError):
                     self.parse(payload)
 
+    def test_schema_version_must_be_a_true_integer(self) -> None:
+        with self.assertRaises(vision_qc.VisionQCError):
+            self.parse(report_payload(schema_version=1.0))
+
 
 class EarlyAcceptTest(unittest.TestCase):
     def test_accepts_an_ordinary_candidate_at_each_threshold(self) -> None:
@@ -165,25 +183,57 @@ class EarlyAcceptTest(unittest.TestCase):
 
         self.assertTrue(vision_qc.early_accept(report, infographic=False))
 
-    def test_infographic_requires_text_score_and_exact_text_and_panels(self) -> None:
-        report = make_report("info", text_layout=95)
+    def test_infographic_requires_every_explicit_exactness_gate(self) -> None:
+        report = dataclasses.replace(
+            make_report("info", text_layout=95), exact_text=True,
+            added_text=(), missing_text=(), instances_exact=True,
+            panel_count_exact=True, panel_layout_exact=True,
+        )
 
         self.assertTrue(vision_qc.early_accept(report, infographic=True))
         self.assertFalse(vision_qc.early_accept(
             make_report("low-text", text_layout=94), infographic=True,
         ))
-        self.assertFalse(vision_qc.early_accept(
-            report, infographic=True, text_exact=False,
-        ))
-        self.assertFalse(vision_qc.early_accept(
-            report, infographic=True, panels_exact=False,
-        ))
+        for change in (
+            {"exact_text": False}, {"added_text": ("SALE",)},
+            {"missing_text": ("FLOWY HEM",)}, {"instances_exact": False},
+            {"panel_count_exact": False}, {"panel_layout_exact": False},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(vision_qc.early_accept(
+                    dataclasses.replace(report, **change), infographic=True,
+                ))
         self.assertFalse(vision_qc.early_accept(
             make_report("missing-text", text_layout=None), infographic=True,
         ))
 
 
 class CorrectionAndSelectionTest(unittest.TestCase):
+    def test_comparative_report_requires_exact_alias_set_and_local_order(self) -> None:
+        def item(alias: str, garment: int) -> dict[str, object]:
+            return report_payload(
+                candidate=alias,
+                scores={
+                    "garment_construction": garment, "color_material": 90,
+                    "garment_details": 90, "target_preservation": 90,
+                    "text_layout": None,
+                },
+            )
+        valid = {"schema_version": 1, "candidates": [item("candidate_1", 90), item("candidate_2", 95)],
+                 "ranking": ["candidate_2", "candidate_1"], "selected_alias": "candidate_2"}
+        parsed = vision_qc.parse_comparative_report(
+            json.dumps(valid), aliases=("candidate_1", "candidate_2"), infographic=False,
+        )
+        self.assertEqual(parsed.selected_alias, "candidate_2")
+        for changed in (
+            {**valid, "ranking": ["candidate_1", "candidate_2"], "selected_alias": "candidate_1"},
+            {**valid, "ranking": ["candidate_2", "candidate_3"]},
+        ):
+            with self.assertRaises(vision_qc.VisionQCError):
+                vision_qc.parse_comparative_report(
+                    json.dumps(changed), aliases=("candidate_1", "candidate_2"), infographic=False,
+                )
+
     def test_correction_uses_the_highest_priority_reported_defect(self) -> None:
         report = make_report(
             "priority",

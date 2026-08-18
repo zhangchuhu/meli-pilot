@@ -292,6 +292,22 @@ class EventLogTest(unittest.TestCase):
             "count": 3, "p50": 10.0, "p95": 19.0,
         })
 
+    def test_summary_counts_actual_ark_requests_and_large_valid_aggregate_inputs(self) -> None:
+        events = [
+            {"schema_version": 1, "event": "target_started", "timestamp_ms": 1,
+             "record_id": "rec-1", "target_id": "target-1", "input_bytes": 140_000_000},
+            {"schema_version": 1, "event": "qc_request_accounted", "timestamp_ms": 2,
+             "record_id": "rec-1", "target_id": "target-1", "attempt": 1,
+             "status": "success", "ark_request_count": 2},
+            {"schema_version": 1, "event": "comparative_qc_finished", "timestamp_ms": 3,
+             "record_id": "rec-1", "target_id": "target-1", "status": "success",
+             "phase": "qc", "ark_request_count": 1},
+        ]
+        summary = summarize_events(events)
+        self.assertEqual(summary["input_bytes"]["total"], 140_000_000)
+        self.assertEqual(summary["qc_calls"], 3)
+        self.assertEqual(summary["comparative_qc_calls"], 1)
+
     def test_summary_counts_accepted_and_accepted_local_targets_consistently(self) -> None:
         """Excluding accepted-local targets understates acceptance and early-pass metrics."""
         events = [

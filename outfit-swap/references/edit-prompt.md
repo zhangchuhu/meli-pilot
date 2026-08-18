@@ -24,6 +24,8 @@ Constraints: Keep Image 1 identity, face, body, skin, hair, hands, feet, pose, a
 
 Bracketed values are drafting slots, not live prompt content. Resolve the numbered target-instance list and garment evidence before calling the editor.
 
+Persist an ordered, bounded `garment_instances` list in every target plan, including ordinary targets. Render one numbered replacement line per instance. The code-owned prompt must explicitly remove all original clothing; preserve face, identity, body, skin, hair, hands, feet, shoes, and carried objects; and preserve pose, composition, framing, background, lighting, shadows, and color grade. Never substitute free-form Ark-authored imperatives for this local template.
+
 ## Image roles and pairing
 
 Each request has a ten-image cap:

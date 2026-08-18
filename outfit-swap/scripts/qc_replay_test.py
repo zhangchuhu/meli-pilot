@@ -33,6 +33,12 @@ def report(
         "evidence": [],
         "confidence": confidence,
         "decision": decision,
+        "exact_text": True if infographic else None,
+        "added_text": [] if infographic else None,
+        "missing_text": [] if infographic else None,
+        "instances_exact": True if infographic else None,
+        "panel_count_exact": True if infographic else None,
+        "panel_layout_exact": True if infographic else None,
     }
 
 

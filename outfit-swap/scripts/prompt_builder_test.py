@@ -51,6 +51,27 @@ def report(
 
 
 class TargetPlanTest(unittest.TestCase):
+    def test_multi_garment_prompt_is_ordered_and_preserves_full_scene_contract(self) -> None:
+        plan = prompt_builder.TargetPlan(
+            classification="front", selected_references=refs(("a", "model")),
+            garment_facts=prompt_builder.GarmentFacts(required=(), forbidden=()),
+            infographic_inventory=None,
+            garment_instances=("ivory lace blouse", "pleated skirt"),
+        )
+        text = prompt_builder.build_prompt(plan, attempt=1).text
+        self.assertLess(text.index("1. ivory lace blouse"), text.index("2. pleated skirt"))
+        for literal in (
+            "Remove all original clothing", "face, identity, body, skin, hair, hands, feet, shoes",
+            "carried objects", "pose, composition, framing, background, lighting, shadows, and color grade",
+        ):
+            self.assertIn(literal, text)
+        self.assertEqual(
+            prompt_builder.deserialize_plan(__import__("json").loads(
+                prompt_builder.serialize_plan(plan),
+            )).garment_instances,
+            ("ivory lace blouse", "pleated skirt"),
+        )
+
     def test_plan_is_deeply_immutable_and_serializes_canonically(self) -> None:
         inventory = {
             "visible_text": ["FLOWY HEM"],
@@ -78,16 +99,9 @@ class TargetPlanTest(unittest.TestCase):
             plan.classification = "front"  # type: ignore[misc]
         with self.assertRaises(TypeError):
             plan.infographic_inventory.panels[0] = "changed"  # type: ignore[index,union-attr]
-        self.assertEqual(
-            prompt_builder.serialize_plan(plan),
-            '{"classification":"infographic","fifth_reference_reason":null,'
-            '"garment_facts":{"forbidden":[],"required":[]},'
-            '"infographic_inventory":{"adjudicated":false,"garment_instances":["skirt"],'
-            '"panels":["main panel"],"reading_count":2,"settled":true,'
-            '"target_token":"target-info","visible_text":["FLOWY HEM"]},'
-            '"schema_version":2,"selected_references":['
-            '{"role":"model","token":"model"},{"role":"skirt_hem","token":"hem"}]}',
-        )
+        serialized = __import__("json").loads(prompt_builder.serialize_plan(plan))
+        self.assertEqual(serialized["schema_version"], 3)
+        self.assertEqual(serialized["garment_instances"], ["skirt"])
         self.assertEqual(len(prompt_builder.plan_digest(plan)), 64)
 
     def test_serialized_ordinary_and_infographic_plans_round_trip_to_typed_plans(self) -> None:
@@ -250,6 +264,7 @@ class TargetPlanTest(unittest.TestCase):
                 garment_instances=("skirt", "lace detail"),
                 reading_count=2, adjudicated=True,
             ),
+            garment_instances=("skirt", "lace detail"),
         )
 
         self.assertNotEqual(

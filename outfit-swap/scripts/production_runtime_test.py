@@ -88,6 +88,7 @@ class _FakeArk:
                     "forbidden": [],
                 },
                 "unique_requirement": None,
+                "garment_instances": ["dress"],
             })
         if "visual quality reviewer" in system_prompt:
             marker = "Return the candidate field exactly as '"
@@ -107,6 +108,9 @@ class _FakeArk:
                 "evidence": [],
                 "confidence": 0.99,
                 "decision": "accept",
+                "exact_text": None, "added_text": None, "missing_text": None,
+                "instances_exact": None, "panel_count_exact": None,
+                "panel_layout_exact": None,
             })
         raise AssertionError("unexpected Ark production request")
 
@@ -1008,6 +1012,7 @@ class ProductionRuntimeContractTest(unittest.TestCase):
                         ],
                     },
                     "unique_requirement": None,
+                    "garment_instances": ["top"],
                 },
             ))
             ark_requests: list[dict[str, object]] = []
@@ -1099,6 +1104,7 @@ class ProductionRuntimeContractTest(unittest.TestCase):
                             "forbidden": [],
                         },
                         "unique_requirement": None,
+                        "garment_instances": ["dress"],
                     })
 
             client = Client()

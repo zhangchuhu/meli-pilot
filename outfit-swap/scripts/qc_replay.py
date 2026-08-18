@@ -423,6 +423,16 @@ def _safe_response_candidate(
     if not isinstance(payload, dict) or payload.get("candidate") != manifest_name:
         return raw
     payload["candidate"] = candidate_alias
+    if "exact_text" not in payload:
+        infographic = isinstance(payload.get("scores"), dict) and payload["scores"].get("text_layout") is not None
+        payload.update({
+            "exact_text": True if infographic else None,
+            "added_text": [] if infographic else None,
+            "missing_text": [] if infographic else None,
+            "instances_exact": True if infographic else None,
+            "panel_count_exact": True if infographic else None,
+            "panel_layout_exact": True if infographic else None,
+        })
     return json.dumps(
         payload, ensure_ascii=False, allow_nan=False,
         separators=(",", ":"), sort_keys=True,

@@ -34,6 +34,9 @@ def report_json(
         "evidence": [],
         "confidence": confidence,
         "decision": decision,
+        "exact_text": None, "added_text": None, "missing_text": None,
+        "instances_exact": None, "panel_count_exact": None,
+        "panel_layout_exact": None,
     })
 
 

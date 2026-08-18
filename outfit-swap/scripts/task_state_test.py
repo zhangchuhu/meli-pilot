@@ -2145,6 +2145,13 @@ class TaskStateTest(unittest.TestCase):
             "--state-root", subparsers.choices["bind"].format_help(),
         )
 
+    def test_durable_metadata_rejects_lone_surrogates(self) -> None:
+        state = self.make_state()
+        with self.assertRaises(task_state.TaskStateError):
+            task_state.record_selection_reason(
+                state, 0, {"reason": "bad\ud800text"},
+            )
+
     def test_cli_argument_errors_use_task_state_contract(self) -> None:
         stderr = io.StringIO()
         with redirect_stderr(stderr), redirect_stdout(io.StringIO()):
