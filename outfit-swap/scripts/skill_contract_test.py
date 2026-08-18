@@ -28,6 +28,8 @@ RUNTIME_SCRIPTS = (
 )
 FFMPEG_MISSING = not shutil.which("ffmpeg") or not shutil.which("ffprobe")
 LARK_CLI_MISSING = not shutil.which("lark-cli")
+ARK_HTTP_MODULE = "scripts/ark_vision_qc.py"
+ARK_CHAT_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -50,18 +52,31 @@ def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
         ("direct httpx client", re.compile(
             r"\bhttpx\s*\.\s*(?:get|post|put|patch|delete|request)\s*\(",
         )),
-        ("direct urllib client", re.compile(r"\burllib\s*\.\s*request\b")),
+        ("direct aiohttp client", re.compile(r"\baiohttp\s*\.\s*ClientSession\b")),
+        ("direct urllib3 client", re.compile(r"\burllib3\s*\.\s*(?:PoolManager|request)\b")),
+        ("direct stdlib HTTP client", re.compile(r"\bhttp\s*\.\s*client\b")),
         ("Feishu HTTP endpoint", re.compile(r"/open[-_]apis/")),
         ("built-in image generator", re.compile(
             r"\bimage_gen\s*(?:\.|__)\s*imagegen\b",
         )),
     )
+    urllib_pattern = re.compile(
+        r"(?:\burllib\s*\.\s*request\b|\bfrom\s+urllib\s+import\s+request\b)",
+    )
+    http_url_pattern = re.compile(r"https?://[^\s'\"<>]+")
     batch_command = "generate" + "-batch"
     findings: list[str] = []
     for name, source in documents.items():
         for label, pattern in patterns:
             if pattern.search(source):
                 findings.append(f"{name}: {label}")
+        if urllib_pattern.search(source):
+            if name != ARK_HTTP_MODULE:
+                findings.append(f"{name}: direct urllib client")
+            else:
+                urls = set(http_url_pattern.findall(source))
+                if urls != {ARK_CHAT_ENDPOINT}:
+                    findings.append(f"{name}: unauthorized Ark HTTP endpoint")
         for line_number, line in enumerate(source.splitlines(), start=1):
             if batch_command not in line:
                 continue
@@ -446,6 +461,48 @@ class SkillContractTest(unittest.TestCase):
         self.assertEqual(
             forbidden_source_findings({"scripts/bad.py": direct_call}),
             ["scripts/bad.py: direct requests client"],
+        )
+
+    def test_forbidden_scanner_allows_only_the_exact_ark_transport(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        allowed = urllib_import + f"ENDPOINT = '{exact_endpoint}'\n"
+
+        self.assertEqual(
+            forbidden_source_findings({ARK_HTTP_MODULE: allowed}),
+            [],
+        )
+        self.assertEqual(
+            forbidden_source_findings({"scripts/bad.py": allowed}),
+            ["scripts/bad.py: direct urllib client"],
+        )
+
+    def test_forbidden_scanner_rejects_alternate_ark_endpoints_and_clients(self) -> None:
+        urllib_import = "from urllib import " + "request\n"
+        wrong_endpoint = "https://ark.cn-beijing.volces.com/api/v3/other"
+        self.assertEqual(
+            forbidden_source_findings({
+                ARK_HTTP_MODULE: urllib_import + f"ENDPOINT = '{wrong_endpoint}'\n",
+            }),
+            [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP endpoint"],
+        )
+
+        for direct_client, label in (
+            ("httpx" + "." + "post('x')", "direct httpx client"),
+            ("aiohttp" + "." + "ClientSession()", "direct aiohttp client"),
+            ("urllib3" + "." + "PoolManager()", "direct urllib3 client"),
+            ("http" + "." + "client.HTTPSConnection('x')", "direct stdlib HTTP client"),
+        ):
+            with self.subTest(label=label):
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: direct_client}),
+                    [f"{ARK_HTTP_MODULE}: {label}"],
+                )
+
+        feishu_path = "/open" + "-apis/bitable/v1/apps"
+        self.assertEqual(
+            forbidden_source_findings({ARK_HTTP_MODULE: feishu_path}),
+            [f"{ARK_HTTP_MODULE}: Feishu HTTP endpoint"],
         )
 
     def test_forbidden_scanner_inventory_is_every_shipped_python_and_markdown(self) -> None:
