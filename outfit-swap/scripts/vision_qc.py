@@ -21,9 +21,12 @@ class DefectCode(str, Enum):
     WRONG_COLOR = "wrong_color"
     ORIGINAL_CLOTHING_REMAINS = "original_clothing_remains"
     IDENTITY_CHANGED = "identity_changed"
+    POSE_CHANGED = "pose_changed"
     ACCESSORY_CHANGED = "accessory_changed"
+    BACKGROUND_CHANGED = "background_changed"
     BAD_OCCLUSION = "bad_occlusion"
     ANATOMY_DISTORTION = "anatomy_distortion"
+    SECONDARY_GARMENT_DETAILS_CHANGED = "secondary_garment_details_changed"
     MISSING_INFOGRAPHIC_INSTANCE = "missing_infographic_instance"
     TEXT_CHANGED = "text_changed"
     LAYOUT_CHANGED = "layout_changed"
@@ -56,7 +59,7 @@ _SCORE_FIELDS = frozenset({
     "garment_construction", "color_material", "garment_details",
     "target_preservation", "text_layout",
 })
-_DECISIONS = frozenset({"accept", "reject"})
+_DECISIONS = frozenset({"accept", "reject", "retry"})
 _DEFECT_PRIORITY = (
     DefectCode.WRONG_COLLAR,
     DefectCode.OPEN_FRONT,
@@ -67,10 +70,13 @@ _DEFECT_PRIORITY = (
     DefectCode.TEXT_CHANGED,
     DefectCode.LAYOUT_CHANGED,
     DefectCode.IDENTITY_CHANGED,
+    DefectCode.POSE_CHANGED,
     DefectCode.ACCESSORY_CHANGED,
+    DefectCode.BACKGROUND_CHANGED,
     DefectCode.ANATOMY_DISTORTION,
     DefectCode.BAD_OCCLUSION,
     DefectCode.WRONG_COLOR,
+    DefectCode.SECONDARY_GARMENT_DETAILS_CHANGED,
 )
 _DEFECT_RANK = {defect: index for index, defect in enumerate(_DEFECT_PRIORITY)}
 
@@ -164,7 +170,7 @@ def parse_report(raw: str, *, infographic: bool) -> QCReport:
         raise VisionQCError("confidence must be a finite number from 0 through 1")
     decision = report["decision"]
     if not isinstance(decision, str) or decision not in _DECISIONS:
-        raise VisionQCError("decision must be accept or reject")
+        raise VisionQCError("decision must be accept, reject, or retry")
     return QCReport(
         candidate=candidate,
         scores=scores,
@@ -188,7 +194,6 @@ def early_accept(
         and scores.target_preservation >= 90
         and report.confidence >= 0.85
         and not report.critical_defects
-        and report.decision == "accept"
     ):
         return False
     if not infographic:

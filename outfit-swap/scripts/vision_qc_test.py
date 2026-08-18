@@ -67,6 +67,19 @@ class ParseReportTest(unittest.TestCase):
         self.assertEqual(report.primary_defect, vision_qc.DefectCode.OPEN_FRONT)
         self.assertEqual(report.confidence, 0.94)
 
+    def test_parses_all_preservation_and_secondary_detail_defect_codes(self) -> None:
+        for defect in (
+            "pose_changed",
+            "background_changed",
+            "secondary_garment_details_changed",
+        ):
+            with self.subTest(defect=defect):
+                report = self.parse(report_payload(
+                    critical_defects=[defect], primary_defect=defect,
+                ))
+                self.assertEqual(report.critical_defects[0].value, defect)
+                self.assertEqual(report.primary_defect.value, defect)  # type: ignore[union-attr]
+
     def test_rejects_markdown_fences_and_trailing_prose(self) -> None:
         raw = json.dumps(report_payload())
         for invalid in (f"```json\n{raw}\n```", f"{raw}\nassessment complete"):
@@ -138,12 +151,19 @@ class EarlyAcceptTest(unittest.TestCase):
             make_report("preservation", preservation=89),
             make_report("confidence", confidence=0.84),
             make_report("critical", critical=(vision_qc.DefectCode.OPEN_FRONT,)),
-            make_report("decision", decision="reject"),
         )
 
         for report in cases:
             with self.subTest(candidate=report.candidate):
                 self.assertFalse(vision_qc.early_accept(report, infographic=False))
+
+    def test_uses_local_thresholds_even_when_remote_decision_is_retry(self) -> None:
+        report = vision_qc.parse_report(
+            json.dumps(report_payload(candidate="remote-retry", decision="retry")),
+            infographic=False,
+        )
+
+        self.assertTrue(vision_qc.early_accept(report, infographic=False))
 
     def test_infographic_requires_text_score_and_exact_text_and_panels(self) -> None:
         report = make_report("info", text_layout=95)
@@ -205,6 +225,38 @@ class CorrectionAndSelectionTest(unittest.TestCase):
             vision_qc.DefectCode.WRONG_COLOR,
         )
         self.assertIsNone(vision_qc.correction_for(make_report("none")))
+
+    def test_correction_represents_and_orders_preservation_and_secondary_details(self) -> None:
+        preservation = make_report(
+            "preservation",
+            critical=(
+                vision_qc.DefectCode.SECONDARY_GARMENT_DETAILS_CHANGED,
+                vision_qc.DefectCode.ANATOMY_DISTORTION,
+                vision_qc.DefectCode.BACKGROUND_CHANGED,
+            ),
+        )
+        color = make_report(
+            "color",
+            critical=(
+                vision_qc.DefectCode.SECONDARY_GARMENT_DETAILS_CHANGED,
+                vision_qc.DefectCode.WRONG_COLOR,
+            ),
+        )
+        pose = make_report(
+            "pose",
+            primary=vision_qc.DefectCode.POSE_CHANGED,
+        )
+
+        self.assertEqual(
+            vision_qc.correction_for(preservation),
+            vision_qc.DefectCode.BACKGROUND_CHANGED,
+        )
+        self.assertEqual(
+            vision_qc.correction_for(color), vision_qc.DefectCode.WRONG_COLOR,
+        )
+        self.assertEqual(
+            vision_qc.correction_for(pose), vision_qc.DefectCode.POSE_CHANGED,
+        )
 
     def test_select_best_is_garment_first_not_a_weighted_sum(self) -> None:
         garment_winner = make_report("garment", garment=91, color=1, details=1, preservation=1)
