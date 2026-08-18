@@ -734,6 +734,47 @@ class TaskStateTest(unittest.TestCase):
             task_state.record_qc_report(state, 0, {"attempt": 3, "decision": "retry"})
         self.assertEqual(state, before)
 
+    def test_current_attempt_cycle_returns_only_the_current_cycle_as_a_copy(self) -> None:
+        state = self.make_state()
+        for attempt in range(3):
+            self.begin(state)
+            task_state.record_failure(
+                state, target_token="box_t1", error=f"old failure {attempt}",
+                updated_at="2026-08-18T10:00:00+08:00",
+            )
+        task_state.prepare_retry(
+            state, updated_at="2026-08-18T11:00:00+08:00",
+        )
+        self.begin(state)
+
+        cycle = task_state.current_attempt_cycle(state, 0)
+        cycle[0]["prompt"] = "mutated copy"
+
+        self.assertEqual(len(cycle), 1)
+        self.assertEqual(cycle[0]["attempt"], 1)
+        self.assertNotEqual(
+            state["targets"]["box_t1"]["attempt_history"][-1]["prompt"],
+            "mutated copy",
+        )
+
+    def test_recoverable_qc_failure_preserves_active_artifact_and_budget(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        active = json.loads(json.dumps(
+            state["targets"]["box_t1"]["attempt_history"][-1],
+        ))
+
+        task_state.record_qc_failure(
+            state, target_token="box_t1", error="Ark QC unavailable",
+            updated_at="2026-08-18T10:02:00+08:00",
+        )
+
+        target = state["targets"]["box_t1"]
+        self.assertEqual((target["status"], target["attempts"]), ("running", 1))
+        self.assertEqual(target["attempt_history"][-1], active)
+        self.assertEqual(target["error"], "Ark QC unavailable")
+        self.assertEqual(state["current_target"], "box_t1")
+
     def test_selection_reason_is_immutable_after_it_is_recorded(self) -> None:
         state = self.make_state()
         reason = {"artifact_sha256": "c" * 64, "reason": "best garment construction"}

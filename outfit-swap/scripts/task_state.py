@@ -1359,6 +1359,36 @@ def record_qc_report(state: dict, target_index: int, report: dict) -> None:
     state.update(candidate)
 
 
+def current_attempt_cycle(state: dict, target_index: int) -> list[dict[str, Any]]:
+    """Return a detached snapshot of the target's current paid-attempt cycle."""
+    _validate_state(state)
+    target = _target_at_index(state, target_index)
+    if not target["attempt_history"]:
+        return []
+    return copy.deepcopy(_current_cycle_history(target))
+
+
+def record_qc_failure(
+        state: dict[str, Any], *, target_token: str, error: str,
+        updated_at: str,
+) -> dict[str, Any]:
+    """Checkpoint a recoverable QC outage without closing the paid attempt."""
+    _validate_state(state)
+    target = _require_target(state, target_token)
+    if target["status"] != "running" or state["current_target"] != target_token:
+        raise TaskStateError(f"target attempt is not running: {target_token}")
+    concise_error = _sanitize_error(error)
+    updated_at = _nonempty_string(updated_at, "updated_at")
+    candidate = copy.deepcopy(state)
+    pending = candidate["targets"][target_token]
+    pending["error"] = concise_error
+    pending["updated_at"] = updated_at
+    _validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+    return state
+
+
 def record_selection_reason(state: dict, target_index: int, reason: dict) -> None:
     """Persist one immutable final-selection reason by zero-based target index."""
     _validate_state(state)
