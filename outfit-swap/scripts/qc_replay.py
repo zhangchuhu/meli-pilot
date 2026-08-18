@@ -61,7 +61,7 @@ class ReplayManifest:
 @dataclass(frozen=True)
 class CandidateReplayResult:
     attempt: int
-    name: str
+    candidate_alias: str
     expected_outcome: str
     predicted_outcome: str
     reported_defects: tuple[str, ...]
@@ -164,6 +164,11 @@ _REPLAY_SYSTEM_PROMPT = (
     "You are the visual quality reviewer. Return exactly one JSON object using "
     "visual-QC schema version 1. Base every score and defect only on visible "
     "image content."
+)
+_FORBIDDEN_REQUEST_TEXT = re.compile(
+    r"\d+\s*[x×]\s*\d+|\d+\s*:\s*\d+|\bresolution\b|\bpixel\w*\b|"
+    r"\bwidth\b|\bheight\b|\bdimensions?\b|\baspect\b|\bratio\b",
+    re.IGNORECASE,
 )
 
 
@@ -386,7 +391,11 @@ def load_manifest(path: str | Path) -> ReplayManifest:
     )
 
 
-def _replay_user_prompt(candidate: ReplayCandidate, *, infographic: bool) -> str:
+def _candidate_alias(attempt: int) -> str:
+    return f"candidate-{attempt:02d}"
+
+
+def _replay_user_prompt(candidate_alias: str, *, infographic: bool) -> str:
     kind_instruction = (
         "It is an infographic; compare all visible text literally and verify the "
         "panel arrangement."
@@ -394,17 +403,57 @@ def _replay_user_prompt(candidate: ReplayCandidate, *, infographic: bool) -> str
         "It is an ordinary fashion image."
     )
     return (
-        f"Review candidate file '{candidate.name}' against every preceding approved "
+        f"Review opaque candidate '{candidate_alias}' against every preceding approved "
         f"reference image. {kind_instruction} Return the candidate field exactly as "
-        f"'{candidate.name}'."
+        f"'{candidate_alias}'."
     )
+
+
+def _safe_response_candidate(
+        raw: str, *, manifest_name: str, candidate_alias: str,
+) -> str:
+    try:
+        payload = json.loads(
+            raw,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except (json.JSONDecodeError, ReplayError):
+        return raw
+    if not isinstance(payload, dict) or payload.get("candidate") != manifest_name:
+        return raw
+    payload["candidate"] = candidate_alias
+    return json.dumps(
+        payload, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"), sort_keys=True,
+    )
+
+
+def _assert_safe_request_prompts(system_prompt: str, user_prompt: str) -> None:
+    if (
+            not isinstance(system_prompt, str)
+            or not isinstance(user_prompt, str)
+            or not system_prompt
+            or not user_prompt
+            or _FORBIDDEN_REQUEST_TEXT.search(system_prompt) is not None
+            or _FORBIDDEN_REQUEST_TEXT.search(user_prompt) is not None
+    ):
+        raise ReplayError("Ark replay prompt contains a forbidden sizing feature")
 
 
 class _OfflineClient:
     def __init__(
-            self, candidate: ReplayCandidate, *, system_prompt: str,
+            self, candidate: ReplayCandidate, *, candidate_alias: str,
+            system_prompt: str,
     ) -> None:
-        self._responses = list(candidate.offline_responses)
+        self._responses = [
+            _safe_response_candidate(
+                raw,
+                manifest_name=candidate.name,
+                candidate_alias=candidate_alias,
+            )
+            for raw in candidate.offline_responses
+        ]
         self._expected_images = candidate.images
         self._expected_system_prompt = system_prompt
         self.calls = 0
@@ -430,27 +479,49 @@ class _OfflineClient:
         return self._responses.pop(0)
 
 
+class _SafePromptClient:
+    def __init__(self, delegate: ark_vision_qc.VisionClient) -> None:
+        self._delegate = delegate
+
+    def complete_json(
+            self, *, system_prompt: str, user_prompt: str,
+            images: Sequence[Path],
+    ) -> str:
+        _assert_safe_request_prompts(system_prompt, user_prompt)
+        return self._delegate.complete_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images=images,
+        )
+
+
 def _review(
         candidate: ReplayCandidate, *, infographic: bool,
         live_ark: bool, client: ark_vision_qc.VisionClient | None,
 ) -> tuple[ark_vision_qc.QCReviewResult, int]:
+    candidate_alias = _candidate_alias(candidate.attempt)
     system_prompt = _REPLAY_SYSTEM_PROMPT
-    user_prompt = _replay_user_prompt(candidate, infographic=infographic)
+    user_prompt = _replay_user_prompt(candidate_alias, infographic=infographic)
     if live_ark:
         if client is None:
             raise ReplayError("live Ark replay has no client")
         review_client = client
         offline_client = None
     else:
-        offline_client = _OfflineClient(candidate, system_prompt=system_prompt)
+        offline_client = _OfflineClient(
+            candidate,
+            candidate_alias=candidate_alias,
+            system_prompt=system_prompt,
+        )
         review_client = offline_client
+    safe_client = _SafePromptClient(review_client)
     try:
         result = ark_vision_qc.review_candidate(
-            review_client,
+            safe_client,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             images=candidate.images,
-            candidate=candidate.name,
+            candidate=candidate_alias,
             infographic=infographic,
         )
     except ark_vision_qc.ArkVisionError as exc:
@@ -480,7 +551,7 @@ def _coverage_misses(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     results = {
         target.target_id: {
-            candidate.name: candidate for candidate in target.candidates
+            candidate.attempt: candidate for candidate in target.candidates
         }
         for target in target_results
     }
@@ -489,7 +560,7 @@ def _coverage_misses(
     for target in manifest.targets:
         result_candidates = results[target.target_id]
         for candidate in target.candidates:
-            reported = set(result_candidates[candidate.name].reported_defects)
+            reported = set(result_candidates[candidate.attempt].reported_defects)
             for defect in set(candidate.expected_defects) & _CONSTRUCTION_DEFECTS:
                 if defect.value not in reported:
                     critical_misses.append(
@@ -581,7 +652,7 @@ def replay_manifest(
             total_qc_calls += calls
             candidate_results.append(CandidateReplayResult(
                 attempt=candidate.attempt,
-                name=candidate.name,
+                candidate_alias=_candidate_alias(candidate.attempt),
                 expected_outcome=candidate.expected_outcome,
                 predicted_outcome=predicted_outcome,
                 reported_defects=tuple(

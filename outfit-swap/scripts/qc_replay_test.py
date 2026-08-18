@@ -173,11 +173,11 @@ class ManifestValidationTest(unittest.TestCase):
         requests: list[dict[str, object]] = []
         live_responses = iter((
             report(
-                "attempt-01.png", decision="retry", confidence=0.5,
+                "candidate-01", decision="retry", confidence=0.5,
                 defects=("wrong_color",),
             ),
-            report("attempt-01.png"),
-            report("attempt-01.png"),
+            report("candidate-01"),
+            report("candidate-01"),
         ))
 
         class LiveClient:
@@ -208,9 +208,99 @@ class ManifestValidationTest(unittest.TestCase):
             request_text,
         ))
         self.assertTrue(all(
-            "attempt-01.png" in str(request["user_prompt"])
+            "candidate-01" in str(request["user_prompt"])
             for request in requests
         ))
+        self.assertTrue(all(
+            "attempt-01.png" not in str(request["user_prompt"])
+            for request in requests
+        ))
+
+    def test_live_requests_and_serialized_report_use_only_opaque_candidate_aliases(self) -> None:
+        forbidden = re.compile(
+            r"\d+\s*[x×]\s*\d+|\d+\s*:\s*\d+|resolution|pixel|"
+            r"\bwidth\b|\bheight\b|dimension|aspect|ratio",
+            re.IGNORECASE,
+        )
+        for filename in ("1024x1024.png", "aspect-ratio.png"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                payload = manifest(target(
+                    "ordinary-1",
+                    [candidate(1, filename, "accept", [report(filename)])],
+                    expected_attempt=1,
+                ))
+                root = Path(temporary)
+                path = root / "manifest.json"
+                image = root / "artifacts" / filename
+                image.parent.mkdir()
+                image.write_bytes(b"approved fixture")
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                loaded = qc_replay.load_manifest(path)
+                requests: list[dict[str, object]] = []
+                responses = iter((
+                    report(
+                        "candidate-01", decision="retry", confidence=0.5,
+                        defects=("wrong_color",),
+                    ),
+                    report("candidate-01"),
+                    report("candidate-01"),
+                ))
+
+                class LiveClient:
+                    def complete_json(self, **request: object) -> str:
+                        requests.append(request)
+                        return json.dumps(next(responses))
+
+                result = qc_replay.replay_manifest(
+                    loaded, live_ark=True, client=LiveClient(),
+                )
+
+                self.assertEqual(len(requests), 3)
+                for request in requests:
+                    prompt_text = " ".join((
+                        str(request["system_prompt"]),
+                        str(request["user_prompt"]),
+                    ))
+                    self.assertNotIn(filename, prompt_text)
+                    self.assertIsNone(forbidden.search(prompt_text))
+                    self.assertIn("candidate-01", str(request["user_prompt"]))
+                rendered = json.dumps(result.to_dict(), sort_keys=True)
+                self.assertNotIn(filename, rendered)
+                self.assertNotIn(str(root), rendered)
+                self.assertIn("candidate-01", rendered)
+
+    def test_final_client_boundary_rejects_forbidden_code_owned_prompt_text(self) -> None:
+        payload = manifest(target(
+            "ordinary-1",
+            [candidate(1, "attempt.png", "accept", [report("attempt.png")])],
+            expected_attempt=1,
+        ))
+
+        class ClientThatMustNotRun:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete_json(self, **_request: object) -> str:
+                self.calls += 1
+                return json.dumps(report("candidate-01"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "manifest.json"
+            image = root / "artifacts" / "attempt.png"
+            image.parent.mkdir()
+            image.write_bytes(b"approved fixture")
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = qc_replay.load_manifest(path)
+            client = ClientThatMustNotRun()
+
+            with patch.object(
+                    qc_replay, "_REPLAY_SYSTEM_PROMPT",
+                    "Use the original aspect ratio and pixel dimensions.",
+            ), self.assertRaises(qc_replay.ReplayError):
+                qc_replay.replay_manifest(loaded, live_ark=True, client=client)
+
+        self.assertEqual(client.calls, 0)
 
     def test_infographic_change_annotations_must_match_derived_semantics(self) -> None:
         cases = (
@@ -314,8 +404,8 @@ class OfflineReplayTest(unittest.TestCase):
         result = qc_replay.replay_manifest(loaded)
 
         self.assertEqual(
-            [item.name for item in result.target_results[0].candidates],
-            ["a-attempt.png", "z-attempt.png"],
+            [item.candidate_alias for item in result.target_results[0].candidates],
+            ["candidate-01", "candidate-02"],
         )
         self.assertEqual(result.target_results[0].predicted_accepted_attempt, 2)
 
@@ -508,7 +598,7 @@ class OfflineReplayTest(unittest.TestCase):
             def complete_json(self, **request: object) -> str:
                 self_request = request
                 self.assert_request(self_request)
-                return json.dumps(report("attempt-01.png"))
+                return json.dumps(report("candidate-01"))
 
             @staticmethod
             def assert_request(request: dict[str, object]) -> None:
