@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_ATTEMPTS = 3
 MAX_RECORDED_ATTEMPT = 5
 CLASSIFICATIONS = frozenset({
@@ -166,6 +166,9 @@ def new_state(
                 "stale_output_tokens": [],
                 "updated_at": started_at,
                 "attempt_history": [],
+                "target_plan": None,
+                "qc_reports": [],
+                "selection_reason": None,
             }
             for token in target_tokens
         },
@@ -177,7 +180,8 @@ def _target_template(updated_at: str) -> dict[str, Any]:
             "attempts": 0, "output": None, "local_acceptance": None,
             "prompt_sha256": None, "model": None,
             "error": None, "stale_output_tokens": [],
-            "updated_at": updated_at, "attempt_history": []}
+            "updated_at": updated_at, "attempt_history": [],
+            "target_plan": None, "qc_reports": [], "selection_reason": None}
 
 
 def _token_list(value: Any, name: str, *, allow_empty: bool = False) -> list[str]:
@@ -298,6 +302,37 @@ def _nonempty_string(value: Any, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise TaskStateError(f"{name} must not be empty")
     return value
+
+
+def _json_object(value: Any, name: str) -> dict[str, Any]:
+    """Validate and detach a JSON object kept in durable target metadata."""
+    if not isinstance(value, dict):
+        raise TaskStateError(f"{name} must be a JSON object")
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise TaskStateError(f"{name} must contain JSON values") from error
+    return copy.deepcopy(value)
+
+
+def _qc_report(value: Any) -> dict[str, Any]:
+    report = _json_object(value, "qc report")
+    attempt = report.get("attempt")
+    if (not isinstance(attempt, int) or isinstance(attempt, bool) or attempt <= 0):
+        raise TaskStateError("qc report must include a positive attempt number")
+    if not any(
+            isinstance(report.get(key), str) and report[key]
+            for key in ("artifact_sha256", "artifact_digest")):
+        raise TaskStateError("qc report must include an artifact digest")
+    return report
+
+
+def _target_at_index(state: dict[str, Any], target_index: int) -> dict[str, Any]:
+    """Return a target by its zero-based current attachment-order index."""
+    if (not isinstance(target_index, int) or isinstance(target_index, bool)
+            or not 0 <= target_index < len(state["target_tokens"])):
+        raise TaskStateError("target_index is outside the current target order")
+    return state["targets"][state["target_tokens"][target_index]]
 
 
 def new_record_error_state(
@@ -429,7 +464,8 @@ def _validate_state(state: Any) -> dict[str, Any]:
             raise TaskStateError(f"target entry is invalid: {token}")
         required = ("status", "classification", "reference_tokens", "attempts", "output",
                     "local_acceptance", "prompt_sha256", "model", "error", "stale_output_tokens",
-                    "updated_at", "attempt_history")
+                    "updated_at", "attempt_history", "target_plan", "qc_reports",
+                    "selection_reason")
         if any(key not in target for key in required):
             raise TaskStateError(f"target entry is incomplete: {token}")
         if (not isinstance(target["status"], str)
@@ -444,8 +480,15 @@ def _validate_state(state: Any) -> dict[str, Any]:
                 or len(target["stale_output_tokens"])
                 != len(set(target["stale_output_tokens"]))
                 or not isinstance(target["attempt_history"], list)
-                or not all(isinstance(entry, dict) for entry in target["attempt_history"])):
+                or not all(isinstance(entry, dict) for entry in target["attempt_history"])
+                or not isinstance(target["qc_reports"], list)):
             raise TaskStateError(f"target entry has invalid fields: {token}")
+        if target["target_plan"] is not None:
+            _json_object(target["target_plan"], "target_plan")
+        if target["selection_reason"] is not None:
+            _json_object(target["selection_reason"], "selection_reason")
+        for report in target["qc_reports"]:
+            _qc_report(report)
         if (target["status"] not in {
                     "pending", "running", "accepted-local", "success", "failed",
                 }
@@ -588,7 +631,7 @@ def _migrate_v1_state(value: Any) -> Any:
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         return value
     state = copy.deepcopy(value)
-    state["schema_version"] = SCHEMA_VERSION
+    state["schema_version"] = 2
     state.setdefault("current_target", None)
     state.setdefault("record_error", None)
     targets = state.get("targets")
@@ -673,6 +716,24 @@ def _migrate_v1_state(value: Any) -> Any:
     return state
 
 
+def _migrate_v2_state(value: Any) -> Any:
+    """Add automatic-QC checkpoints without modifying historical attempts."""
+    if not isinstance(value, dict) or value.get("schema_version") != 2:
+        return value
+    state = copy.deepcopy(value)
+    state["schema_version"] = SCHEMA_VERSION
+    targets = state.get("targets")
+    if not isinstance(targets, dict):
+        return state
+    for target in targets.values():
+        if not isinstance(target, dict):
+            continue
+        target.setdefault("target_plan", None)
+        target.setdefault("qc_reports", [])
+        target.setdefault("selection_reason", None)
+    return state
+
+
 def _normalize_legacy_budget(state: dict[str, Any]) -> dict[str, Any]:
     """Terminalize pending legacy work that has exceeded the active budget."""
     for target in state["targets"].values():
@@ -687,7 +748,9 @@ def load_state(path: str | Path) -> dict[str, Any]:
     """Load and validate a persisted state file."""
     try:
         with Path(path).open(encoding="utf-8") as handle:
-            state = _validate_state(_migrate_v1_state(json.load(handle)))
+            state = _validate_state(
+                _migrate_v2_state(_migrate_v1_state(json.load(handle))),
+            )
         state = _normalize_legacy_budget(state)
         return _validate_state(state)
     except (OSError, json.JSONDecodeError) as error:
@@ -783,9 +846,11 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
                         and output["file_token"] not in stale_tokens):
                     stale_tokens.append(output["file_token"])
             history = list(target["attempt_history"])
-            candidate["targets"][token] = _target_template(updated_at)
-            candidate["targets"][token]["attempt_history"] = history
-            candidate["targets"][token]["stale_output_tokens"] = stale_tokens
+            replacement = _target_template(updated_at)
+            replacement["attempt_history"] = history
+            replacement["stale_output_tokens"] = stale_tokens
+            replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+            candidate["targets"][token] = replacement
     else:
         for token, target in candidate["targets"].items():
             if target["status"] == "running" and token not in current_tokens:
@@ -936,9 +1001,11 @@ def reconcile_error(
                         and output["file_token"] not in stale_output_tokens):
                     stale_output_tokens.append(output["file_token"])
             history = list(target["attempt_history"])
-            candidate["targets"][token] = _target_template(updated_at)
-            candidate["targets"][token]["attempt_history"] = history
-            candidate["targets"][token]["stale_output_tokens"] = stale_output_tokens
+            replacement = _target_template(updated_at)
+            replacement["attempt_history"] = history
+            replacement["stale_output_tokens"] = stale_output_tokens
+            replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+            candidate["targets"][token] = replacement
     _validate_state(candidate)
     state.clear()
     state.update(candidate)
@@ -962,9 +1029,12 @@ def prepare_retry(state: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
             continue
         history = list(target["attempt_history"])
         stale_output_tokens = list(target["stale_output_tokens"])
-        candidate["targets"][token] = _target_template(updated_at)
-        candidate["targets"][token]["attempt_history"] = history
-        candidate["targets"][token]["stale_output_tokens"] = stale_output_tokens
+        replacement = _target_template(updated_at)
+        replacement["attempt_history"] = history
+        replacement["stale_output_tokens"] = stale_output_tokens
+        replacement["target_plan"] = copy.deepcopy(target["target_plan"])
+        replacement["qc_reports"] = copy.deepcopy(target["qc_reports"])
+        candidate["targets"][token] = replacement
     candidate["current_target"] = None
     candidate["record_error"] = None
     _validate_state(candidate)
@@ -1185,6 +1255,51 @@ def record_error(state: dict[str, Any], *, code: str, error: str,
     return state
 
 
+def record_target_plan(state: dict, target_index: int, plan: dict) -> None:
+    """Persist one immutable target plan by zero-based attachment-order index."""
+    _validate_state(state)
+    plan_value = _json_object(plan, "target plan")
+    candidate = copy.deepcopy(state)
+    target = _target_at_index(candidate, target_index)
+    existing = target["target_plan"]
+    if existing is not None and existing != plan_value:
+        raise TaskStateError("target plan is already recorded and cannot be replaced")
+    if existing is None:
+        target["target_plan"] = plan_value
+    _validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+
+
+def record_qc_report(state: dict, target_index: int, report: dict) -> None:
+    """Append an immutable automatic-QC report by zero-based target index."""
+    _validate_state(state)
+    report_value = _qc_report(report)
+    candidate = copy.deepcopy(state)
+    _target_at_index(candidate, target_index)["qc_reports"].append(report_value)
+    _validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+
+
+def record_selection_reason(state: dict, target_index: int, reason: dict) -> None:
+    """Persist one immutable final-selection reason by zero-based target index."""
+    _validate_state(state)
+    reason_value = _json_object(reason, "selection reason")
+    candidate = copy.deepcopy(state)
+    target = _target_at_index(candidate, target_index)
+    existing = target["selection_reason"]
+    if existing is not None and existing != reason_value:
+        raise TaskStateError(
+            "selection reason is already recorded and cannot be replaced",
+        )
+    if existing is None:
+        target["selection_reason"] = reason_value
+    _validate_state(candidate)
+    state.clear()
+    state.update(candidate)
+
+
 def pending_targets(state: dict[str, Any]) -> list[str]:
     """Return current non-success targets in their input order."""
     _validate_state(state)
@@ -1332,6 +1447,11 @@ def _parser() -> argparse.ArgumentParser:
     failure = commands.add_parser("failure")
     failure.add_argument("--state", required=True); failure.add_argument("--target-token", required=True)
     failure.add_argument("--error-file", required=True); failure.add_argument("--updated-at", required=True)
+    for command in ("target-plan", "qc-report", "selection-reason"):
+        checkpoint = commands.add_parser(command)
+        checkpoint.add_argument("--state", required=True)
+        checkpoint.add_argument("--target-index", required=True, type=int)
+        checkpoint.add_argument("--payload-json", required=True)
     for command in ("pending", "uploads", "summary", "compact"):
         item = commands.add_parser(command); item.add_argument("--state", required=True)
     return parser
@@ -1388,6 +1508,16 @@ def main(argv: list[str] | None = None) -> int:
             _atomic_write(args.state, state); _state_stdout(state)
         elif args.command == "failure":
             state = record_failure(load_state(args.state), target_token=args.target_token, error=Path(args.error_file).read_text(encoding="utf-8"), updated_at=args.updated_at)
+            _atomic_write(args.state, state); _state_stdout(state)
+        elif args.command in {"target-plan", "qc-report", "selection-reason"}:
+            state = load_state(args.state)
+            payload = _read_json(args.payload_json)
+            if args.command == "target-plan":
+                record_target_plan(state, args.target_index, payload)
+            elif args.command == "qc-report":
+                record_qc_report(state, args.target_index, payload)
+            else:
+                record_selection_reason(state, args.target_index, payload)
             _atomic_write(args.state, state); _state_stdout(state)
         elif args.command == "pending":
             _json_stdout(pending_targets(load_state(args.state)))

@@ -582,9 +582,164 @@ class TaskStateTest(unittest.TestCase):
             target_tokens=["box_t1", "box_t2"],
             started_at="2026-08-15T10:00:00+08:00",
         )
-        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["schema_version"], 3)
         self.assertEqual(state["target_tokens"], ["box_t1", "box_t2"])
         self.assertEqual(state["targets"]["box_t1"]["status"], "pending")
+
+    def test_new_state_initializes_schema_v3_qc_checkpoints(self) -> None:
+        state = self.make_state()
+
+        self.assertEqual(state["targets"]["box_t1"], {
+            "status": "pending",
+            "classification": None,
+            "reference_tokens": [],
+            "attempts": 0,
+            "output": None,
+            "local_acceptance": None,
+            "prompt_sha256": None,
+            "model": None,
+            "error": None,
+            "stale_output_tokens": [],
+            "updated_at": "2026-08-15T10:00:00+08:00",
+            "attempt_history": [],
+            "target_plan": None,
+            "qc_reports": [],
+            "selection_reason": None,
+        })
+
+    def test_load_migrates_v2_checkpoints_without_changing_attempt_history(self) -> None:
+        legacy = self.make_state()
+        self.begin(legacy)
+        task_state.record_failure(
+            legacy, target_token="box_t1", error="needs visual review",
+            updated_at="2026-08-15T10:02:00+08:00",
+        )
+        legacy["schema_version"] = 2
+        target = legacy["targets"]["box_t1"]
+        target.pop("target_plan", None)
+        target.pop("qc_reports", None)
+        target.pop("selection_reason", None)
+        history = json.loads(json.dumps(target["attempt_history"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-v2.json"
+            path.write_text(json.dumps(legacy), encoding="utf-8")
+            migrated = task_state.load_state(path)
+            path.write_text(json.dumps(migrated), encoding="utf-8")
+            reloaded = task_state.load_state(path)
+
+        migrated_target = migrated["targets"]["box_t1"]
+        self.assertEqual(migrated["schema_version"], 3)
+        self.assertEqual(migrated_target["attempt_history"], history)
+        self.assertIsNone(migrated_target["target_plan"])
+        self.assertEqual(migrated_target["qc_reports"], [])
+        self.assertIsNone(migrated_target["selection_reason"])
+        self.assertEqual(reloaded, migrated)
+
+    def test_target_plan_is_immutable_but_identical_replay_is_safe(self) -> None:
+        state = self.make_state()
+        plan = {
+            "classification": "front",
+            "reference_tokens": ["box_s1"],
+            "roles": ["primary"],
+        }
+
+        task_state.record_target_plan(state, 0, plan)
+        plan["roles"].append("mutated-after-write")
+        task_state.record_target_plan(state, 0, {
+            "classification": "front",
+            "reference_tokens": ["box_s1"],
+            "roles": ["primary"],
+        })
+
+        self.assertEqual(state["targets"]["box_t1"]["target_plan"], {
+            "classification": "front",
+            "reference_tokens": ["box_s1"],
+            "roles": ["primary"],
+        })
+        before = json.loads(json.dumps(state))
+        with self.assertRaisesRegex(task_state.TaskStateError, "target plan"):
+            task_state.record_target_plan(state, 0, {"classification": "side"})
+        self.assertEqual(state, before)
+
+    def test_qc_reports_append_with_artifact_digest_and_attempt_number(self) -> None:
+        state = self.make_state()
+        first = {
+            "attempt": 1,
+            "artifact_sha256": "a" * 64,
+            "decision": "retry",
+        }
+        second = {
+            "attempt": 2,
+            "artifact_sha256": "b" * 64,
+            "decision": "accept",
+        }
+
+        task_state.record_qc_report(state, 0, first)
+        task_state.record_qc_report(state, 0, second)
+
+        self.assertEqual(state["targets"]["box_t1"]["qc_reports"], [first, second])
+        before = json.loads(json.dumps(state))
+        with self.assertRaisesRegex(task_state.TaskStateError, "artifact digest"):
+            task_state.record_qc_report(state, 0, {"attempt": 3, "decision": "retry"})
+        self.assertEqual(state, before)
+
+    def test_selection_reason_is_immutable_after_it_is_recorded(self) -> None:
+        state = self.make_state()
+        reason = {"artifact_sha256": "c" * 64, "reason": "best garment construction"}
+
+        task_state.record_selection_reason(state, 0, reason)
+        task_state.record_selection_reason(state, 0, {
+            "artifact_sha256": "c" * 64,
+            "reason": "best garment construction",
+        })
+
+        before = json.loads(json.dumps(state))
+        with self.assertRaisesRegex(task_state.TaskStateError, "selection reason"):
+            task_state.record_selection_reason(
+                state, 0, {"artifact_sha256": "d" * 64, "reason": "different"},
+            )
+        self.assertEqual(state, before)
+
+    def test_cli_persists_schema_v3_qc_checkpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "state.json"
+            plan_path = root / "plan.json"
+            report_path = root / "report.json"
+            reason_path = root / "reason.json"
+            state_path.write_text(json.dumps(self.make_state()), encoding="utf-8")
+            plan_path.write_text(
+                '{"classification":"front","reference_tokens":["box_s1"]}',
+                encoding="utf-8",
+            )
+            report_path.write_text(
+                '{"attempt":1,"artifact_sha256":"'
+                + "a" * 64 + '","decision":"accept"}',
+                encoding="utf-8",
+            )
+            reason_path.write_text(
+                '{"artifact_sha256":"'
+                + "a" * 64 + '","reason":"accepted automatically"}',
+                encoding="utf-8",
+            )
+            for command, payload in (
+                ("target-plan", plan_path),
+                ("qc-report", report_path),
+                ("selection-reason", reason_path),
+            ):
+                with self.subTest(command=command), redirect_stderr(io.StringIO()), \
+                        redirect_stdout(io.StringIO()):
+                    code = task_state.main([
+                        command, "--state", str(state_path), "--target-index", "0",
+                        "--payload-json", str(payload),
+                    ])
+                self.assertEqual(code, 0)
+
+            target = task_state.load_state(state_path)["targets"]["box_t1"]
+            self.assertEqual(target["target_plan"]["classification"], "front")
+            self.assertEqual(target["qc_reports"][0]["attempt"], 1)
+            self.assertEqual(target["selection_reason"]["reason"], "accepted automatically")
 
     def test_new_state_rejects_empty_record_run_or_start_identity(self) -> None:
         defaults = {
@@ -1777,7 +1932,7 @@ class TaskStateTest(unittest.TestCase):
             path = Path(directory) / "legacy.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
             migrated = task_state.load_state(path)
-        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["schema_version"], 3)
         self.assertEqual(migrated["targets"]["box_t1"]["status"], "success")
         self.assertEqual(migrated["targets"]["box_t1"]["output"]["file_token"], "box_out")
         self.assertEqual(migrated["targets"]["box_t1"]["attempt_history"], [])
