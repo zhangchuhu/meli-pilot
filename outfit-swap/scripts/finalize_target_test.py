@@ -36,6 +36,7 @@ class FakeBase:
         self.upload_calls = 0
         self.update_calls = 0
         self.get_calls = 0
+        self.get_field_ids: list[tuple[str, ...]] = []
         self.fail_upload = False
         self.fail_update = False
         self.drop_update = False
@@ -65,6 +66,7 @@ class FakeBase:
 
     def get_record(self, **kwargs: object) -> dict:
         self.get_calls += 1
+        self.get_field_ids.append(tuple(kwargs["field_ids"]))
         return {"data": {
             "fields": ["输出图", "处理明细"],
             "data": [[list(self.outputs), self.detail]],
@@ -97,7 +99,7 @@ class FinalizeTargetTest(unittest.TestCase):
         self.base = FakeBase(self.root)
         self.finalizer = TargetFinalizer(
             base=self.base, app_token="app_token", table_id="tbl_1",
-            output_field_id="fld_output",
+            output_field_id="fld_output", detail_field_id="fld_detail",
             clock=lambda: "2026-08-18T10:02:00+08:00",
         )
 
@@ -142,6 +144,10 @@ class FinalizeTargetTest(unittest.TestCase):
         self.assertEqual(self.base.upload_calls, 1)
         self.assertEqual(self.base.update_calls, 1)
         self.assertEqual(self.base.detail, task_state.compact_detail(persisted))
+        self.assertEqual(
+            self.base.get_field_ids,
+            [("fld_output", "fld_detail"), ("fld_output", "fld_detail")],
+        )
 
     def test_accepted_local_checkpoint_does_not_reaccept_or_regenerate(self) -> None:
         self.accept_locally()
@@ -202,6 +208,15 @@ class FinalizeTargetTest(unittest.TestCase):
         self.assertEqual(self.state_file.read_bytes(), before)
         self.assertEqual(self.base.get_calls, 0)
         self.assertEqual(self.base.upload_calls, 0)
+
+    def test_complete_candidate_ignores_comparison_dimensions_and_aspect(self) -> None:
+        write_png(self.candidate, width=1, height=64)
+        self.digest = hashlib.sha256(self.candidate.read_bytes()).hexdigest()
+
+        result = self.finalizer.finalize(self.request())
+
+        self.assertEqual(result.attachment_token, "box_uploaded_1")
+        self.assertEqual(self.base.upload_calls, 1)
 
     def test_upload_failure_leaves_durable_accepted_local_checkpoint(self) -> None:
         self.base.fail_upload = True

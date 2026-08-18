@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -199,17 +200,17 @@ def probe_image(path: str | Path) -> ImageInfo:
     )
 
 
-def validate_image(path: str | Path) -> ImageInfo:
+def _raster_path(path: str | Path) -> Path:
     image_path = Path(path)
     if not image_path.is_file():
         raise ImageQCError(f"image is not a file: {image_path}")
     suffix = image_path.suffix.lower()
     if suffix not in SUPPORTED_INPUT_SUFFIXES:
         raise ImageQCError(f"unsupported image suffix: {image_path.suffix or '(none)'}")
-    size_bytes = image_path.stat().st_size
-    if size_bytes > MAX_FILE_BYTES:
-        raise ImageQCError(f"image exceeds 30 MiB: {image_path}")
+    return image_path
 
+
+def _supported_raster_info(image_path: Path) -> ImageInfo:
     info = probe_image(image_path)
     format_names = set(info.format_name.split(","))
     video_container = bool(format_names & VIDEO_CONTAINER_NAMES)
@@ -223,6 +224,38 @@ def validate_image(path: str | Path) -> ImageInfo:
     )
     if not supported_raster_content or video_container and not valid_heif_container:
         raise ImageQCError(f"unsupported raster content: {image_path}")
+    return info
+
+
+def _validate_full_decode(image_path: Path) -> None:
+    result = _run([
+        "ffmpeg", "-v", "error", "-i", str(image_path), "-f", "null", "-",
+    ])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "ffmpeg failed"
+        raise ImageQCError(f"image failed full decode {image_path}: {detail}")
+
+
+def validate_decodable_raster(path: str | Path) -> ImageInfo:
+    """Validate supported static raster content and a complete full decode.
+
+    This deliberately makes no decision from file size, pixel dimensions, or
+    aspect ratio. It is the finalization authority for an already-selected
+    generation candidate.
+    """
+    image_path = _raster_path(path)
+    info = _supported_raster_info(image_path)
+    _validate_full_decode(image_path)
+    return info
+
+
+def validate_image(path: str | Path) -> ImageInfo:
+    image_path = _raster_path(path)
+    size_bytes = image_path.stat().st_size
+    if size_bytes > MAX_FILE_BYTES:
+        raise ImageQCError(f"image exceeds 30 MiB: {image_path}")
+
+    info = _supported_raster_info(image_path)
     if info.width <= MIN_SIDE or info.height <= MIN_SIDE:
         raise ImageQCError(f"image sides must be greater than 14 pixels: {image_path}")
     if not MIN_PIXELS <= info.pixels <= MAX_PIXELS:
@@ -230,13 +263,7 @@ def validate_image(path: str | Path) -> ImageInfo:
     ratio = info.width / info.height
     if not 1 / MAX_RATIO <= ratio <= MAX_RATIO:
         raise ImageQCError(f"image aspect ratio is outside 1:16..16:1: {image_path}")
-
-    result = _run([
-        "ffmpeg", "-v", "error", "-i", str(image_path), "-f", "null", "-",
-    ])
-    if result.returncode != 0:
-        detail = result.stderr.strip() or "ffmpeg failed"
-        raise ImageQCError(f"image failed full decode {image_path}: {detail}")
+    _validate_full_decode(image_path)
     return info
 
 
@@ -482,7 +509,7 @@ def build_empty_contact_sheet(
 
 
 def promote_output(attempt: str | Path, output: str | Path) -> Path:
-    """Atomically copy an accepted immutable attempt to its deterministic name."""
+    """Atomically publish an accepted attempt without replacing prior output."""
     attempt_path = Path(attempt)
     output_path = Path(output)
     attempt_match = ATTEMPT_OUTPUT_NAME.fullmatch(attempt_path.name)
@@ -506,7 +533,18 @@ def promote_output(attempt: str | Path, output: str | Path) -> Path:
             shutil.copyfileobj(source, target)
             target.flush()
             os.fsync(target.fileno())
-        os.replace(temporary, output_path)
+        temporary_digest = _file_sha256(temporary)
+        try:
+            os.link(temporary, output_path)
+        except FileExistsError:
+            if (output_path.is_symlink()
+                    or not output_path.is_file()
+                    or _file_sha256(output_path) != temporary_digest):
+                raise ImageQCError(
+                    "deterministic output conflicts with accepted attempt",
+                ) from None
+            return output_path
+        temporary.unlink()
         temporary = None
         directory = os.open(output_path.parent, os.O_RDONLY)
         try:
@@ -522,6 +560,17 @@ def promote_output(attempt: str | Path, output: str | Path) -> Path:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as error:
+        raise ImageQCError(f"cannot read image artifact: {path}") from error
+    return digest.hexdigest()
 
 
 def _read_manifest(path: Path) -> Any:

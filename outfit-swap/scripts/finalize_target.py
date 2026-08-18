@@ -62,15 +62,19 @@ class TargetFinalizer:
 
     def __init__(
             self, *, base: BaseClient, app_token: str, table_id: str,
-            output_field_id: str, clock: Callable[[], str] = _utc_now,
+            output_field_id: str, detail_field_id: str,
+            clock: Callable[[], str] = _utc_now,
     ) -> None:
         if not all(isinstance(value, str) and value
-                   for value in (app_token, table_id, output_field_id)):
+                   for value in (
+                       app_token, table_id, output_field_id, detail_field_id,
+                   )):
             raise FinalizeError("Base finalization scope is incomplete")
         self._base = base
         self._app_token = app_token
         self._table_id = table_id
         self._output_field_id = output_field_id
+        self._detail_field_id = detail_field_id
         self._clock = clock
 
     def __call__(self, request: FinalizeRequest) -> FinalizeResult:
@@ -185,7 +189,7 @@ class TargetFinalizer:
     @staticmethod
     def _revalidate_candidate(candidate: Path, expected_sha256: str) -> None:
         try:
-            image_qc.validate_image(candidate)
+            image_qc.validate_decodable_raster(candidate)
         except (image_qc.ImageQCError, OSError) as error:
             raise FinalizeError("candidate image is invalid") from error
         if _sha256(candidate) != expected_sha256:
@@ -283,7 +287,7 @@ class TargetFinalizer:
             response = self._base.get_record(
                 app_token=self._app_token, table_id=self._table_id,
                 record_id=record_id,
-                field_ids=[self._output_field_id, DETAIL_FIELD],
+                field_ids=[self._output_field_id, self._detail_field_id],
             )
             return _record_fields(response, record_id)
         except Exception:

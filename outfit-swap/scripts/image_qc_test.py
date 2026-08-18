@@ -67,19 +67,54 @@ class AcceptedOutputPromotionTest(unittest.TestCase):
             attempt = root / "attempt-01-deadbeefcafe-04.png"
             accepted = root / "look-01-deadbeefcafe.png"
             attempt.write_bytes(b"accepted pixels")
-            accepted.write_bytes(b"stale pixels")
 
-            with patch.object(image_qc.os, "replace", wraps=os.replace) as replace:
+            with patch.object(image_qc.os, "link", wraps=os.link) as link:
                 promoted = image_qc.promote_output(attempt, accepted)
 
             self.assertEqual(promoted, accepted)
             self.assertEqual(accepted.read_bytes(), b"accepted pixels")
             self.assertEqual(attempt.read_bytes(), b"accepted pixels")
-            replace.assert_called_once()
-            temporary, destination = replace.call_args.args
+            link.assert_called_once()
+            temporary, destination = link.call_args.args
             self.assertEqual(Path(temporary).parent, accepted.parent)
             self.assertEqual(Path(destination), accepted)
             self.assertFalse(any("-v2" in path.name for path in root.iterdir()))
+
+    def test_existing_identical_output_is_reused_but_conflict_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / "attempt-01-deadbeefcafe-04.png"
+            accepted = root / "look-01-deadbeefcafe.png"
+            attempt.write_bytes(b"accepted pixels")
+            accepted.write_bytes(b"accepted pixels")
+
+            self.assertEqual(image_qc.promote_output(attempt, accepted), accepted)
+            accepted.write_bytes(b"historical pixels")
+            with self.assertRaisesRegex(image_qc.ImageQCError, "conflicts"):
+                image_qc.promote_output(attempt, accepted)
+
+            self.assertEqual(accepted.read_bytes(), b"historical pixels")
+
+    def test_concurrent_publisher_wins_without_being_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / "attempt-01-deadbeefcafe-04.png"
+            accepted = root / "look-01-deadbeefcafe.png"
+            attempt.write_bytes(b"our accepted pixels")
+            real_link = os.link
+
+            def publish_competitor_then_link(source: Path, destination: Path) -> None:
+                Path(destination).write_bytes(b"concurrent accepted pixels")
+                real_link(source, destination)
+
+            with patch.object(
+                    image_qc.os, "link", side_effect=publish_competitor_then_link,
+            ):
+                with self.assertRaisesRegex(image_qc.ImageQCError, "conflicts"):
+                    image_qc.promote_output(attempt, accepted)
+
+            self.assertEqual(accepted.read_bytes(), b"concurrent accepted pixels")
+            self.assertEqual(attempt.read_bytes(), b"our accepted pixels")
 
 
 class RasterContentContractTest(unittest.TestCase):
@@ -140,6 +175,16 @@ class ImageValidationTest(unittest.TestCase):
         info = image_qc.validate_image(path)
         self.assertEqual((info.width, info.height, info.pixels), (64, 64, 4096))
         self.assertEqual(info.codec_name, "png")
+
+    def test_decodable_raster_accepts_comparison_dimensions_and_aspect(self) -> None:
+        path = self.root / "narrow-but-complete.png"
+        write_png(path, 1, 64)
+
+        info = image_qc.validate_decodable_raster(path)
+
+        self.assertEqual((info.width, info.height, info.pixels), (1, 64, 64))
+        with self.assertRaises(image_qc.ImageQCError):
+            image_qc.validate_image(path)
 
     def test_supported_png_content_with_jpg_suffix_passes(self) -> None:
         path = self.root / "mislabeled.jpg"
