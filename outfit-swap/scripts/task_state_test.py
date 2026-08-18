@@ -1596,6 +1596,61 @@ class TaskStateTest(unittest.TestCase):
         state["targets"]["box_t1"]["stale_output_tokens"] = ["box_stale"]
         self.assertNotIn("stale_output_tokens", task_state.compact_detail(state))
 
+    def test_reconcile_target_output_promotes_accepted_mapping_once(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        output = {
+            "file_token": "box_uploaded", "name": task_state.output_name(1, "box_t1"),
+        }
+
+        reconciled = task_state.reconcile_target_output(
+            state, target_index=0, outputs=[output],
+            updated_at="2026-08-18T10:02:00+08:00",
+        )
+        replayed = task_state.reconcile_target_output(
+            state, target_index=0, outputs=[{**output, "size": 123}],
+            updated_at="2026-08-18T10:03:00+08:00",
+        )
+
+        self.assertEqual(reconciled, output)
+        self.assertEqual(replayed, output)
+        self.assertEqual(state["targets"]["box_t1"]["status"], "success")
+        self.assertEqual(
+            [entry["outcome"] for entry in state["targets"]["box_t1"]["attempt_history"]],
+            ["success"],
+        )
+
+    def test_reconcile_target_output_without_match_does_not_mutate(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        before = json.loads(json.dumps(state))
+
+        reconciled = task_state.reconcile_target_output(
+            state, target_index=0, outputs=[],
+            updated_at="2026-08-18T10:02:00+08:00",
+        )
+
+        self.assertIsNone(reconciled)
+        self.assertEqual(state, before)
+
+    def test_reconcile_target_output_rejects_ambiguous_current_attachments(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        name = task_state.output_name(1, "box_t1")
+
+        with self.assertRaisesRegex(task_state.TaskStateError, "ambiguous"):
+            task_state.reconcile_target_output(
+                state, target_index=0,
+                outputs=[
+                    {"file_token": "box_one", "name": name},
+                    {"file_token": "box_two", "name": name},
+                ],
+                updated_at="2026-08-18T10:02:00+08:00",
+            )
+
     def test_source_reorder_preserves_current_success(self) -> None:
         state = task_state.new_state(
             record_id="rec_1", run_id="run_1",

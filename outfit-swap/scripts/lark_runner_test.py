@@ -293,9 +293,15 @@ class LarkBaseClientTest(unittest.TestCase):
         self.assertEqual(
             self.client.get_record(
                 app_token="app-token", table_id="tbl123", record_id="rec123",
+                field_ids=["fld-output", "fld-detail"],
             ),
             {"ok": True},
         )
+        self.assertEqual(self._calls()[-1]["argv"], [
+            "base", "+record-get", "--base-token", "app-token", "--table-id",
+            "tbl123", "--record-id", "rec123", "--field-id", "fld-output",
+            "--field-id", "fld-detail", "--format", "json", "--as", "user",
+        ])
 
 
 if __name__ == "__main__":

@@ -808,6 +808,12 @@ def _atomic_write(path: str | Path, state: dict[str, Any]) -> None:
         raise TaskStateError(f"cannot write state: {error}") from error
 
 
+def save_state(path: str | Path, state: dict[str, Any]) -> None:
+    """Validate and atomically persist a state transition."""
+    _validate_state(state)
+    _atomic_write(path, state)
+
+
 def _finish_running_history(
         target: dict[str, Any], *, outcome: str, error: str | None, updated_at: str,
         output: dict[str, str] | None = None,
@@ -1233,6 +1239,55 @@ def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
     state.clear()
     state.update(candidate)
     return state
+
+
+def reconcile_target_output(
+        state: dict[str, Any], *, target_index: int,
+        outputs: Iterable[dict[str, Any]], updated_at: str,
+) -> dict[str, str] | None:
+    """Reconcile one accepted target with its append-only Base attachment.
+
+    A successful mapping is replay-safe. An accepted-local target advances only
+    when exactly one non-stale attachment has its deterministic accepted name.
+    No match leaves the caller's state untouched so it can decide whether an
+    upload is still required.
+    """
+    _validate_state(state)
+    current_outputs = _outputs_iterable(outputs)
+    updated_at = _nonempty_string(updated_at, "updated_at")
+    if (not isinstance(target_index, int) or isinstance(target_index, bool)
+            or not 0 <= target_index < len(state["target_tokens"])):
+        raise TaskStateError("target_index is outside the current target order")
+    target_token = state["target_tokens"][target_index]
+    target = state["targets"][target_token]
+    if target["status"] == "success":
+        mapped = target["output"]
+        present = any(
+            output["file_token"] == mapped["file_token"]
+            and output["name"] == mapped["name"]
+            for output in current_outputs
+        )
+        return copy.deepcopy(mapped) if present else None
+    if target["status"] != "accepted-local":
+        raise TaskStateError("target is not ready for output reconciliation")
+
+    accepted_name = target["local_acceptance"]["name"]
+    matches = [
+        {"file_token": output["file_token"], "name": output["name"]}
+        for output in current_outputs
+        if (output["name"] == accepted_name
+            and output["file_token"] not in target["stale_output_tokens"])
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise TaskStateError("accepted target has ambiguous current attachments")
+    uploaded = matches[0]
+    record_success(
+        state, target_token=target_token, file_token=uploaded["file_token"],
+        name=uploaded["name"], updated_at=updated_at,
+    )
+    return copy.deepcopy(uploaded)
 
 
 def record_failure(state: dict[str, Any], *, target_token: str, error: str,

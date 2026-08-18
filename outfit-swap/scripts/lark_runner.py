@@ -102,13 +102,22 @@ class LarkBaseClient:
             self._required(table_id, "table ID"), "--json", f"@{payload_arg}", "--as", "user",
         ], cwd=payload_path.parent)
 
-    def get_record(self, *, app_token: str, table_id: str, record_id: str) -> dict:
-        """Read one record by ID."""
-        return self._json([
+    def get_record(
+            self, *, app_token: str, table_id: str, record_id: str,
+            field_ids: Sequence[str] = (),
+    ) -> dict:
+        """Read one record by ID with an optional exact field projection."""
+        command = [
             "base", "+record-get", "--base-token", self._required(app_token, "app token"),
             "--table-id", self._required(table_id, "table ID"), "--record-id",
-            self._required(record_id, "record ID"), "--as", "user",
-        ])
+            self._required(record_id, "record ID"),
+        ]
+        if isinstance(field_ids, (str, bytes)):
+            raise LarkRunnerError("field IDs must be a sequence")
+        for field_id in field_ids:
+            command.extend(["--field-id", self._required(field_id, "field ID")])
+        command.extend(["--format", "json", "--as", "user"])
+        return self._json(command)
 
     def _input_path(self, supplied: Path) -> tuple[Path, str]:
         path = self._task_file(supplied)
