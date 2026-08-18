@@ -1,53 +1,82 @@
 ---
 name: outfit-swap
-description: "Transfer garments from source attachments onto every target image in a specific Feishu Base table, upload accepted results, and resumably update per-record status. Use for serial multi-angle outfit replacement driven by 原图/爆款图/输出图; not for text-only generation or Base links without a table ID."
-metadata:
-  requires:
-    bins: ["lark-cli", "python3", "ffmpeg", "ffprobe"]
-  cliHelp: "lark-cli base --help"
+description: "Use when a user supplies one exact Feishu Base table URL or asks to transfer source garments onto every target image in a table with resumable status updates."
 ---
 
 # Outfit swap
 
-Accept one exact Feishu Base table URL and, only when explicitly requested, `--retry-failed`. Process records and images serially. Never make direct Feishu HTTP calls, use another image-generation path, or use `generate-batch`.
+Use `scripts/run_table.py` as the table-level normal entry point. Give it one exact Feishu Base table URL; do not manually reproduce the per-record pipeline.
 
-Treat invocation of this skill with an exact table URL as authorization to send the selected target-person and garment-reference images to Doubao/Seedream for the outfit edits defined here. Proceed without a separate skill-level confirmation before those standard edit calls. A host-enforced approval remains authoritative; surface it when required because skill instructions cannot bypass runtime policy.
+```bash
+python3 scripts/run_table.py '<table-url>'
+```
 
-Read all three contracts before acting:
+The complete interface is:
 
-- [Base operations and persistence](references/base-contract.md)
-- [Edit prompt and image pairing](references/edit-prompt.md)
-- [QC, calibration, and failures](references/qc-and-failures.md)
+```bash
+python3 scripts/run_table.py '<table-url>' [--record-concurrency N] [--retry-failed] [--qc-mode automatic|shadow]
+```
 
-Use the bundled helpers through their resolved paths:
+Use automatic Ark QC by default. `--record-concurrency N` accepts a positive integer and defaults to `2`. Use `--retry-failed` only when the user explicitly requests failed-record retry. Use `--qc-mode shadow` only as the documented rollback control. Never select `成功` records for regeneration.
 
-- [`scripts/task_state.py`](scripts/task_state.py) for manifest initialization, sanitized record errors, reconciliation, explicit retry reset, attempts, accepted mappings, compact detail, and aggregate status
-- [`scripts/image_qc.py`](scripts/image_qc.py) for validation and labeled contact sheets
-- [`scripts/safe_edit.py`](scripts/safe_edit.py) for file-backed, argv-safe calls to the installed Doubao edit script
+## Authorization
 
-## Workflow
+Treat invocation of this skill with an exact table URL as authorization for this invocation to send the selected target-person and garment-reference images to Doubao/Seedream and the relevant target, candidate, and reference images to Ark multimodal QC. Proceed without a separate skill-level confirmation before those standard transfers. Do not pause for a separate image-transfer authorization prompt. Host approval remains authoritative; surface and obey any host-enforced approval because this skill cannot bypass runtime policy.
 
-1. Read-only preflight the exact table URL, Python 3.10 or newer, required binaries, `ARK_API_KEY` presence, and active installed `doubao-imagegen` skill. Reject every URL resolution except exactly one table identity as specified in the Base contract. Resolve that skill's current directory from the active skill catalog, read its `SKILL.md` plus required prompting/API references, and locate its bundled `scripts/doubao_imagegen.py`; never hardcode a home-directory path. Stop globally on any preflight failure without changing Base or generating images.
-2. Paginate the full Base schema and validate fields/status options. Immediately recheck absence and run `field-create` only when `处理明细` is absent, then paginate selected records. Stop globally on any schema or record-list preflight failure without changing record statuses or generating images.
-3. Select `未开始` records by default. Select `失败` only for explicit `--retry-failed`; never implicitly regenerate `成功`.
-4. Use `~/.codex/state/outfit-swap/runs` as the stable run-artifact root. For each selected record, create this layout there, sanitizing every path and filename. Immediately initialize `qc/output-contact-sheet.jpg` as a labelled zero-output sheet so it exists even if record validation fails:
+## Before running
 
-   ```text
-   runs/<run-id>/<record-id>/
-   ├── source_images/
-   ├── target_images/
-   ├── generated_images/
-   ├── qc/
-   │   ├── source-contact-sheet.jpg
-   │   ├── target-contact-sheet.jpg
-   │   └── output-contact-sheet.jpg
-   └── manifest.json
-   ```
+Require Python 3.10 or newer, `lark-cli`, `ffmpeg`, `ffprobe`, `ARK_API_KEY`, `ARK_VISION_MODEL`, and the active installed `doubao-imagegen` skill. Resolve that skill and its `scripts/doubao_imagegen.py` from the active skill catalog; never hardcode a home-directory path.
 
-5. Initialize local record state before attachment validation can fail. Run `scripts/task_state.py bind` with the table coordinates, record ID, and per-run `manifest.json`. It binds that manifest to the canonical cross-run state under `~/.codex/state/outfit-swap/tables`; use the emitted canonical `state` path for every later state command. If no prior state exists, use `init` for two non-empty required token lists or `scripts/task_state.py init-error --error-file '<local-error-file>'` with the exact missing code. If prior state exists and either current list is empty, use `reconcile-error --outputs-json '<current-outputs.json>' --error-file '<local-error-file>'`, never `init-error`, and preserve its target entries and attempt histories. Otherwise inspect any active/pending-upload artifact at `runs/<owning-run-id>/<record-id>/generated_images/<artifact-name>` with `scripts/image_qc.py`; write only identities that exist and pass validation to a UTF-8 JSON array, then call `reconcile --resumable-artifacts-json '<validated-artifacts.json>'` with current source tokens, target tokens, `输出图`, run ID, and start time. A source attachment identity changes invalidates old current mappings and resets the working budget while preserving append-only history; source reorder does not.
-6. After reconciliation, run `scripts/task_state.py uploads` and finish every listed upload before any new edit. Locate it with its owning `run_id`, revalidate/promote that exact bitmap when necessary, upload it, and call `success`; never regenerate it. Only then, for explicit `--retry-failed`, run `scripts/task_state.py retry` to reset only current non-success targets; accepted local uploads and valid current successes remain intact. Download current `原图` and `爆款图` attachments in attachment order. Validate every image with `scripts/image_qc.py`, classify it, and create source and target contact sheets. On a corrupt or invalid attachment, write the diagnostic to a local file and use `scripts/task_state.py record-error --error-file '<local-error-file>'` with the exact QC-contract code, persist compact detail, mark only that record `失败`, and continue.
-7. Resolve the target instances, source evidence, primary/complementary references, and prepare the complete prompt for every pending target before generation.
-8. Calibrate the record as specified by the QC contract. Then process remaining pending targets serially in original attachment order. Record `attempt` first and use its returned active artifact identity. For every edit invoke `scripts/safe_edit.py --doubao-script '<resolved-doubao-script>' --prompt-file '<prompt-file>' --image '<target>' --image '<primary-source>' ... --out '<immutable-attempt-path>'`; the wrapper invokes the installed `doubao_imagegen.py edit` through an argv array. Pass Image 1 first, Image 2 second, and complementary references through Image 10. Its pinned controls are Seedream 5.0 pro, fixed `--size 2K`, PNG, opaque background, standard prompt optimization, and no watermark.
-9. Allow no more than three paid edits per target in the current source identity and explicit retry cycle. Output/target pixel dimensions and aspect ratio are never QC comparison, rejection, retry, failure, or ranking criteria. Attempts one and two use full QC: stop immediately after an early full-QC pass, promote that artifact, and continue through `accept-local`, upload, and `success`. On a visual rejection, retain the bitmap, call `failure --error-file '<local-error-file>'`, add one targeted prompt correction, and retry the same target. A Doubao failure or absent, incomplete, corrupt, or undecodable artifact also retains its history, calls `failure --error-file '<local-error-file>'`, and retries the same target without a visual prompt correction. After attempt three, compare every complete decodable candidate from the current cycle using the QC contract, promote the selected artifact, and pass that selected artifact name to `accept-local`; it may be an earlier candidate. If attempt three is unusable and no earlier complete decodable candidate exists, call `record-error --code external-call --error-file '<local-error-file>'` directly while attempt three is active; do not expose another pending attempt. On restart, re-inspect a validated active artifact before any new edit. Because a started request may already have been billed, an absent/incomplete artifact conservatively spends that initiated attempt. If the exhausted active artifact is not valid after restart, keep the final-selection checkpoint and either accept an existing revalidated current-cycle candidate or record terminal `external-call`; never start another paid edit. Never regenerate an accepted target because another target fails.
-10. After early visual acceptance or third-attempt selection, use `scripts/image_qc.py promote-output` to atomically create the deterministic local output. Before uploading, call `scripts/task_state.py accept-local` with the selected artifact and deterministic name. Then upload that exact file, call `success` with its attachment token, compact `处理明细`, and update Base. An upload or critical Base-write/readback failure stops immediately under the external-call policy; neither path is a generation retry or repeats a paid edit. An upload failure resumes through `uploads` from the accepted-local checkpoint on the next invocation. A later Base detail-write failure resumes through output reconciliation, which sees the uploaded attachment/current success; neither recovery path repeats a paid edit. Refresh `qc/output-contact-sheet.jpg` as accepted outputs accumulate.
-11. After all eligible work or an early per-record stop, inspect available output evidence, aggregate state with `scripts/task_state.py summary`, and write final `任务状态` plus compact `处理明细` as required by the Base contract. Report compact counts and final status without secrets or raw data URLs.
+Read these contracts before execution:
+
+- [Feishu Base scope and finalization](references/feishu-base.md)
+- [State, planning, recovery, and events](references/task-state.md)
+- [Automatic QC and failure policy](references/qc-and-failures.md)
+
+Stop before mutation or paid work when the exact URL, dependencies, authentication, schema, or selected-record materialization fails preflight.
+
+## Normal workflow
+
+1. Run the table entry once with the requested flags. Let it complete one global preflight, materialize a stable record queue, and schedule records. Do not launch a second independent invocation for the same table.
+2. Let records run concurrently at the configured limit. Keep targets within each record serial in original attachment order. Do not create a persistent run lock or parallelize targets.
+3. Let the pipeline reconcile state and Base first, drain accepted local uploads, inspect active artifacts, create immutable target plans, generate with fixed `--size 2K`, obtain automatic Ark decisions, select within the three-attempt budget, and call the idempotent finalizer.
+4. Report the table result and sanitized event metrics. Never expose secrets, prompts, raw Base64, raw data URLs, authorization headers, or unsanitized external diagnostics.
+
+Do not substitute direct Feishu HTTP, another image-generation path, `generate-batch`, manual per-image approval, or a sequence of target-level shell commands for the normal entry.
+
+## Recovery and diagnosis
+
+Re-run the same table entry to resume. Recovery always reconciles Base, drains `accepted-local` work, and checks an active candidate before starting another paid generation. An upload failure resumes through `uploads`; a later Base detail-write failure resumes through output reconciliation. Neither repeats a paid edit.
+
+Keep these component CLIs for diagnosis and recovery, not as the normal workflow:
+
+- [`scripts/run_record.py`](scripts/run_record.py) inspects one prepared record checkpoint.
+- [`scripts/qc_replay.py`](scripts/qc_replay.py) replays historical QC read-only by default; live Ark requires `--live-ark`.
+- [`scripts/task_state.py`](scripts/task_state.py) supports `bind`, `init`, `init-error`, `reconcile`, `reconcile-error`, `retry`, `record-error`, `attempt`, `accept-local`, `success`, `failure`, `pending`, `uploads`, `compact`, and `summary`. `scripts/task_state.py retry` must reset only current non-success targets. Use `--resumable-artifacts-json` during diagnostic reconciliation and locate pending uploads by their owning `run_id` before any new edit.
+- [`scripts/image_qc.py`](scripts/image_qc.py) validates artifacts, builds labeled contact sheets, and promotes selected outputs.
+- [`scripts/safe_edit.py`](scripts/safe_edit.py) provides argv-safe Seedream transport with `--prompt-file`.
+
+Pass diagnostics through `--error-file`; never put raw diagnostics in argv.
+
+## Runtime map
+
+Use these modules through `run_table.py`; read their source only for diagnosis or extension:
+
+- [`scripts/run_table.py`](scripts/run_table.py): preflight, bounded record scheduling, service limits, and global stop
+- [`scripts/run_record.py`](scripts/run_record.py): serial target orchestration and recovery
+- [`scripts/reference_selector.py`](scripts/reference_selector.py): deterministic three/four-reference selection and evidenced fifth exception
+- [`scripts/prompt_builder.py`](scripts/prompt_builder.py): immutable target plans and controlled corrections
+- [`scripts/infographic_text.py`](scripts/infographic_text.py): literal text/panel/instance inventory gate
+- [`scripts/safe_edit.py`](scripts/safe_edit.py): installed Seedream edit transport
+- [`scripts/image_qc.py`](scripts/image_qc.py): deterministic file validation and promotion
+- [`scripts/ark_vision_qc.py`](scripts/ark_vision_qc.py): exact Ark ChatCompletions transport and same-candidate review
+- [`scripts/vision_qc.py`](scripts/vision_qc.py): strict reports, thresholds, corrections, and garment-first ranking
+- [`scripts/finalize_target.py`](scripts/finalize_target.py): one resumable target transaction
+- [`scripts/lark_runner.py`](scripts/lark_runner.py): typed relative-file `lark-cli` transport
+- [`scripts/task_state.py`](scripts/task_state.py): canonical schema-versioned state and compatibility migration
+- [`scripts/event_log.py`](scripts/event_log.py): sanitized NDJSON events and metrics
+- [`scripts/qc_replay.py`](scripts/qc_replay.py): offline/live opt-in shadow validation
+
+Initialize local record state before attachment validation can fail. Validate every image only after the state is bound. Use `scripts/task_state.py bind` for the canonical state under `~/.codex/state/outfit-swap/tables`; use `reconcile-error`, not `init-error`, for an existing record with missing required attachment lists, and preserve its target entries and attempt histories. A source attachment identity changes invalidates current mappings and resets the working budget while preserving append-only history.
+
+Persist selected artifacts with `scripts/task_state.py accept-local` before finalization. A later Base detail-write failure resumes through output reconciliation, and accepted outputs are never regenerated because another target fails.
