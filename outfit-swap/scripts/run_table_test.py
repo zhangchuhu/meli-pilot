@@ -1244,6 +1244,127 @@ class SemaphoreTest(unittest.TestCase):
                         )
                     self.assertEqual(len(raw.calls), before)
 
+    def test_worker_update_uses_validated_private_snapshot_during_rename_race(
+            self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "update.json"
+            original.write_text(
+                '{ "update_records": { "rec_1": {'
+                ' "处理明细": "allowed" } } }',
+                encoding="utf-8",
+            )
+            raw_entered = threading.Event()
+            allow_raw_read = threading.Event()
+
+            class WriteGate:
+                def __init__(self) -> None:
+                    self._semaphore = threading.BoundedSemaphore(1)
+                    self._lock = threading.Lock()
+                    self.active = False
+
+                def __enter__(self) -> "WriteGate":
+                    self._semaphore.acquire()
+                    with self._lock:
+                        self.active = True
+                    return self
+
+                def __exit__(self, *_args: object) -> None:
+                    with self._lock:
+                        self.active = False
+                    self._semaphore.release()
+
+                def is_active(self) -> bool:
+                    with self._lock:
+                        return self.active
+
+            class ConsumingBase:
+                def __init__(self) -> None:
+                    self.payload_name: str | None = None
+                    self.payload_mode: int | None = None
+                    self.consumed: bytes | None = None
+
+                def update_record(self, **kwargs: object) -> dict:
+                    supplied = kwargs["payload"]
+                    if not isinstance(supplied, Path):
+                        raise AssertionError("payload must remain a filename")
+                    self.payload_name = supplied.name
+                    raw_entered.set()
+                    if not allow_raw_read.wait(timeout=2):
+                        raise AssertionError("raw Base read was not released")
+                    path = root / supplied.name
+                    self.payload_mode = path.stat().st_mode & 0o777
+                    self.consumed = path.read_bytes()
+                    return {"ok": True}
+
+            gate = WriteGate()
+            raw = ConsumingBase()
+            base = BoundedBase(
+                raw,
+                read_semaphore=threading.BoundedSemaphore(2),
+                write_semaphore=gate,
+            ).scoped(_record_scope(payload_root=root))
+            errors: list[BaseException] = []
+
+            def update() -> None:
+                try:
+                    base.update_record(
+                        app_token="app_exact", table_id="tbl_exact",
+                        record_id="rec_1", payload=Path(original.name),
+                    )
+                except BaseException as error:  # pragma: no cover - asserted below
+                    errors.append(error)
+
+            thread = threading.Thread(target=update)
+            thread.start()
+            self.assertTrue(raw_entered.wait(timeout=1))
+            self.assertTrue(gate.is_active())
+
+            replacement = root / "forbidden.json"
+            replacement.write_text(
+                '{"update_records":{"rec_1":{"输出图":[]}}}',
+                encoding="utf-8",
+            )
+            replacement.replace(original)
+            allow_raw_read.set()
+            thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertNotEqual(raw.payload_name, original.name)
+            self.assertEqual(raw.payload_mode, 0o400)
+            self.assertEqual(
+                raw.consumed,
+                '{"update_records":{"rec_1":{"处理明细":"allowed"}}}\n'.encode(),
+            )
+            self.assertIsNotNone(raw.payload_name)
+            self.assertFalse((root / raw.payload_name).exists())
+            self.assertIn("输出图", original.read_text(encoding="utf-8"))
+
+    def test_worker_update_rejects_symlink_payload_before_client_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outside = root / "outside.json"
+            outside.write_text(
+                '{"update_records":{"rec_1":{"处理明细":"allowed"}}}',
+                encoding="utf-8",
+            )
+            (root / "update.json").symlink_to(outside)
+            raw = _Base()
+            base = BoundedBase(
+                raw,
+                read_semaphore=threading.BoundedSemaphore(2),
+                write_semaphore=threading.BoundedSemaphore(1),
+            ).scoped(_record_scope(payload_root=root))
+
+            with self.assertRaises(PreflightError):
+                base.update_record(
+                    app_token="app_exact", table_id="tbl_exact",
+                    record_id="rec_1", payload=Path("update.json"),
+                )
+            self.assertEqual(raw.calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

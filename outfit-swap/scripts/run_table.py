@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -383,6 +384,25 @@ class BoundedBase:
     def update_record(self, **kwargs: object) -> object:
         return self._write("update_record", **kwargs)
 
+    def _update_scoped_record(
+            self, scope: RecordBaseScope, **kwargs: object,
+    ) -> object:
+        method = getattr(self._service, "update_record", None)
+        if not callable(method):
+            raise TableSchedulerError("Base service has no update_record boundary")
+        with self._write_semaphore:
+            decoded = _read_scoped_update(scope, kwargs["payload"])
+            snapshot, identity = _private_update_snapshot(scope, decoded)
+            transport = dict(kwargs)
+            transport["payload"] = Path(snapshot.name)
+            try:
+                _verify_private_snapshot(snapshot, identity)
+                result = method(**transport)
+                _verify_private_snapshot(snapshot, identity)
+                return result
+            finally:
+                _cleanup_private_snapshot(snapshot, identity)
+
 
 class ScopedBase:
     """Reject any record-worker Lark call outside the preflighted scope."""
@@ -435,74 +455,172 @@ class ScopedBase:
         self._scope(kwargs, frozenset({
             "app_token", "table_id", "record_id", "payload",
         }))
-        self._validate_update_payload(kwargs["payload"])
-        return self._base.update_record(**kwargs)
+        return self._base._update_scoped_record(self._scope_value, **kwargs)
 
-    def _validate_update_payload(self, supplied: object) -> None:
-        invalid = False
-        path: Path | None = None
-        if isinstance(supplied, Path):
-            if (supplied.is_absolute() or len(supplied.parts) != 1
-                    or supplied.name in {"", ".", ".."}):
-                invalid = True
-            else:
-                path = self._scope_value.payload_root / supplied.name
-        else:
-            invalid = True
+
+def _read_scoped_update(
+        scope: RecordBaseScope, supplied: object,
+) -> dict[object, object]:
+    invalid = False
+    decoded: object = None
+    if (not isinstance(supplied, Path) or supplied.is_absolute()
+            or len(supplied.parts) != 1
+            or supplied.name in {"", ".", ".."}):
+        invalid = True
+    else:
+        root_fd = source_fd = -1
         try:
-            if (path is None or path.is_symlink() or not path.is_file()
-                    or path.resolve().parent != self._scope_value.payload_root):
-                invalid = True
-                decoded = None
-            else:
+            no_follow = getattr(os, "O_NOFOLLOW", None)
+            if no_follow is None:
+                raise OSError("no-follow file opens are unavailable")
+            root_fd = os.open(
+                scope.payload_root,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            source_fd = os.open(
+                supplied.name,
+                os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=root_fd,
+            )
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise OSError("record update payload is not a regular file")
+            with os.fdopen(source_fd, "r", encoding="utf-8") as stream:
+                source_fd = -1
                 decoded = json.loads(
-                    path.read_text(encoding="utf-8"),
-                    object_pairs_hook=self._unique_json_object,
+                    stream.read(), object_pairs_hook=_unique_json_object,
                 )
         except (OSError, UnicodeError, ValueError):
             invalid = True
             decoded = None
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
 
-        if not isinstance(decoded, dict) or set(decoded) != {"update_records"}:
+    if not isinstance(decoded, dict) or set(decoded) != {"update_records"}:
+        invalid = True
+        updates = None
+    else:
+        updates = decoded["update_records"]
+    if (not isinstance(updates, dict)
+            or set(updates) != {scope.record_id}):
+        invalid = True
+        fields = None
+    else:
+        fields = updates[scope.record_id]
+    allowed = {"任务状态", "处理明细"}
+    if (not isinstance(fields, dict) or not fields
+            or not set(fields).issubset(allowed)):
+        invalid = True
+    else:
+        detail = fields.get("处理明细")
+        status = fields.get("任务状态")
+        if "处理明细" in fields and not isinstance(detail, str):
             invalid = True
-            updates = None
-        else:
-            updates = decoded["update_records"]
-        if (not isinstance(updates, dict)
-                or set(updates) != {self._scope_value.record_id}):
+        if ("任务状态" in fields
+                and (not isinstance(status, list) or len(status) != 1
+                     or not isinstance(status[0], str)
+                     or status[0] not in {"未开始", "成功", "失败"})):
             invalid = True
-            fields = None
-        else:
-            fields = updates[self._scope_value.record_id]
-        allowed = {"任务状态", "处理明细"}
-        if (not isinstance(fields, dict) or not fields
-                or not set(fields).issubset(allowed)):
-            invalid = True
-        else:
-            detail = fields.get("处理明细")
-            status = fields.get("任务状态")
-            if "处理明细" in fields and not isinstance(detail, str):
-                invalid = True
-            if ("任务状态" in fields
-                    and (not isinstance(status, list) or len(status) != 1
-                         or not isinstance(status[0], str)
-                         or status[0] not in {"未开始", "成功", "失败"})):
-                invalid = True
-        if invalid:
-            raise PreflightError(
-                "record update payload escaped field capability scope",
-            )
+    if invalid:
+        raise PreflightError(
+            "record update payload escaped field capability scope",
+        )
+    return decoded
 
-    @staticmethod
-    def _unique_json_object(
-            pairs: list[tuple[object, object]],
-    ) -> dict[object, object]:
-        decoded: dict[object, object] = {}
-        for key, value in pairs:
-            if key in decoded:
-                raise ValueError("duplicate JSON key")
-            decoded[key] = value
-        return decoded
+
+def _unique_json_object(
+        pairs: list[tuple[object, object]],
+) -> dict[object, object]:
+    decoded: dict[object, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError("duplicate JSON key")
+        decoded[key] = value
+    return decoded
+
+
+def _private_update_snapshot(
+        scope: RecordBaseScope, decoded: dict[object, object],
+) -> tuple[Path, tuple[int, int, str]]:
+    descriptor = -1
+    snapshot: Path | None = None
+    try:
+        descriptor, filename = tempfile.mkstemp(
+            prefix=".scoped-update-", suffix=".json",
+            dir=scope.payload_root,
+        )
+        snapshot = Path(filename)
+        identity = os.fstat(descriptor)
+        canonical = (
+            json.dumps(
+                decoded, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
+        ).encode("utf-8")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(canonical)
+            stream.flush()
+            os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), stat.S_IRUSR)
+        return snapshot, (
+            identity.st_dev, identity.st_ino,
+            hashlib.sha256(canonical).hexdigest(),
+        )
+    except (OSError, TypeError, ValueError):
+        if descriptor >= 0:
+            os.close(descriptor)
+        if snapshot is not None:
+            try:
+                snapshot.unlink()
+            except OSError:
+                pass
+        raise PreflightError("private record update snapshot failed") from None
+
+
+def _verify_private_snapshot(
+        snapshot: Path, identity: tuple[int, int, str],
+) -> None:
+    descriptor = -1
+    try:
+        no_follow = getattr(os, "O_NOFOLLOW", None)
+        if no_follow is None:
+            raise OSError("no-follow file opens are unavailable")
+        descriptor = os.open(
+            snapshot,
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+        )
+        observed = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if (not stat.S_ISREG(observed.st_mode)
+                or (observed.st_dev, observed.st_ino) != identity[:2]
+                or observed.st_mode & 0o777 != stat.S_IRUSR
+                or digest.hexdigest() != identity[2]):
+            raise OSError("private update snapshot identity changed")
+    except OSError:
+        raise PreflightError("private record update snapshot changed") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _cleanup_private_snapshot(
+        snapshot: Path, identity: tuple[int, int, str],
+) -> None:
+    try:
+        observed = snapshot.stat(follow_symlinks=False)
+        if (stat.S_ISREG(observed.st_mode)
+                and (observed.st_dev, observed.st_ino) == identity[:2]):
+            snapshot.unlink()
+    except FileNotFoundError:
+        pass
 
 
 class SeedreamGeneratorAdapter:
