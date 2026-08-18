@@ -296,11 +296,14 @@ class RunRecordTest(unittest.TestCase):
             target_indices=tuple(range(targets)),
         )
 
-    def services(self, *, events: object | None = None) -> RecordServices:
+    def services(
+            self, *, events: object | None = None,
+            qc_mode: str = "automatic",
+    ) -> RecordServices:
         return RecordServices(
             generator=self.generator, qc=self.qc, finalizer=self.finalizer,
             events=self.events if events is None else events,
-            stop_signal=self.stop, clock=self.clock,
+            stop_signal=self.stop, clock=self.clock, qc_mode=qc_mode,
         )
 
     def active_artifact(self, state: dict, index: int = 0) -> Path:
@@ -381,6 +384,43 @@ class RunRecordTest(unittest.TestCase):
             state["targets"][token]["status"] == "success"
             for token in state["target_tokens"]
         ))
+
+    def test_shadow_qc_observes_rejection_but_does_not_control_retry_or_finalization(self) -> None:
+        context = self.initialize()
+        self.qc.responses[(0, 1)] = lambda request: report(
+            request.candidate.name, garment=70,
+            defects=(vision_qc.DefectCode.OPEN_FRONT,), decision="retry",
+        )
+
+        result = run_record(context, self.services(qc_mode="shadow"))
+
+        state = task_state.load_state(self.state_file)
+        target = state["targets"]["box_target_1"]
+        self.assertEqual((result.status, result.accepted_targets), ("success", 1))
+        self.assertEqual([(call.attempt) for call in self.generator.calls], [1])
+        self.assertEqual([(call.attempt) for call in self.qc.calls], [1])
+        self.assertEqual(len(self.finalizer.calls), 1)
+        self.assertTrue(self.finalizer.calls[0].candidate.name.endswith("-01.png"))
+        self.assertEqual(target["attempts"], 1)
+        self.assertEqual(target["status"], "success")
+        self.assertEqual(len(target["qc_reports"]), 1)
+        self.assertEqual(
+            target["qc_reports"][0]["report"]["primary_defect"], "open_front",
+        )
+        self.assertEqual(
+            target["selection_reason"]["reason"],
+            "shadow QC observation; deterministic candidate acceptance",
+        )
+        self.assertFalse(any(
+            item["event"] == "retry_decided" for item in self.events.items
+        ))
+        shadow_finish = next(
+            item for item in self.events.items
+            if item["event"] == "qc_finished"
+        )
+        self.assertEqual(shadow_finish["status"], "reject")
+        self.assertEqual(shadow_finish["defect"], "open_front")
+        self.assertEqual(shadow_finish["scores"]["garment_construction"], 70)
 
     def test_three_rejections_select_the_garment_best_candidate(self) -> None:
         context = self.initialize()

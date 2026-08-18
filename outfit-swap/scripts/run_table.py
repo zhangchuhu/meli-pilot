@@ -10,7 +10,7 @@ import os
 import tempfile
 import threading
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -105,6 +105,30 @@ class TableScope:
                 self.app_token, self.table_id, self.view_id,
         )):
             raise PreflightError("exact Base table and view scope is required")
+
+
+@dataclass(frozen=True)
+class RecordBaseScope:
+    table: TableScope
+    record_id: str
+    attachment_tokens: frozenset[str]
+    output_field_id: str
+    detail_field_id: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.table, TableScope)
+                or not isinstance(self.record_id, str) or not self.record_id
+                or not isinstance(self.attachment_tokens, frozenset)
+                or not all(
+                    isinstance(token, str) and token
+                    for token in self.attachment_tokens
+                )
+                or not isinstance(self.output_field_id, str)
+                or not self.output_field_id
+                or not isinstance(self.detail_field_id, str)
+                or not self.detail_field_id
+                or self.output_field_id == self.detail_field_id):
+            raise PreflightError("record Base capability scope is invalid")
 
 
 @dataclass(frozen=True)
@@ -305,10 +329,8 @@ class BoundedBase:
         self._read_semaphore = read_semaphore
         self._write_semaphore = write_semaphore
 
-    def scoped(
-            self, scope: TableScope, record_ids: Iterable[str],
-    ) -> "ScopedBase":
-        return ScopedBase(self, scope, frozenset(record_ids))
+    def scoped(self, scope: RecordBaseScope) -> "ScopedBase":
+        return ScopedBase(self, scope)
 
     def _read(self, name: str, *args: object, **kwargs: object) -> object:
         method = getattr(self._service, name, None)
@@ -352,54 +374,54 @@ class BoundedBase:
 class ScopedBase:
     """Reject any record-worker Lark call outside the preflighted scope."""
 
-    def __init__(
-            self, base: BoundedBase, scope: TableScope,
-            record_ids: frozenset[str],
-    ) -> None:
-        if not record_ids or not all(
-                isinstance(record_id, str) and record_id for record_id in record_ids
-        ):
+    def __init__(self, base: BoundedBase, scope: RecordBaseScope) -> None:
+        if not isinstance(scope, RecordBaseScope):
             raise PreflightError("record scope is invalid")
         self._base = base
         self._scope_value = scope
-        self._record_ids = record_ids
 
-    def _scope(self, kwargs: dict[str, object]) -> None:
+    def _scope(self, kwargs: dict[str, object], expected_keys: frozenset[str]) -> None:
+        if set(kwargs) != expected_keys:
+            raise PreflightError("record Base call arguments are outside capability scope")
         token = kwargs.get("app_token", kwargs.get("base_token"))
-        if token != self._scope_value.app_token:
+        if token != self._scope_value.table.app_token:
             raise PreflightError("Base call escaped the preflighted app scope")
-        if kwargs.get("table_id") != self._scope_value.table_id:
+        if kwargs.get("table_id") != self._scope_value.table.table_id:
             raise PreflightError("Base call escaped the preflighted table scope")
-        record_id = kwargs.get("record_id")
-        if record_id is not None and record_id not in self._record_ids:
+        if kwargs.get("record_id") != self._scope_value.record_id:
             raise PreflightError("Base call escaped the active record scope")
 
-    def list_fields(self, **kwargs: object) -> object:
-        self._scope(kwargs)
-        return self._base.list_fields(**kwargs)
-
-    def list_records(self, **kwargs: object) -> object:
-        self._scope(kwargs)
-        return self._base.list_records(**kwargs)
-
     def download_attachment(self, **kwargs: object) -> object:
-        self._scope(kwargs)
+        self._scope(kwargs, frozenset({
+            "app_token", "table_id", "record_id", "token", "output",
+        }))
+        if kwargs["token"] not in self._scope_value.attachment_tokens:
+            raise PreflightError("attachment token is outside the active record scope")
         return self._base.download_attachment(**kwargs)
 
     def get_record(self, **kwargs: object) -> object:
-        self._scope(kwargs)
+        self._scope(kwargs, frozenset({
+            "app_token", "table_id", "record_id", "field_ids",
+        }))
+        if kwargs["field_ids"] != [
+                self._scope_value.output_field_id,
+                self._scope_value.detail_field_id,
+        ]:
+            raise PreflightError("Base read fields escaped the record capability scope")
         return self._base.get_record(**kwargs)
 
-    def create_field(self, **kwargs: object) -> object:
-        self._scope(kwargs)
-        return self._base.create_field(**kwargs)
-
     def upload_attachment(self, **kwargs: object) -> object:
-        self._scope(kwargs)
+        self._scope(kwargs, frozenset({
+            "app_token", "table_id", "record_id", "field_id", "file",
+        }))
+        if kwargs["field_id"] != self._scope_value.output_field_id:
+            raise PreflightError("Base upload field escaped the record capability scope")
         return self._base.upload_attachment(**kwargs)
 
     def update_record(self, **kwargs: object) -> object:
-        self._scope(kwargs)
+        self._scope(kwargs, frozenset({
+            "app_token", "table_id", "record_id", "payload",
+        }))
         return self._base.update_record(**kwargs)
 
 
@@ -411,6 +433,7 @@ class SeedreamGeneratorAdapter:
     def __init__(
             self, *, doubao_script: str | Path, planner: object,
             image_resolver: Callable[[GenerationRequest], Iterable[Path]],
+            approved_run_roots: Iterable[Path],
             artifact_resolver: Callable[
                 [RecordContext, dict[str, object]], Path
             ] | None = None,
@@ -424,10 +447,20 @@ class SeedreamGeneratorAdapter:
             raise TypeError("generation image resolver must be callable")
         if artifact_resolver is not None and not callable(artifact_resolver):
             raise TypeError("artifact resolver must be callable")
+        if isinstance(approved_run_roots, (str, bytes, Path)):
+            raise TypeError("approved run roots must be an iterable of directories")
+        try:
+            run_roots = tuple(Path(root).resolve() for root in approved_run_roots)
+        except (OSError, TypeError, ValueError):
+            raise TableSchedulerError("approved run roots are invalid") from None
+        if (not run_roots or len(set(run_roots)) != len(run_roots)
+                or not all(root.is_dir() for root in run_roots)):
+            raise TableSchedulerError("approved run roots are invalid")
         self._doubao_script = script
         self._planner = planner
         self._image_resolver = image_resolver
         self._artifact_resolver = artifact_resolver
+        self._approved_run_roots = run_roots
 
     def plan_target(
             self, context: RecordContext, target_index: int, target_token: str,
@@ -446,16 +479,33 @@ class SeedreamGeneratorAdapter:
             self, context: RecordContext, history: dict[str, object],
     ) -> Path:
         name = history.get("artifact_name")
-        if not isinstance(name, str) or not name or Path(name).name != name:
+        run_id = history.get("run_id")
+        if (not isinstance(name, str) or not name or Path(name).name != name
+                or not isinstance(run_id, str) or not run_id
+                or Path(run_id).name != run_id):
             raise TableSchedulerError("attempt artifact identity is invalid")
         value = (
             self._artifact_resolver(context, history)
             if self._artifact_resolver is not None
             else Path(context.task_dir).resolve() / "generated_images" / name
         )
-        path = Path(value).resolve()
-        if path.name != name:
+        supplied = Path(value)
+        path = supplied.resolve()
+        if (path.name != name or supplied.is_symlink()
+                or not self._is_approved(path)):
             raise TableSchedulerError("artifact resolver changed the immutable identity")
+        current = (
+            Path(context.task_dir).resolve() / "generated_images" / name
+        )
+        if path.exists():
+            if not path.is_file():
+                raise TableSchedulerError("resolved attempt artifact is not a regular file")
+            if path != current and path not in self._prior_artifact_identities(
+                    run_id, context.record_id, name,
+            ):
+                raise TableSchedulerError("prior-run attempt identity is invalid")
+        elif path != current:
+            raise TableSchedulerError("prior-run attempt artifact is missing")
         return path
 
     def generate(self, request: GenerationRequest) -> Path:
@@ -466,7 +516,8 @@ class SeedreamGeneratorAdapter:
             Path(request.context.task_dir).resolve()
             / "generated_images" / request.artifact_name
         )
-        if output != expected or output.exists() or output.is_symlink():
+        if (output != expected or not self._is_approved(output)
+                or output.exists() or output.is_symlink()):
             raise TableSchedulerError("generation output escaped its immutable path")
         try:
             images = [Path(path).resolve() for path in self._image_resolver(request)]
@@ -500,6 +551,27 @@ class SeedreamGeneratorAdapter:
         if resolved != output:
             raise TableSchedulerError("Seedream transport returned the wrong artifact")
         return resolved
+
+    def _is_approved(self, path: Path) -> bool:
+        for root in self._approved_run_roots:
+            try:
+                path.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _prior_artifact_identities(
+            self, run_id: str, record_id: str, name: str,
+    ) -> frozenset[Path]:
+        identities: set[Path] = set()
+        for root in self._approved_run_roots:
+            identities.add(
+                root / run_id / record_id / "generated_images" / name,
+            )
+            if root.name == run_id:
+                identities.add(root / record_id / "generated_images" / name)
+        return frozenset(identities)
 
 
 class RecordFinalizerAdapter:
@@ -638,6 +710,7 @@ class ProductionRecordServicesFactory:
             events=events,
             stop_signal=stop_signal,
             clock=self._clock,
+            qc_mode=qc_mode,
         )
 
 
@@ -743,7 +816,7 @@ class TableScheduler:
         if not isinstance(runtime, TableRuntime):
             raise TypeError("table runtime is required")
         self._runtime = runtime
-        self._limits = limits or ServiceLimits()
+        self._injected_limits = limits
         self._active: set[str] = set()
         self._active_lock = threading.Lock()
 
@@ -755,20 +828,30 @@ class TableScheduler:
     def run(self, config: TableConfig) -> TableResult:
         if not isinstance(config, TableConfig):
             raise TypeError("table configuration is required")
+        limits = (
+            replace(ServiceLimits(), record_workers=config.record_concurrency)
+            if self._injected_limits is None else replace(
+                self._injected_limits,
+                record_workers=min(
+                    config.record_concurrency,
+                    self._injected_limits.record_workers,
+                ),
+            )
+        )
         stop_signal = GlobalStop()
         bounded_base = BoundedBase(
             self._runtime.base,
-            read_semaphore=threading.BoundedSemaphore(self._limits.lark_reads),
-            write_semaphore=threading.BoundedSemaphore(self._limits.lark_writes),
+            read_semaphore=threading.BoundedSemaphore(limits.lark_reads),
+            write_semaphore=threading.BoundedSemaphore(limits.lark_writes),
         )
         bounded_generator = BoundedGenerator(
             self._runtime.generator,
-            threading.BoundedSemaphore(self._limits.doubao_requests),
+            threading.BoundedSemaphore(limits.doubao_requests),
             stop_signal,
         )
         bounded_qc = BoundedQC(
             self._runtime.qc,
-            threading.BoundedSemaphore(self._limits.qc_requests),
+            threading.BoundedSemaphore(limits.qc_requests),
             stop_signal,
         )
 
@@ -780,7 +863,7 @@ class TableScheduler:
         succeeded = failed = stopped = 0
         next_index = 0
         futures: dict[Future[RecordResult], str] = {}
-        worker_count = config.record_concurrency
+        worker_count = limits.record_workers
         with ThreadPoolExecutor(
                 max_workers=worker_count, thread_name_prefix="outfit-record",
         ) as executor:
@@ -792,7 +875,7 @@ class TableScheduler:
                     next_index += 1
                     self._claim(context.record_id)
                     future = executor.submit(
-                        self._run_one, context, scope, config.qc_mode,
+                        self._run_one, context, scope, schema, config.qc_mode,
                         bounded_generator, bounded_qc, bounded_base, stop_signal,
                     )
                     futures[future] = context.record_id
@@ -808,6 +891,7 @@ class TableScheduler:
                     if result.status == "success":
                         succeeded += 1
                     elif result.status == "stopped":
+                        stop_signal.set()
                         stopped += 1
                     else:
                         failed += 1
@@ -849,18 +933,31 @@ class TableScheduler:
             self._active.add(record_id)
 
     def _run_one(
-            self, context: RecordContext, scope: TableScope, qc_mode: str,
+            self, context: RecordContext, scope: TableScope,
+            schema: TableSchema, qc_mode: str,
             generator: BoundedGenerator, qc: BoundedQC, base: BoundedBase,
             stop_signal: GlobalStop,
     ) -> RecordResult:
         try:
             if stop_signal.is_set():
                 return RecordResult(context.record_id, "stopped", 0)
-            scoped_base = base.scoped(scope, {context.record_id})
+            record_scope = self._runtime.adapter.record_base_scope(
+                context, scope, schema,
+            )
+            if (not isinstance(record_scope, RecordBaseScope)
+                    or record_scope.table != scope
+                    or record_scope.record_id != context.record_id
+                    or record_scope.output_field_id
+                    != schema.field("输出图").field_id
+                    or record_scope.detail_field_id
+                    != schema.field("处理明细").field_id):
+                raise TableSchedulerError("record Base scope escaped global preflight")
+            scoped_base = base.scoped(record_scope)
             services = self._runtime.adapter.record_services(
                 context, generator, qc, scoped_base, stop_signal, qc_mode,
             )
-            if not isinstance(services, RecordServices):
+            if (not isinstance(services, RecordServices)
+                    or services.qc_mode != qc_mode):
                 raise TableSchedulerError("record service factory returned invalid services")
             if stop_signal.is_set():
                 return RecordResult(context.record_id, "stopped", 0)

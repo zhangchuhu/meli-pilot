@@ -47,6 +47,7 @@ class RecordServices:
     events: object
     stop_signal: object
     clock: Callable[[], str] = _utc_now
+    qc_mode: str = "automatic"
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,8 @@ def _validate_context(
         raise RecordWorkerError("record context is invalid")
     if not callable(services.clock):
         raise RecordWorkerError("record clock is invalid")
+    if services.qc_mode not in {"automatic", "shadow"}:
+        raise RecordWorkerError("record QC mode is invalid")
     state_file = root / "manifest.json"
     if not state_file.is_file():
         raise RecordWorkerError("record manifest is missing")
@@ -475,6 +478,34 @@ def _apply_candidate_qc(
             return "stopped"
     else:
         report = persisted
+
+    if services.qc_mode == "shadow":
+        observed_accept = vision_qc.early_accept(
+            report, infographic=plan.classification == "infographic",
+        )
+        observed_defect = vision_qc.correction_for(report)
+        state = task_state.load_state(state_file)
+        task_state.record_selection_reason(state, target_index, {
+            "artifact_name": active["artifact_name"],
+            "artifact_sha256": digest,
+            "attempt": active["attempt"],
+            "reason": "shadow QC observation; deterministic candidate acceptance",
+        })
+        task_state.save_state(state_file, state)
+        _event(
+            services, "qc_finished", record_id=context.record_id,
+            target_id=token, run_id=active["run_id"], attempt=active["attempt"],
+            status="early_accept" if observed_accept else "reject",
+            phase="qc", candidate_digest=digest,
+            scores=_event_scores(report),
+            **(
+                {"defect": observed_defect.value}
+                if observed_defect is not None else {}
+            ),
+        )
+        return _finalize_candidate(
+            context, state_file, target_index, candidate, digest, services,
+        ) or "completed"
 
     if active["attempt"] >= task_state.MAX_ATTEMPTS:
         return _select_after_third_attempt(

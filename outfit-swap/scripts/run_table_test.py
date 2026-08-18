@@ -31,6 +31,7 @@ from scripts.run_table import (
     PaidCallStopped,
     PreflightError,
     ProductionRecordServicesFactory,
+    RecordBaseScope,
     RecordFinalizerAdapter,
     SeedreamGeneratorAdapter,
     ServiceLimits,
@@ -38,6 +39,7 @@ from scripts.run_table import (
     TableResult,
     TableRuntime,
     TableScheduler,
+    TableSchedulerError,
     TableSchema,
     TableScope,
     main,
@@ -69,6 +71,9 @@ class _Service:
 
     def review(self, request: object) -> object:
         self.calls += 1
+        callback = getattr(request, "on_review", None)
+        if callback is not None:
+            callback()
         return request
 
 
@@ -127,6 +132,19 @@ def _schema(*, missing: str | None = None, drift: str | None = None) -> TableSch
     return TableSchema(tuple(fields))
 
 
+def _record_scope(
+        record_id: str = "rec_1", *,
+        attachment_tokens: frozenset[str] = frozenset({"box_source_1"}),
+) -> RecordBaseScope:
+    return RecordBaseScope(
+        table=TableScope("app_exact", "tbl_exact", "vew_exact"),
+        record_id=record_id,
+        attachment_tokens=attachment_tokens,
+        output_field_id="fld_output",
+        detail_field_id="fld_detail",
+    )
+
+
 class _Adapter:
     def __init__(
             self, contexts: list[RecordContext], *, schema: TableSchema | None = None,
@@ -177,6 +195,19 @@ class _Adapter:
             finalizer=base,
             events=_Events(),
             stop_signal=stop_signal,
+            qc_mode=qc_mode,
+        )
+
+    def record_base_scope(
+            self, context: RecordContext, scope: TableScope,
+            schema: TableSchema,
+    ) -> RecordBaseScope:
+        return RecordBaseScope(
+            table=scope,
+            record_id=context.record_id,
+            attachment_tokens=frozenset({"box_source_1", "box_target_1"}),
+            output_field_id=schema.field("输出图").field_id,
+            detail_field_id=schema.field("处理明细").field_id,
         )
 
 
@@ -280,6 +311,92 @@ class CLIAndPreflightTest(unittest.TestCase):
 
 
 class SchedulerTest(unittest.TestCase):
+    def _observed_record_concurrency(
+            self, *, configured: int, expected: int,
+            limits: ServiceLimits | None = None,
+    ) -> int:
+        root = Path(tempfile.mkdtemp())
+        contexts = [
+            RecordContext(root / f"r{index}", f"rec_{index}", (0,))
+            for index in range(6)
+        ]
+        lock = threading.Lock()
+        reached = threading.Event()
+        release = threading.Event()
+        active = 0
+        maximum = 0
+
+        def worker(context: RecordContext, _services: RecordServices) -> RecordResult:
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == expected:
+                    reached.set()
+            release.wait(timeout=2)
+            with lock:
+                active -= 1
+            return RecordResult(context.record_id, "success", 1)
+
+        scheduler = TableScheduler(_runtime(_Adapter(contexts), worker), limits=limits)
+        result: list[TableResult] = []
+        exit_codes: list[int] = []
+
+        def execute(config: TableConfig) -> TableResult:
+            value = scheduler.run(config)
+            result.append(value)
+            return value
+
+        def invoke_cli() -> None:
+            with redirect_stdout(io.StringIO()):
+                exit_codes.append(main([
+                    "https://base.example/table",
+                    "--record-concurrency", str(configured),
+                ], execute=execute))
+
+        thread = threading.Thread(target=invoke_cli)
+        thread.start()
+        observed = reached.wait(timeout=1)
+        time.sleep(0.02)
+        release.set()
+        thread.join(timeout=3)
+        self.assertTrue(observed)
+        self.assertEqual(exit_codes, [0])
+        self.assertEqual(result, [TableResult(6, 6, 0, 0)])
+        return maximum
+
+    def test_record_concurrency_default_override_and_injected_safety_cap(self) -> None:
+        self.assertEqual(self._observed_record_concurrency(
+            configured=2, expected=2,
+        ), 2)
+        self.assertEqual(self._observed_record_concurrency(
+            configured=4, expected=4,
+        ), 4)
+        self.assertEqual(self._observed_record_concurrency(
+            configured=4, expected=2, limits=ServiceLimits(record_workers=2),
+        ), 2)
+
+    def test_worker_stopped_result_sets_global_stop_before_later_dispatch(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        contexts = [
+            RecordContext(root / f"r{index}", f"rec_{index}", (0,))
+            for index in range(3)
+        ]
+        calls: list[str] = []
+
+        def worker(context: RecordContext, _services: RecordServices) -> RecordResult:
+            calls.append(context.record_id)
+            return RecordResult(context.record_id, "stopped", 0)
+
+        result = TableScheduler(_runtime(_Adapter(contexts), worker)).run(
+            TableConfig(
+                "https://base.example/table", record_concurrency=1,
+            ),
+        )
+
+        self.assertEqual(calls, ["rec_0"])
+        self.assertEqual(result, TableResult(3, 0, 0, 3))
+
     def test_records_are_bounded_targets_are_not_split_and_failures_are_independent(self) -> None:
         root = Path(tempfile.mkdtemp())
         contexts = [
@@ -400,6 +517,51 @@ class SchedulerTest(unittest.TestCase):
                 self.assertEqual(runtime.generator.calls, 1)
                 self.assertEqual(result, TableResult(4, 1, 0, 3))
 
+    def test_global_stop_race_blocks_waiting_and_queued_qc_ten_times(self) -> None:
+        @dataclass
+        class Request:
+            on_review: object
+
+        for iteration in range(10):
+            with self.subTest(iteration=iteration):
+                root = Path(tempfile.mkdtemp())
+                contexts = [
+                    RecordContext(root / f"r{index}", f"rec_{index}", (0,))
+                    for index in range(4)
+                ]
+                adapter = _Adapter(contexts)
+                first_started = threading.Event()
+
+                def worker(
+                        context: RecordContext, services: RecordServices,
+                ) -> RecordResult:
+                    if context.record_id != "rec_0":
+                        first_started.wait(timeout=1)
+
+                    def stop_after_first_start() -> None:
+                        first_started.set()
+                        services.stop_signal.set()
+
+                    callback = (
+                        stop_after_first_start
+                        if context.record_id == "rec_0" else lambda: None
+                    )
+                    try:
+                        services.qc.review(Request(callback))
+                    except PaidCallStopped:
+                        return RecordResult(context.record_id, "stopped", 0)
+                    return RecordResult(context.record_id, "success", 0)
+
+                runtime = _runtime(adapter, worker)
+                result = TableScheduler(runtime, limits=ServiceLimits(
+                    record_workers=2, doubao_requests=2, qc_requests=1,
+                    lark_writes=1, lark_reads=2,
+                )).run(TableConfig(
+                    "https://base.example/table", record_concurrency=2,
+                ))
+                self.assertEqual(runtime.qc.calls, 1)
+                self.assertEqual(result, TableResult(4, 1, 0, 3))
+
 
 class ProductionAdapterTest(unittest.TestCase):
     def test_record_reconciliation_accepts_the_canonical_manifest_symlink(self) -> None:
@@ -479,7 +641,7 @@ class ProductionAdapterTest(unittest.TestCase):
             scoped = BoundedBase(
                 raw, read_semaphore=threading.BoundedSemaphore(2),
                 write_semaphore=threading.BoundedSemaphore(1),
-            ).scoped(TableScope("app_exact", "tbl_exact", "vew_exact"), {"rec_1"})
+            ).scoped(_record_scope())
             finalizer = RecordFinalizerAdapter(
                 base=scoped, app_token="app_exact", table_id="tbl_exact",
                 output_field_id="fld_output", detail_field_id="fld_detail",
@@ -522,6 +684,7 @@ class ProductionAdapterTest(unittest.TestCase):
         self.assertIs(services.qc, qc)
         self.assertIs(services.events, events)
         self.assertIs(services.stop_signal, stop)
+        self.assertEqual(services.qc_mode, "shadow")
         self.assertIsInstance(services.finalizer, RecordFinalizerAdapter)
         self.assertEqual(services.finalizer.qc_mode, "shadow")
 
@@ -554,6 +717,7 @@ class ProductionAdapterTest(unittest.TestCase):
                 doubao_script=doubao_script,
                 planner=lambda *_args: plan,
                 image_resolver=lambda _request: (target, source),
+                approved_run_roots=(root,),
             )
 
             def fixed_edit(**kwargs: object) -> Path:
@@ -581,17 +745,55 @@ class ProductionAdapterTest(unittest.TestCase):
                 root / "prior" / "rec_1" / "generated_images"
                 / "attempt-01-aaaaaaaaaaaa-01.png"
             )
+            prior_artifact.parent.mkdir(parents=True)
+            prior_artifact.write_bytes(b"prior candidate")
             adapter = SeedreamGeneratorAdapter(
                 doubao_script=doubao_script,
                 planner=lambda *_args: object(),
                 image_resolver=lambda _request: (),
                 artifact_resolver=lambda _context, _history: prior_artifact,
+                approved_run_roots=(root,),
             )
 
             self.assertEqual(adapter.artifact_path(context, {
                 "run_id": "prior",
                 "artifact_name": prior_artifact.name,
             }), prior_artifact.resolve())
+
+    def test_prior_run_artifacts_cannot_escape_approved_roots_or_use_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            approved = root / "approved-runs"
+            approved.mkdir()
+            outside = root / "outside" / "attempt-01-aaaaaaaaaaaa-01.png"
+            outside.parent.mkdir()
+            outside.write_bytes(b"outside candidate")
+            link = approved / "prior" / "rec_1" / "generated_images" / outside.name
+            link.parent.mkdir(parents=True)
+            link.symlink_to(outside)
+            wrong_run = approved / "other" / "rec_1" / "generated_images" / outside.name
+            wrong_run.parent.mkdir(parents=True)
+            wrong_run.write_bytes(b"wrong owning run")
+            doubao_script = root / "doubao_imagegen.py"
+            doubao_script.write_text("# fixed transport", encoding="utf-8")
+            context = RecordContext(approved / "current" / "rec_1", "rec_1", (0,))
+            history = {"run_id": "prior", "artifact_name": outside.name}
+
+            for label, resolved in (
+                    ("outside", outside),
+                    ("symlink", link),
+                    ("wrong-run-identity", wrong_run),
+            ):
+                with self.subTest(label=label):
+                    adapter = SeedreamGeneratorAdapter(
+                        doubao_script=doubao_script,
+                        planner=lambda *_args: object(),
+                        image_resolver=lambda _request: (),
+                        artifact_resolver=lambda _context, _history, value=resolved: value,
+                        approved_run_roots=(approved,),
+                    )
+                    with self.assertRaises(TableSchedulerError):
+                        adapter.artifact_path(context, history)
 
 
 class SemaphoreTest(unittest.TestCase):
@@ -817,11 +1019,11 @@ class SemaphoreTest(unittest.TestCase):
             raw,
             read_semaphore=threading.BoundedSemaphore(limits.lark_reads),
             write_semaphore=threading.BoundedSemaphore(limits.lark_writes),
-        ).scoped(TableScope("app_exact", "tbl_exact", "vew_exact"), {"rec_1"})
+        ).scoped(_record_scope())
 
         read_threads = [threading.Thread(target=base.get_record, kwargs={
             "app_token": "app_exact", "table_id": "tbl_exact",
-            "record_id": "rec_1",
+            "record_id": "rec_1", "field_ids": ["fld_output", "fld_detail"],
         }) for _ in range(6)]
         for thread in read_threads:
             thread.start()
@@ -848,11 +1050,72 @@ class SemaphoreTest(unittest.TestCase):
         with self.assertRaises(PreflightError):
             base.get_record(
                 app_token="app_other", table_id="tbl_exact", record_id="rec_1",
+                field_ids=["fld_output", "fld_detail"],
             )
         with self.assertRaises(PreflightError):
             base.get_record(
                 app_token="app_exact", table_id="tbl_exact", record_id="rec_2",
+                field_ids=["fld_output", "fld_detail"],
             )
+
+    def test_worker_base_capabilities_block_scope_escape_before_client_call(self) -> None:
+        raw = _Base()
+        base = BoundedBase(
+            raw,
+            read_semaphore=threading.BoundedSemaphore(2),
+            write_semaphore=threading.BoundedSemaphore(1),
+        ).scoped(_record_scope(attachment_tokens=frozenset({"box_source_1"})))
+
+        base.get_record(
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            field_ids=["fld_output", "fld_detail"],
+        )
+        base.download_attachment(
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            token="box_source_1", output=Path("source.png"),
+        )
+        base.upload_attachment(
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            field_id="fld_output", file=Path("output.png"),
+        )
+        base.update_record(
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            payload=Path("update.json"),
+        )
+        self.assertEqual(len(raw.calls), 4)
+
+        def blocked(method, **kwargs: object) -> None:
+            before = len(raw.calls)
+            with self.assertRaises(PreflightError):
+                method(**kwargs)
+            self.assertEqual(len(raw.calls), before)
+
+        exact_read = {
+            "app_token": "app_exact", "table_id": "tbl_exact",
+            "record_id": "rec_1", "field_ids": ["fld_output", "fld_detail"],
+        }
+        for changed in (
+            {**exact_read, "app_token": "app_other"},
+            {**exact_read, "table_id": "tbl_other"},
+            {**exact_read, "record_id": "rec_other"},
+            {**exact_read, "field_ids": ["fld_output"]},
+            {**exact_read, "view_id": "vew_other"},
+        ):
+            blocked(base.get_record, **changed)
+        blocked(
+            base.download_attachment,
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            token="box_unapproved", output=Path("source.png"),
+        )
+        blocked(
+            base.upload_attachment,
+            app_token="app_exact", table_id="tbl_exact", record_id="rec_1",
+            field_id="fld_detail", file=Path("output.png"),
+        )
+        self.assertFalse(hasattr(base, "list_records"))
+        self.assertFalse(hasattr(base, "list_fields"))
+        self.assertFalse(hasattr(base, "create_field"))
+        self.assertFalse(hasattr(base, "resolve_base"))
 
 
 if __name__ == "__main__":
