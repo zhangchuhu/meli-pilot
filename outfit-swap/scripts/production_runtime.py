@@ -1196,7 +1196,8 @@ class ProductionTableAdapter:
                     updated_at=started,
                     resumable_artifacts=self._resumable_artifacts(state, generated),
                 )
-            if retry_failed and sources and targets:
+            if (retry_failed and sources and targets
+                    and state["current_target"] is None):
                 task_state.prepare_retry(state, updated_at=started)
             task_state.save_state(manifest, state)
         image_qc.build_empty_contact_sheet(

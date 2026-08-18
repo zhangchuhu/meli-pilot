@@ -351,6 +351,131 @@ class StandaloneEntryTest(unittest.TestCase):
 
 
 class ProductionRuntimeContractTest(unittest.TestCase):
+    def test_retry_failed_resumes_exhausted_comparative_checkpoint_without_reset(self) -> None:
+        from scripts import production_runtime, prompt_builder, task_state, vision_qc
+        from scripts.run_record import run_record
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            prior_generated = runs / "prior" / "rec_1" / "generated_images"
+            prior_generated.mkdir(parents=True)
+            state_root = root / "state"
+            state_path = task_state.canonical_state_path(
+                state_root, "app_exact", "tbl_exact", "rec_1",
+            )
+            state_path.parent.mkdir(parents=True)
+            plan = prompt_builder.TargetPlan(
+                classification="front",
+                selected_references=(prompt_builder.SelectedReference("source_1", "model"),),
+                garment_facts=prompt_builder.GarmentFacts((), ()),
+                infographic_inventory=None,
+            )
+            state = task_state.new_state(
+                record_id="rec_1", run_id="prior", source_tokens=["source_1"],
+                target_tokens=["target_1"], started_at="2026-08-19T00:00:00+00:00",
+            )
+            task_state.record_target_plan(state, 0, json.loads(prompt_builder.serialize_plan(plan)))
+            for attempt in (1, 2, 3):
+                task_state.begin_attempt(
+                    state, target_token="target_1", classification="front",
+                    reference_tokens=["source_1"], prompt="prompt", model="model",
+                    updated_at=f"2026-08-19T00:00:0{attempt}+00:00",
+                )
+                history = state["targets"]["target_1"]["attempt_history"][-1]
+                candidate = prior_generated / history["artifact_name"]
+                _write_png(candidate)
+                digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                task_state.record_qc_report(state, 0, {
+                    "attempt": attempt, "artifact_name": candidate.name,
+                    "artifact_sha256": digest, "report": {
+                        "schema_version": 1, "candidate": candidate.name,
+                        "scores": {"garment_construction": 70 + attempt,
+                                   "color_material": 80, "garment_details": 80,
+                                   "target_preservation": 80, "text_layout": None},
+                        "critical_defects": ["wrong_color"],
+                        "primary_defect": "wrong_color", "evidence": [],
+                        "confidence": 0.9, "decision": "reject",
+                        "exact_text": None, "added_text": None, "missing_text": None,
+                        "instances_exact": None, "panel_count_exact": None,
+                        "panel_layout_exact": None,
+                    },
+                })
+                if attempt < 3:
+                    task_state.record_failure(
+                        state, target_token="target_1", error="rejected",
+                        updated_at=f"2026-08-19T00:00:1{attempt}+00:00",
+                    )
+            task_state.save_state(state_path, state)
+
+            input_image = root / "input.png"
+            _write_png(input_image)
+            class Service:
+                def register_record(self, *_args: object) -> None: pass
+            class Base:
+                def download_attachment(self, **kwargs: object) -> None:
+                    Path(kwargs["output"]).write_bytes(input_image.read_bytes())
+            current = runs / "current"
+            current.mkdir()
+            adapter = production_runtime.ProductionTableAdapter(
+                run_id="current", run_dir=current, runs_root=runs,
+                state_root=state_root, base_service=Service(), ark_client=object(),
+            )
+            record = {"record_id": "rec_1", "fields": {
+                "原图": [{"file_token": "source_1", "name": "source.jpg"}],
+                "爆款图": [{"file_token": "target_1", "name": "target.jpg"}],
+                "输出图": [], "任务状态": ["失败"], "处理明细": "stopped",
+            }}
+            context = adapter._materialize(
+                TableScope("app_exact", "tbl_exact", "view_exact"), _table_schema(),
+                record, retry_failed=True, base=Base(),
+            )
+            resumed = task_state.load_state(context.task_dir / "manifest.json")
+            self.assertEqual((resumed["current_target"], resumed["targets"]["target_1"]["attempts"]),
+                             ("target_1", 3))
+
+            class Generator:
+                model = "model"
+                def artifact_path(self, ctx, history):
+                    return ctx.task_dir / "generated_images" / history["artifact_name"]
+                def generate(self, _request):
+                    raise AssertionError("no fourth generation")
+            class QC:
+                calls = 0
+                def compare(self, request):
+                    self.calls += 1
+                    reports = tuple(vision_qc.QCReport(
+                        alias, vision_qc.Scores(70 + int(alias[-1]), 80, 80, 80, None),
+                        (vision_qc.DefectCode.WRONG_COLOR,), vision_qc.DefectCode.WRONG_COLOR,
+                        0.9, "reject",
+                    ) for alias in request.aliases)
+                    ranking = tuple(reversed(request.aliases))
+                    return vision_qc.ComparativeReport(reports, ranking, ranking[0])
+            class Finalizer:
+                def reconcile_record(self, *_args): return None
+                def finalize(self, request):
+                    value = task_state.load_state(request.state_file)
+                    token = value["target_tokens"][request.target_index]
+                    name = task_state.promoted_output_name(request.candidate.name, token)
+                    task_state.record_local_acceptance(
+                        value, target_token=token, artifact_name=request.candidate.name,
+                        name=name, updated_at="2026-08-19T00:01:00+00:00",
+                    )
+                    task_state.record_success(
+                        value, target_token=token, file_token="uploaded", name=name,
+                        updated_at="2026-08-19T00:01:01+00:00",
+                    )
+                    task_state.save_state(request.state_file, value)
+            class Events:
+                def append(self, *_args, **_kwargs): return None
+            qc = QC()
+            result = run_record(context, RecordServices(
+                Generator(), qc, Finalizer(), Events(), GlobalStop(),
+            ))
+            self.assertEqual(result.status, "success")
+            self.assertEqual(qc.calls, 1)
+            self.assertEqual(len(task_state.load_state(state_path)["targets"]["target_1"]["attempt_history"]), 3)
+
     def test_record_limit_validates_later_page_before_any_materialization(self) -> None:
         from scripts import production_runtime
         from scripts.lark_runner import RecordPage
