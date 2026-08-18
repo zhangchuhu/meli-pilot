@@ -87,6 +87,62 @@ class RecordingOpener:
 
 
 class ArkVisionClientTest(unittest.TestCase):
+    def value_contains_sentinel(
+            self, value: object, sentinel: str, seen: set[int],
+    ) -> bool:
+        if id(value) in seen:
+            return False
+        seen.add(id(value))
+        if isinstance(value, str):
+            return sentinel in value
+        if isinstance(value, bytes):
+            return sentinel.encode("utf-8") in value
+        if isinstance(value, dict):
+            return any(
+                self.value_contains_sentinel(item, sentinel, seen)
+                for pair in value.items() for item in pair
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(
+                self.value_contains_sentinel(item, sentinel, seen)
+                for item in value
+            )
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            return self.value_contains_sentinel(
+                attributes, sentinel, seen,
+            )
+        return False
+
+    def assert_traceback_locals_are_sanitized(
+            self, exception: BaseException, *sentinels: str,
+    ) -> None:
+        traceback_node = exception.__traceback__
+        production_frames = []
+        while traceback_node is not None:
+            frame = traceback_node.tb_frame
+            if Path(frame.f_code.co_filename).resolve() == Path(
+                    ark_vision_qc.__file__,
+            ).resolve():
+                production_frames.append(frame)
+            traceback_node = traceback_node.tb_next
+        self.assertTrue(production_frames, "expected a production traceback frame")
+        for frame in production_frames:
+            for name, value in frame.f_locals.items():
+                for sentinel in sentinels:
+                    self.assertFalse(
+                        self.value_contains_sentinel(value, sentinel, set()),
+                        f"{sentinel!r} retained by traceback local {name!r} "
+                        f"in {frame.f_code.co_name}",
+                    )
+
+    def capture_ark_error(self, operation: Any) -> ark_vision_qc.ArkVisionError:
+        try:
+            operation()
+        except ark_vision_qc.ArkVisionError as exception:
+            return exception
+        self.fail("ArkVisionError was not raised")
+
     def assert_exception_is_sanitized(
             self, exception: BaseException, *sentinels: str,
     ) -> None:
@@ -243,21 +299,69 @@ class ArkVisionClientTest(unittest.TestCase):
 
     def test_malformed_response_exception_graph_does_not_retain_remote_body(self) -> None:
         remote_sentinel = "private-remote-response-sentinel"
+        api_key = "malformed-api-key-sentinel"
+        system_prompt = "malformed-system-prompt-sentinel"
+        user_prompt = "malformed-user-prompt-sentinel"
+        image_bytes = b"malformed-image-sentinel"
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
         client = ark_vision_qc.ArkVisionClient(
-            environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+            environ={"ARK_API_KEY": api_key, "ARK_VISION_MODEL": "model"},
             opener=RecordingOpener(
                 f'{{"choices":["{remote_sentinel}"'.encode("utf-8"),
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
             image = Path(directory) / "candidate.png"
-            image.write_bytes(b"image")
-            with self.assertRaises(ark_vision_qc.ArkVisionError) as raised:
-                client.complete_json(
-                    system_prompt="system", user_prompt="user", images=(image,),
-                )
+            image.write_bytes(image_bytes)
+            error = self.capture_ark_error(lambda: client.complete_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                images=(image,),
+            ))
 
-        self.assert_exception_is_sanitized(raised.exception, remote_sentinel)
+        self.assert_exception_is_sanitized(error, remote_sentinel)
+        self.assert_traceback_locals_are_sanitized(
+            error,
+            remote_sentinel,
+            api_key,
+            system_prompt,
+            user_prompt,
+            image_base64,
+            "Authorization",
+        )
+
+    def test_transport_error_traceback_frames_do_not_retain_sensitive_locals(self) -> None:
+        api_key = "traceback-api-key-sentinel"
+        system_prompt = "traceback-system-prompt-sentinel"
+        user_prompt = "traceback-user-prompt-sentinel"
+        image_bytes = b"traceback-image-sentinel"
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+
+        def failing_opener(_request: Any, *, timeout: float) -> FakeResponse:
+            raise OSError("external-transport-sentinel")
+
+        client = ark_vision_qc.ArkVisionClient(
+            environ={"ARK_API_KEY": api_key, "ARK_VISION_MODEL": "model"},
+            opener=failing_opener,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "candidate.png"
+            image.write_bytes(image_bytes)
+            error = self.capture_ark_error(lambda: client.complete_json(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                images=(image,),
+            ))
+
+        self.assert_traceback_locals_are_sanitized(
+            error,
+            api_key,
+            system_prompt,
+            user_prompt,
+            image_base64,
+            "Authorization",
+            "external-transport-sentinel",
+        )
 
     def test_same_host_and_cross_host_redirects_are_not_followed(self) -> None:
         self.assertTrue(

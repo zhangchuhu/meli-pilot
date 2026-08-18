@@ -50,6 +50,12 @@ class QCReviewResult:
         return self.review_count + int(self.adjudicated)
 
 
+@dataclass(frozen=True)
+class _CompletionOutcome:
+    content: str | None
+    error: str | None
+
+
 def _nonempty_environment(environ: Mapping[str, str], name: str) -> str:
     value = environ.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -129,27 +135,14 @@ def _build_rejecting_opener(*handlers: Any) -> Callable[..., Any]:
     return urllib.request.build_opener(_RejectRedirects(), *handlers).open
 
 
-class ArkVisionClient:
-    def __init__(
-            self, *, environ: Mapping[str, str] | None = None,
-            opener: Callable[..., Any] | None = None,
-            timeout_seconds: float = 30.0,
-    ) -> None:
-        if (not isinstance(timeout_seconds, (int, float))
-                or isinstance(timeout_seconds, bool)
-                or not math.isfinite(timeout_seconds)
-                or timeout_seconds <= 0):
-            raise ValueError("timeout_seconds must be a positive finite number")
-        self._environ = os.environ if environ is None else environ
-        self._opener = _build_rejecting_opener() if opener is None else opener
-        self._timeout_seconds = float(timeout_seconds)
-
-    def complete_json(
-            self, *, system_prompt: str, user_prompt: str,
-            images: Sequence[Path],
-    ) -> str:
-        api_key = _nonempty_environment(self._environ, "ARK_API_KEY")
-        model = _nonempty_environment(self._environ, "ARK_VISION_MODEL")
+def _complete_json_outcome(
+        *, environ: Mapping[str, str], opener: Callable[..., Any],
+        timeout_seconds: float, system_prompt: str, user_prompt: str,
+        images: Sequence[Path],
+) -> _CompletionOutcome:
+    try:
+        api_key = _nonempty_environment(environ, "ARK_API_KEY")
+        model = _nonempty_environment(environ, "ARK_VISION_MODEL")
         if not images:
             raise ArkVisionError("at least one image is required for Ark vision QC")
         image_content = [
@@ -171,45 +164,89 @@ class ArkVisionClient:
         request_body = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
-        failure: str | None = None
-        body = b""
-        final_url: str | None = None
-        try:
-            request = urllib.request.Request(
-                ARK_CHAT_ENDPOINT,
-                data=request_body,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with self._opener(request, timeout=self._timeout_seconds) as response:
-                final_url = response.geturl()
-                if final_url == ARK_CHAT_ENDPOINT:
-                    body = response.read(_MAX_RESPONSE_BYTES + 1)
-        except (TimeoutError, socket.timeout):
-            failure = "timeout"
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
-                failure = "timeout"
-            else:
-                failure = "failed"
-            close = getattr(exc, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-        except Exception:
-            failure = "failed"
-        if failure == "timeout":
-            raise ArkVisionError("Ark vision request timed out")
-        if failure is not None:
-            raise ArkVisionError("Ark vision request failed")
-        if final_url != ARK_CHAT_ENDPOINT:
-            raise ArkVisionError("Ark vision response came from an unapproved endpoint")
-        return _extract_content(body)
+        request = urllib.request.Request(
+            ARK_CHAT_ENDPOINT,
+            data=request_body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with opener(request, timeout=timeout_seconds) as response:
+            if response.geturl() != ARK_CHAT_ENDPOINT:
+                return _CompletionOutcome(
+                    content=None,
+                    error="Ark vision response came from an unapproved endpoint",
+                )
+            body = response.read(_MAX_RESPONSE_BYTES + 1)
+        content = _extract_content(body)
+        return _CompletionOutcome(content=content, error=None)
+    except (TimeoutError, socket.timeout):
+        return _CompletionOutcome(
+            content=None, error="Ark vision request timed out",
+        )
+    except urllib.error.URLError as exc:
+        timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
+        close = getattr(exc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return _CompletionOutcome(
+            content=None,
+            error=(
+                "Ark vision request timed out"
+                if timed_out else "Ark vision request failed"
+            ),
+        )
+    except ArkVisionError as exc:
+        message = exc.args[0] if len(exc.args) == 1 else None
+        return _CompletionOutcome(
+            content=None,
+            error=message if isinstance(message, str) else "Ark vision request failed",
+        )
+    except Exception:
+        return _CompletionOutcome(content=None, error="Ark vision request failed")
+
+
+class ArkVisionClient:
+    def __init__(
+            self, *, environ: Mapping[str, str] | None = None,
+            opener: Callable[..., Any] | None = None,
+            timeout_seconds: float = 30.0,
+    ) -> None:
+        if (not isinstance(timeout_seconds, (int, float))
+                or isinstance(timeout_seconds, bool)
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0):
+            raise ValueError("timeout_seconds must be a positive finite number")
+        self._environ = os.environ if environ is None else environ
+        self._opener = _build_rejecting_opener() if opener is None else opener
+        self._timeout_seconds = float(timeout_seconds)
+
+    def complete_json(
+            self, *, system_prompt: str, user_prompt: str,
+            images: Sequence[Path],
+    ) -> str:
+        outcome = _complete_json_outcome(
+            environ=self._environ,
+            opener=self._opener,
+            timeout_seconds=self._timeout_seconds,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images=images,
+        )
+        del self, system_prompt, user_prompt, images
+        content = outcome.content
+        error = outcome.error
+        del outcome
+        if error is not None:
+            raise ArkVisionError(error)
+        if content is None:
+            raise ArkVisionError("Ark vision response was invalid")
+        return content
 
 
 def _valid_report(

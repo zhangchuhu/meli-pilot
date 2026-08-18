@@ -54,40 +54,78 @@ def _attribute_path(node: ast.AST) -> tuple[str, ...]:
     return tuple(reversed(parts))
 
 
+_LEXICAL_SCOPES = (
+    ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+    ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp,
+)
+
+
+def _lexical_scope(
+        node: ast.AST, parents: dict[ast.AST, ast.AST], tree: ast.Module,
+) -> ast.AST:
+    current = parents.get(node)
+    while current is not None:
+        if isinstance(current, _LEXICAL_SCOPES):
+            return current
+        current = parents.get(current)
+    return tree
+
+
+def _nodes_in_scope(scope: ast.AST) -> list[ast.AST]:
+    nodes: list[ast.AST] = []
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        if isinstance(node, _LEXICAL_SCOPES):
+            continue
+        nodes.append(node)
+        pending.extend(ast.iter_child_nodes(node))
+    return nodes
+
+
 def _ark_http_target_is_exact(source: str) -> bool:
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return False
 
-    endpoint_values: list[ast.AST] = []
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    endpoint_assignments: list[ast.Assign] = []
     request_calls: list[ast.Call] = []
-    approved_request_names: set[str] = set()
+    network_calls: list[ast.Call] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "ARK_CHAT_ENDPOINT":
-                    endpoint_values.append(node.value)
-            if (
-                    isinstance(node.value, ast.Call)
-                    and _attribute_path(node.value.func) == ("urllib", "request", "Request")
-                    and node.value.args
-                    and isinstance(node.value.args[0], ast.Name)
-                    and node.value.args[0].id == "ARK_CHAT_ENDPOINT"
-            ):
-                approved_request_names.update(
-                    target.id for target in node.targets if isinstance(target, ast.Name)
-                )
+                    endpoint_assignments.append(node)
         if (
                 isinstance(node, ast.Call)
                 and _attribute_path(node.func) == ("urllib", "request", "Request")
         ):
             request_calls.append(node)
+        if isinstance(node, ast.Call):
+            path = _attribute_path(node.func)
+            if (
+                    path == ("urllib", "request", "urlopen")
+                    or path[-1:] == ("_opener",)
+                    or (isinstance(node.func, ast.Name) and node.func.id == "opener")
+            ):
+                network_calls.append(node)
 
-    if len(endpoint_values) != 1:
+    if len(endpoint_assignments) != 1:
         return False
-    endpoint = endpoint_values[0]
-    if not isinstance(endpoint, ast.Constant) or endpoint.value != ARK_CHAT_ENDPOINT:
+    endpoint_assignment = endpoint_assignments[0]
+    if _lexical_scope(endpoint_assignment, parents, tree) is not tree:
+        return False
+    endpoint = endpoint_assignment.value
+    if (
+            not isinstance(endpoint, ast.Constant)
+            or endpoint.value != ARK_CHAT_ENDPOINT
+    ):
         return False
     if len(request_calls) != 1:
         return False
@@ -98,27 +136,46 @@ def _ark_http_target_is_exact(source: str) -> bool:
             or request_call.args[0].id != "ARK_CHAT_ENDPOINT"
     ):
         return False
-
-    network_calls: list[ast.Call] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        path = _attribute_path(node.func)
-        if path == ("urllib", "request", "urlopen") or path[-1:] == ("_opener",):
-            network_calls.append(node)
+    request_assignment = parents.get(request_call)
+    if (
+            not isinstance(request_assignment, ast.Assign)
+            or request_assignment.value is not request_call
+            or len(request_assignment.targets) != 1
+            or not isinstance(request_assignment.targets[0], ast.Name)
+    ):
+        return False
+    request_name = request_assignment.targets[0].id
     if len(network_calls) != 1:
         return False
     network_call = network_calls[0]
-    if not network_call.args:
+    request_scope = _lexical_scope(request_assignment, parents, tree)
+    if _lexical_scope(network_call, parents, tree) is not request_scope:
+        return False
+    if network_call.lineno <= request_assignment.lineno or not network_call.args:
         return False
     target = network_call.args[0]
-    return (
-        isinstance(target, ast.Name)
-        and (
-            target.id == "ARK_CHAT_ENDPOINT"
-            or target.id in approved_request_names
+    if not isinstance(target, ast.Name) or target.id != request_name:
+        return False
+    stores = [
+        node for node in _nodes_in_scope(request_scope)
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Store)
+            and node.id == request_name
         )
-    )
+    ]
+    if isinstance(request_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        arguments = [
+            *request_scope.args.posonlyargs,
+            *request_scope.args.args,
+            *request_scope.args.kwonlyargs,
+        ]
+        if request_scope.args.vararg is not None:
+            arguments.append(request_scope.args.vararg)
+        if request_scope.args.kwarg is not None:
+            arguments.append(request_scope.args.kwarg)
+        stores.extend(argument for argument in arguments if argument.arg == request_name)
+    return len(stores) == 1 and stores[0] is request_assignment.targets[0]
 
 
 def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
@@ -606,6 +663,51 @@ class SkillContractTest(unittest.TestCase):
             forbidden_source_findings({ARK_HTTP_MODULE: source}),
             [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
         )
+
+    def test_forbidden_scanner_rejects_reassigned_or_mis_scoped_request_names(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        dynamic_other_url = "'https:' + '" + "//redirect.invalid/collect'"
+        prefix = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + f"OTHER_URL = {dynamic_other_url}\n"
+        )
+        request_constructor = "urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)"
+        fixtures = {
+            "reassignment": (
+                f"request = {request_constructor}\n"
+                "request = OTHER_URL\n"
+                "self._opener(request)\n"
+            ),
+            "wrong-order": (
+                "self._opener(request)\n"
+                f"request = {request_constructor}\n"
+            ),
+            "wrong-scope": (
+                "def approved():\n"
+                f"    request = {request_constructor}\n"
+                "def unsafe():\n"
+                "    self._opener(request)\n"
+            ),
+            "shadowed-parameter": (
+                f"request = {request_constructor}\n"
+                "def unsafe(request):\n"
+                "    self._opener(request)\n"
+            ),
+            "dynamic-alias": (
+                f"request = {request_constructor}\n"
+                "alias = request\n"
+                "self._opener(alias)\n"
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: prefix + fixture}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
 
     def test_forbidden_scanner_inventory_is_every_shipped_python_and_markdown(self) -> None:
         expected = {
