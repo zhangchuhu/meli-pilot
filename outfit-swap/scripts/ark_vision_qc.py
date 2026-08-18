@@ -56,6 +56,12 @@ class _CompletionOutcome:
     error: str | None
 
 
+@dataclass(frozen=True)
+class _ReviewOutcome:
+    result: QCReviewResult | None
+    error: str | None
+
+
 def _nonempty_environment(environ: Mapping[str, str], name: str) -> str:
     value = environ.get(name)
     if not isinstance(value, str) or not value.strip():
@@ -125,7 +131,7 @@ def _extract_content(body: bytes) -> str:
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(
-            self, request: Any, file_pointer: Any, code: int, message: str,
+            self, original_request: Any, file_pointer: Any, code: int, message: str,
             headers: Any, new_url: str,
     ) -> None:
         return None
@@ -164,7 +170,7 @@ def _complete_json_outcome(
         request_body = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")
-        request = urllib.request.Request(
+        ark_request = urllib.request.Request(
             ARK_CHAT_ENDPOINT,
             data=request_body,
             headers={
@@ -173,7 +179,7 @@ def _complete_json_outcome(
             },
             method="POST",
         )
-        with opener(request, timeout=timeout_seconds) as response:
+        with opener(ark_request, timeout=timeout_seconds) as response:
             if response.geturl() != ARK_CHAT_ENDPOINT:
                 return _CompletionOutcome(
                     content=None,
@@ -303,47 +309,109 @@ def _adjudication_prompt(
     )
 
 
+def _review_candidate_outcome(
+        client: VisionClient, *, system_prompt: str, user_prompt: str,
+        images: Sequence[Path], candidate: str, infographic: bool,
+) -> _ReviewOutcome:
+    adjudicating = False
+    try:
+        same_images = tuple(Path(path) for path in images)
+        first = _valid_report(
+            client,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images=same_images,
+            candidate=candidate,
+            infographic=infographic,
+        )
+        if first is not None and first.confidence >= _MINIMUM_CONFIDENCE:
+            return _ReviewOutcome(
+                result=QCReviewResult(
+                    report=first, review_count=1, adjudicated=False,
+                ),
+                error=None,
+            )
+
+        second = _valid_report(
+            client,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images=same_images,
+            candidate=candidate,
+            infographic=infographic,
+        )
+        if (
+                first is not None
+                and second is not None
+                and first.decision != second.decision
+        ):
+            adjudicating = True
+            adjudicated = _valid_report(
+                client,
+                system_prompt=system_prompt,
+                user_prompt=_adjudication_prompt(user_prompt, first, second),
+                images=same_images,
+                candidate=candidate,
+                infographic=infographic,
+            )
+            if (
+                    adjudicated is not None
+                    and adjudicated.confidence >= _MINIMUM_CONFIDENCE
+            ):
+                return _ReviewOutcome(
+                    result=QCReviewResult(
+                        report=adjudicated, review_count=2, adjudicated=True,
+                    ),
+                    error=None,
+                )
+            return _ReviewOutcome(
+                result=None,
+                error=(
+                    "Ark vision QC failed after same-candidate review "
+                    "and adjudication"
+                ),
+            )
+        if second is not None and second.confidence >= _MINIMUM_CONFIDENCE:
+            return _ReviewOutcome(
+                result=QCReviewResult(
+                    report=second, review_count=2, adjudicated=False,
+                ),
+                error=None,
+            )
+        return _ReviewOutcome(
+            result=None,
+            error="Ark vision QC failed after same-candidate review",
+        )
+    except Exception:
+        return _ReviewOutcome(
+            result=None,
+            error=(
+                "Ark vision QC failed after same-candidate review and adjudication"
+                if adjudicating
+                else "Ark vision QC failed after same-candidate review"
+            ),
+        )
+
+
 def review_candidate(
         client: VisionClient, *, system_prompt: str, user_prompt: str,
         images: Sequence[Path], candidate: str, infographic: bool,
 ) -> QCReviewResult:
     """Review one candidate, retrying only QC and adjudicating valid disagreement."""
-    same_images = tuple(Path(path) for path in images)
-    first = _valid_report(
+    outcome = _review_candidate_outcome(
         client,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        images=same_images,
+        images=images,
         candidate=candidate,
         infographic=infographic,
     )
-    if first is not None and first.confidence >= _MINIMUM_CONFIDENCE:
-        return QCReviewResult(report=first, review_count=1, adjudicated=False)
-
-    second = _valid_report(
-        client,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        images=same_images,
-        candidate=candidate,
-        infographic=infographic,
-    )
-    if first is not None and second is not None and first.decision != second.decision:
-        adjudicated = _valid_report(
-            client,
-            system_prompt=system_prompt,
-            user_prompt=_adjudication_prompt(user_prompt, first, second),
-            images=same_images,
-            candidate=candidate,
-            infographic=infographic,
-        )
-        if adjudicated is not None and adjudicated.confidence >= _MINIMUM_CONFIDENCE:
-            return QCReviewResult(
-                report=adjudicated, review_count=2, adjudicated=True,
-            )
-        raise ArkVisionError(
-            "Ark vision QC failed after same-candidate review and adjudication",
-        )
-    if second is not None and second.confidence >= _MINIMUM_CONFIDENCE:
-        return QCReviewResult(report=second, review_count=2, adjudicated=False)
-    raise ArkVisionError("Ark vision QC failed after same-candidate review")
+    del client, system_prompt, user_prompt, images, candidate, infographic
+    result = outcome.result
+    error = outcome.error
+    del outcome
+    if error is not None:
+        raise ArkVisionError(error)
+    if result is None:
+        raise ArkVisionError("Ark vision QC failed after same-candidate review")
+    return result

@@ -71,16 +71,49 @@ def _lexical_scope(
     return tree
 
 
-def _nodes_in_scope(scope: ast.AST) -> list[ast.AST]:
-    nodes: list[ast.AST] = []
-    pending = list(ast.iter_child_nodes(scope))
-    while pending:
-        node = pending.pop()
-        if isinstance(node, _LEXICAL_SCOPES):
-            continue
-        nodes.append(node)
-        pending.extend(ast.iter_child_nodes(node))
-    return nodes
+def _mutation_root(node: ast.AST) -> str | None:
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _request_name_effects(tree: ast.Module, request_name: str) -> list[ast.AST]:
+    effects: list[ast.AST] = []
+    for node in ast.walk(tree):
+        if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and node.id == request_name
+        ):
+            effects.append(node)
+        elif (
+                isinstance(node, (ast.Attribute, ast.Subscript))
+                and isinstance(node.ctx, (ast.Store, ast.Del))
+                and _mutation_root(node) == request_name
+        ):
+            effects.append(node)
+        elif isinstance(node, ast.arg) and node.arg == request_name:
+            effects.append(node)
+        elif (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.name == request_name
+        ):
+            effects.append(node)
+        elif isinstance(node, ast.ExceptHandler) and node.name == request_name:
+            effects.append(node)
+        elif isinstance(node, ast.alias):
+            bound_name = node.asname or node.name.split(".", 1)[0]
+            if bound_name == request_name:
+                effects.append(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and request_name in node.names:
+            effects.append(node)
+        elif isinstance(node, ast.MatchAs) and node.name == request_name:
+            effects.append(node)
+        elif isinstance(node, ast.MatchStar) and node.name == request_name:
+            effects.append(node)
+        elif isinstance(node, ast.MatchMapping) and node.rest == request_name:
+            effects.append(node)
+    return effects
 
 
 def _ark_http_target_is_exact(source: str) -> bool:
@@ -156,26 +189,8 @@ def _ark_http_target_is_exact(source: str) -> bool:
     target = network_call.args[0]
     if not isinstance(target, ast.Name) or target.id != request_name:
         return False
-    stores = [
-        node for node in _nodes_in_scope(request_scope)
-        if (
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Store)
-            and node.id == request_name
-        )
-    ]
-    if isinstance(request_scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        arguments = [
-            *request_scope.args.posonlyargs,
-            *request_scope.args.args,
-            *request_scope.args.kwonlyargs,
-        ]
-        if request_scope.args.vararg is not None:
-            arguments.append(request_scope.args.vararg)
-        if request_scope.args.kwarg is not None:
-            arguments.append(request_scope.args.kwarg)
-        stores.extend(argument for argument in arguments if argument.arg == request_name)
-    return len(stores) == 1 and stores[0] is request_assignment.targets[0]
+    effects = _request_name_effects(tree, request_name)
+    return len(effects) == 1 and effects[0] is request_assignment.targets[0]
 
 
 def forbidden_source_findings(documents: dict[str, str]) -> list[str]:
@@ -706,6 +721,104 @@ class SkillContractTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(
                     forbidden_source_findings({ARK_HTTP_MODULE: prefix + fixture}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
+
+    def test_forbidden_scanner_rejects_hidden_request_mutation_and_binding(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        prefix = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + "OTHER_URL = 'https:' + '" + "//redirect.invalid/collect'\n"
+        )
+        constructor = "urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)"
+        fixtures = {
+            "attribute-mutation": (
+                f"request = {constructor}\n"
+                "request.full_url = OTHER_URL\n"
+                "self._opener(request)\n"
+            ),
+            "exception-alias": (
+                f"request = {constructor}\n"
+                "try:\n    pass\nexcept Exception as request:\n    pass\n"
+                "self._opener(request)\n"
+            ),
+            "import-alias": (
+                f"request = {constructor}\n"
+                "import os as request\n"
+                "self._opener(request)\n"
+            ),
+            "match-capture": (
+                f"request = {constructor}\n"
+                "match OTHER_URL:\n    case request:\n        pass\n"
+                "self._opener(request)\n"
+            ),
+        }
+
+        for name, fixture in fixtures.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: prefix + fixture}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
+
+    def test_forbidden_scanner_rejects_all_request_binding_forms(self) -> None:
+        urllib_import = "import urllib" + "." + "request\n"
+        exact_endpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        prefix = (
+            urllib_import
+            + f"ARK_CHAT_ENDPOINT = '{exact_endpoint}'\n"
+            + "OTHER_URL = 'https:' + '" + "//redirect.invalid/collect'\n"
+        )
+        constructor = "urllib" + "." + "request.Request(ARK_CHAT_ENDPOINT)"
+        fixtures = {
+            "subscript": "request[0] = OTHER_URL",
+            "augassign": "request += OTHER_URL",
+            "named-expression": "value = (request := OTHER_URL)",
+            "loop-target": "for request in []:\n    pass",
+            "comprehension-target": "value = [request for request in []]",
+            "with-target": "with open(__file__) as request:\n    pass",
+            "nested-function": "def request():\n    pass",
+            "nested-class": "class request:\n    pass",
+            "delete": "del request",
+        }
+
+        for name, mutation in fixtures.items():
+            with self.subTest(name=name):
+                source = (
+                    prefix
+                    + f"request = {constructor}\n"
+                    + mutation + "\n"
+                    + "self._opener(request)\n"
+                )
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: source}),
+                    [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
+                )
+
+        global_source = (
+            prefix
+            + "def unsafe():\n"
+            + "    global request\n"
+            + f"    request = {constructor}\n"
+            + "    opener(request)\n"
+        )
+        nonlocal_source = (
+            prefix
+            + "def outer():\n"
+            + "    request = None\n"
+            + "    def unsafe():\n"
+            + "        nonlocal request\n"
+            + f"        request = {constructor}\n"
+            + "        opener(request)\n"
+        )
+        for name, source in (
+            ("global", global_source), ("nonlocal", nonlocal_source),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    forbidden_source_findings({ARK_HTTP_MODULE: source}),
                     [f"{ARK_HTTP_MODULE}: unauthorized Ark HTTP target"],
                 )
 

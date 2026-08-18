@@ -86,7 +86,7 @@ class RecordingOpener:
         return FakeResponse(self.body)
 
 
-class ArkVisionClientTest(unittest.TestCase):
+class _SanitizedErrorAssertions:
     def value_contains_sentinel(
             self, value: object, sentinel: str, seen: set[int],
     ) -> bool:
@@ -169,6 +169,8 @@ class ArkVisionClientTest(unittest.TestCase):
         self.assertIsNone(exception.__cause__)
         self.assertIsNone(exception.__context__)
 
+
+class ArkVisionClientTest(_SanitizedErrorAssertions, unittest.TestCase):
     def test_posts_exact_multimodal_request_with_env_model_and_credentials(self) -> None:
         opener = RecordingOpener(response_body("{\"result\":\"ok\"}"))
         with tempfile.TemporaryDirectory() as directory:
@@ -523,6 +525,18 @@ class FakeVisionClient:
         return result
 
 
+class SensitiveVisionClient(FakeVisionClient):
+    def __init__(
+            self, results: list[str | Exception], *, api_key: str,
+            image_base64: str, authorization: str, remote_body: str,
+    ) -> None:
+        super().__init__(results)
+        self.api_key = api_key
+        self.image_base64 = image_base64
+        self.authorization = authorization
+        self.remote_body = remote_body
+
+
 class ReviewCandidateTest(unittest.TestCase):
     images = (Path("reference.png"), Path("candidate.png"))
 
@@ -638,6 +652,112 @@ class ReviewCandidateTest(unittest.TestCase):
         self.assertEqual(result.report.candidate, "candidate.png")
         self.assertFalse(result.adjudicated)
         self.assertEqual(result.request_count, 2)
+
+
+class ReviewCandidateTracebackTest(_SanitizedErrorAssertions, unittest.TestCase):
+    images = (Path("sensitive-reference.png"), Path("sensitive-candidate.png"))
+    api_key = "coordinator-api-key-sentinel"
+    system_prompt = "coordinator-system-prompt-sentinel"
+    user_prompt = "coordinator-user-prompt-sentinel"
+    image_base64 = "Y29vcmRpbmF0b3ItaW1hZ2Utc2VudGluZWw="
+    authorization = "Bearer coordinator-authorization-sentinel"
+    remote_body = "coordinator-remote-body-sentinel"
+
+    def client(self, results: list[str | Exception]) -> SensitiveVisionClient:
+        return SensitiveVisionClient(
+            results,
+            api_key=self.api_key,
+            image_base64=self.image_base64,
+            authorization=self.authorization,
+            remote_body=self.remote_body,
+        )
+
+    def capture_review_error(
+            self, client: SensitiveVisionClient,
+    ) -> ark_vision_qc.ArkVisionError:
+        return self.capture_ark_error(lambda: ark_vision_qc.review_candidate(
+            client,
+            system_prompt=self.system_prompt,
+            user_prompt=self.user_prompt,
+            images=self.images,
+            candidate="sensitive-candidate.png",
+            infographic=False,
+        ))
+
+    def assert_coordinator_traceback_is_sanitized(
+            self, error: ark_vision_qc.ArkVisionError,
+    ) -> None:
+        self.assert_exception_is_sanitized(
+            error,
+            self.api_key,
+            self.system_prompt,
+            self.user_prompt,
+            self.image_base64,
+            self.authorization,
+            self.remote_body,
+        )
+        self.assert_traceback_locals_are_sanitized(
+            error,
+            self.api_key,
+            self.system_prompt,
+            self.user_prompt,
+            self.image_base64,
+            self.authorization,
+            self.remote_body,
+        )
+
+    def test_malformed_reports_leave_no_sensitive_coordinator_traceback_locals(self) -> None:
+        client = self.client([
+            self.remote_body + " malformed one",
+            self.remote_body + " malformed two",
+        ])
+
+        error = self.capture_review_error(client)
+
+        self.assert_coordinator_traceback_is_sanitized(error)
+
+    def test_transport_failures_leave_no_sensitive_coordinator_traceback_locals(self) -> None:
+        client = self.client([
+            ark_vision_qc.ArkVisionError(self.remote_body + " transport one"),
+            ark_vision_qc.ArkVisionError(self.remote_body + " transport two"),
+        ])
+
+        error = self.capture_review_error(client)
+
+        self.assert_coordinator_traceback_is_sanitized(error)
+
+    def test_persistent_low_confidence_leaves_no_sensitive_coordinator_traceback_locals(self) -> None:
+        client = self.client([
+            report_json(
+                candidate="sensitive-candidate.png", confidence=0.40,
+                decision="accept",
+            ),
+            report_json(
+                candidate="sensitive-candidate.png", confidence=0.50,
+                decision="accept",
+            ),
+        ])
+
+        error = self.capture_review_error(client)
+
+        self.assert_coordinator_traceback_is_sanitized(error)
+
+    def test_failed_adjudication_leaves_no_sensitive_coordinator_traceback_locals(self) -> None:
+        client = self.client([
+            report_json(
+                candidate="sensitive-candidate.png", confidence=0.40,
+                decision="accept",
+            ),
+            report_json(
+                candidate="sensitive-candidate.png", confidence=0.95,
+                decision="reject",
+            ),
+            self.remote_body + " malformed adjudication",
+        ])
+
+        error = self.capture_review_error(client)
+
+        self.assert_coordinator_traceback_is_sanitized(error)
 
 
 if __name__ == "__main__":
