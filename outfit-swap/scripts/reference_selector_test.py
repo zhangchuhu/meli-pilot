@@ -81,6 +81,50 @@ class OrdinaryReferenceSelectionTest(unittest.TestCase):
                 self.assertEqual(selection.tokens[0], expected_primary)
                 self.assertEqual(selection.tokens[1:], ("upper", "flat", "hem"))
 
+    def test_side_and_back_rank_complementary_evidence_by_angle_before_score(self) -> None:
+        for classification in ("side", "back"):
+            with self.subTest(classification=classification):
+                selection = reference_selector.select_references((
+                    evidence(f"{classification}-model", angle=classification,
+                             roles=("model",), score=10),
+                    evidence("front-model", angle="front", roles=("model",), score=100),
+                    evidence(f"{classification}-upper", angle=classification,
+                             roles=("upper_construction",), score=10),
+                    evidence("front-upper", angle="front",
+                             roles=("upper_construction",), score=100),
+                    evidence(f"{classification}-flat", angle=classification,
+                             roles=("full_outfit_flat_lay",), score=10),
+                    evidence("front-flat", angle="front",
+                             roles=("full_outfit_flat_lay",), score=100),
+                    evidence(f"{classification}-hem", angle=classification,
+                             roles=("skirt_hem",), score=10),
+                    evidence("front-hem", angle="front", roles=("skirt_hem",), score=100),
+                ), classification=classification)
+
+                self.assertEqual(selection.tokens, (
+                    f"{classification}-model", f"{classification}-upper",
+                    f"{classification}-flat", f"{classification}-hem",
+                ))
+                self.assertEqual(selection.roles, (
+                    "model", "upper_construction", "full_outfit_flat_lay", "skirt_hem",
+                ))
+
+    def test_zero_information_sources_are_excluded_and_missing_evidence_fails(self) -> None:
+        selection = reference_selector.select_references((
+            evidence("zero-side", angle="side", roles=("model",), score=0),
+            evidence("front-model", angle="front", roles=("model",), score=10),
+            evidence("upper", angle="side", roles=("upper_construction",), score=10),
+            evidence("flat", angle="side", roles=("full_outfit_flat_lay",), score=10),
+        ), classification="side")
+        self.assertEqual(selection.tokens[0], "front-model")
+
+        with self.assertRaises(reference_selector.ReferenceSelectionError):
+            reference_selector.select_references((
+                evidence("model", angle="front", roles=("model",), score=10),
+                evidence("zero-upper", angle="front", roles=("upper_construction",), score=0),
+                evidence("flat", angle="front", roles=("full_outfit_flat_lay",), score=10),
+            ), classification="front")
+
     def test_fifth_requires_and_records_nonredundant_unique_evidence(self) -> None:
         sources = (
             evidence("model", angle="front", roles=("model",)),
@@ -99,6 +143,10 @@ class OrdinaryReferenceSelectionTest(unittest.TestCase):
         )
 
         self.assertEqual(selection.tokens, ("model", "upper", "flat", "hem", "waistband"))
+        self.assertEqual(selection.roles, (
+            "model", "upper_construction", "full_outfit_flat_lay", "skirt_hem",
+            "hidden_waistband",
+        ))
         self.assertEqual(selection.fifth_reference_reason, requirement.reason)
         with self.assertRaises(reference_selector.ReferenceSelectionError):
             reference_selector.select_references(

@@ -6,11 +6,12 @@ import hashlib
 import json
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Mapping
 
 try:
-    from . import vision_qc
+    from . import infographic_text, vision_qc
 except ImportError:  # pragma: no cover - direct script-directory import
+    import infographic_text
     import vision_qc
 
 
@@ -27,26 +28,6 @@ def _string_tuple(value: object, name: str, *, allow_empty: bool = True) -> tupl
     return value
 
 
-def _freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        if not all(isinstance(key, str) for key in value):
-            raise PromptPlanError("inventory keys must be strings")
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    raise PromptPlanError("inventory contains a non-JSON value")
-
-
-def _thaw(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {key: _thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw(item) for item in value]
-    return value
-
-
 @dataclass(frozen=True)
 class GarmentFacts:
     required: tuple[str, ...]
@@ -58,26 +39,79 @@ class GarmentFacts:
 
 
 @dataclass(frozen=True)
-class TargetPlan:
-    classification: str
-    selected_references: tuple[str, ...]
-    garment_facts: GarmentFacts
-    infographic_inventory: dict | None
+class SelectedReference:
+    token: str
+    role: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.classification, str) or not self.classification:
-            raise PromptPlanError("classification must be a non-empty string")
-        _string_tuple(
-            self.selected_references, "selected references", allow_empty=False,
-        )
+        if not isinstance(self.token, str) or not self.token:
+            raise PromptPlanError("selected reference token must not be empty")
+        if not isinstance(self.role, str) or not self.role:
+            raise PromptPlanError("selected reference role must not be empty")
+
+
+@dataclass(frozen=True)
+class TargetPlan:
+    classification: str
+    selected_references: tuple[SelectedReference, ...]
+    garment_facts: GarmentFacts
+    infographic_inventory: infographic_text.InfographicInventory | None
+    fifth_reference_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        classifications = frozenset({
+            "front", "front three-quarter", "side", "back three-quarter", "back",
+            "detail or flat lay", "infographic",
+        })
+        if self.classification not in classifications:
+            raise PromptPlanError("classification is not supported")
+        if (not isinstance(self.selected_references, tuple)
+                or not self.selected_references
+                or len(self.selected_references) > 5
+                or not all(
+                    isinstance(reference, SelectedReference)
+                    for reference in self.selected_references
+                )):
+            raise PromptPlanError(
+                "selected references must be one through five typed entries",
+            )
+        tokens = tuple(reference.token for reference in self.selected_references)
+        if len(set(tokens)) != len(tokens):
+            raise PromptPlanError("selected reference tokens must be unique")
         if not isinstance(self.garment_facts, GarmentFacts):
             raise PromptPlanError("garment facts are invalid")
-        if self.infographic_inventory is not None:
-            if not isinstance(self.infographic_inventory, Mapping):
-                raise PromptPlanError("infographic inventory must be a JSON object")
-            object.__setattr__(
-                self, "infographic_inventory", _freeze(self.infographic_inventory),
+        if self.classification == "infographic":
+            if not isinstance(
+                    self.infographic_inventory, infographic_text.InfographicInventory,
+            ):
+                raise PromptPlanError(
+                    "infographic targets require a typed settled inventory",
+                )
+        elif self.infographic_inventory is not None:
+            raise PromptPlanError(
+                "ordinary targets cannot carry an infographic inventory",
             )
+        if len(self.selected_references) == 5:
+            if (not isinstance(self.fifth_reference_reason, str)
+                    or not self.fifth_reference_reason.strip()):
+                raise PromptPlanError(
+                    "a fifth reference requires a recorded reason",
+                )
+            first_roles = {
+                reference.role for reference in self.selected_references[:4]
+            }
+            if self.selected_references[4].role in first_roles:
+                raise PromptPlanError(
+                    "the fifth reference must provide a unique evidence role",
+                )
+        elif self.fifth_reference_reason is not None:
+            raise PromptPlanError(
+                "a fifth reference reason must be bound to an actual fifth entry",
+            )
+
+    @property
+    def reference_tokens(self) -> tuple[str, ...]:
+        return tuple(reference.token for reference in self.selected_references)
 
 
 @dataclass(frozen=True)
@@ -86,13 +120,14 @@ class PromptArtifact:
     text: str
     selected_references: tuple[str, ...]
     correction: str | None
+    correction_code: vision_qc.DefectCode | None
 
 
 _CORRECTIONS: Mapping[vision_qc.DefectCode, str] = MappingProxyType({
     vision_qc.DefectCode.WRONG_COLLAR:
         "Retry correction: Restore the evidenced collar construction exactly.",
     vision_qc.DefectCode.OPEN_FRONT:
-        "Retry correction: Fully close the front opening exactly as required by the evidenced garment facts.",
+        "Retry correction: Restore the front opening exactly from the evidenced garment facts and references.",
     vision_qc.DefectCode.MISSING_SLEEVE:
         "Retry correction: Restore every missing sleeve exactly from the evidenced garment facts and references.",
     vision_qc.DefectCode.WRONG_SKIRT_SHAPE:
@@ -129,14 +164,21 @@ def serialize_plan(plan: TargetPlan) -> str:
     if not isinstance(plan, TargetPlan):
         raise PromptPlanError("target plan is invalid")
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "classification": plan.classification,
-        "selected_references": list(plan.selected_references),
+        "selected_references": [
+            {"token": reference.token, "role": reference.role}
+            for reference in plan.selected_references
+        ],
+        "fifth_reference_reason": plan.fifth_reference_reason,
         "garment_facts": {
             "required": list(plan.garment_facts.required),
             "forbidden": list(plan.garment_facts.forbidden),
         },
-        "infographic_inventory": _thaw(plan.infographic_inventory),
+        "infographic_inventory": (
+            None if plan.infographic_inventory is None
+            else plan.infographic_inventory.plan_dict()
+        ),
     }
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -154,7 +196,7 @@ def _base_prompt(plan: TargetPlan) -> str:
         f"Target classification: {plan.classification}.",
         "Preserve the target person's identity, pose, anatomy, accessories, framing, and background.",
         "Use garment references in this exact order: "
-        + ", ".join(plan.selected_references) + ".",
+        + ", ".join(plan.reference_tokens) + ".",
     ]
     if plan.garment_facts.required:
         lines.append("Required garment facts:")
@@ -164,7 +206,7 @@ def _base_prompt(plan: TargetPlan) -> str:
         lines.extend(f"- {fact}" for fact in plan.garment_facts.forbidden)
     if plan.infographic_inventory is not None:
         inventory = json.dumps(
-            _thaw(plan.infographic_inventory),
+            plan.infographic_inventory.to_dict(),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -177,25 +219,44 @@ def build_prompt(
         plan: TargetPlan, *, attempt: int,
         correction: vision_qc.DefectCode | None = None,
 ) -> PromptArtifact:
-    """Build attempt one or one deterministic single-correction retry."""
+    """Build the immutable initial prompt; retries require a QC report."""
+    if not isinstance(plan, TargetPlan):
+        raise PromptPlanError("target plan is invalid")
+    if attempt != 1 or isinstance(attempt, bool):
+        raise PromptPlanError("build_prompt constructs attempt one only")
+    if correction is not None:
+        raise PromptPlanError("retry corrections require a QC report")
+
+    base = _base_prompt(plan)
+    return PromptArtifact(
+        base_prompt=base,
+        text=base,
+        selected_references=plan.reference_tokens,
+        correction=None,
+        correction_code=None,
+    )
+
+
+def build_retry_prompt(
+        plan: TargetPlan, *, attempt: int, report: vision_qc.QCReport,
+) -> PromptArtifact:
+    """Append only the highest-priority correction from a structured QC report."""
     if not isinstance(plan, TargetPlan):
         raise PromptPlanError("target plan is invalid")
     if (not isinstance(attempt, int) or isinstance(attempt, bool)
-            or attempt not in (1, 2, 3)):
-        raise PromptPlanError("attempt must be one, two, or three")
-    if attempt == 1 and correction is not None:
-        raise PromptPlanError("the initial prompt cannot contain a retry correction")
-    if attempt > 1 and correction is None:
-        raise PromptPlanError("a retry requires exactly one defect correction")
-    if correction is not None and not isinstance(correction, vision_qc.DefectCode):
-        raise PromptPlanError("retry correction must be a known defect code")
-
+            or attempt not in (2, 3)):
+        raise PromptPlanError("retry attempt must be two or three")
+    if not isinstance(report, vision_qc.QCReport):
+        raise PromptPlanError("retry requires a structured QC report")
+    correction_code = vision_qc.correction_for(report)
+    if correction_code is None:
+        raise PromptPlanError("retry report contains no correctable defect")
     base = _base_prompt(plan)
-    correction_text = None if correction is None else _CORRECTIONS[correction]
-    text = base if correction_text is None else base + "\n" + correction_text
+    correction_text = _CORRECTIONS[correction_code]
     return PromptArtifact(
         base_prompt=base,
-        text=text,
-        selected_references=plan.selected_references,
+        text=base + "\n" + correction_text,
+        selected_references=plan.reference_tokens,
         correction=correction_text,
+        correction_code=correction_code,
     )

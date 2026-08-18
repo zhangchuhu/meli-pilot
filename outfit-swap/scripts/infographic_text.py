@@ -48,7 +48,11 @@ class InfographicInventory:
         _literal_tuple(self.visible_text, "visible text")
         _literal_tuple(self.panels, "panels")
         _literal_tuple(self.garment_instances, "garment instances")
-        if self.reading_count != 2 or not self.settled:
+        if (not isinstance(self.reading_count, int)
+                or isinstance(self.reading_count, bool)
+                or self.reading_count != 2
+                or not isinstance(self.adjudicated, bool)
+                or self.settled is not True):
             raise InventoryError("inventory must be settled from exactly two readings")
 
     def to_dict(self) -> dict[str, list[str]]:
@@ -56,6 +60,16 @@ class InfographicInventory:
             "visible_text": list(self.visible_text),
             "panels": list(self.panels),
             "garment_instances": list(self.garment_instances),
+        }
+
+    def plan_dict(self) -> dict[str, object]:
+        """Return every field required to reconstruct the settled artifact."""
+        return {
+            "target_token": self.target_token,
+            **self.to_dict(),
+            "reading_count": self.reading_count,
+            "adjudicated": self.adjudicated,
+            "settled": self.settled,
         }
 
 
