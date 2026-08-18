@@ -90,6 +90,63 @@ class TargetPlanTest(unittest.TestCase):
         )
         self.assertEqual(len(prompt_builder.plan_digest(plan)), 64)
 
+    def test_serialized_ordinary_and_infographic_plans_round_trip_to_typed_plans(self) -> None:
+        ordinary = prompt_builder.TargetPlan(
+            classification="front",
+            selected_references=refs(
+                ("model", "model"), ("flat", "full_outfit_flat_lay"),
+            ),
+            garment_facts=prompt_builder.GarmentFacts(
+                required=("round neckline",), forbidden=("open front",),
+            ),
+            infographic_inventory=None,
+        )
+        infographic = prompt_builder.TargetPlan(
+            classification="infographic",
+            selected_references=refs(("info", "instance:skirt")),
+            garment_facts=prompt_builder.GarmentFacts(required=(), forbidden=()),
+            infographic_inventory=infographic_text.InfographicInventory(
+                target_token="target-info", visible_text=("FLOWY HEM",),
+                panels=("main panel",), garment_instances=("skirt",),
+                reading_count=2, adjudicated=True,
+            ),
+        )
+
+        for expected in (ordinary, infographic):
+            with self.subTest(classification=expected.classification):
+                persisted = __import__("json").loads(
+                    prompt_builder.serialize_plan(expected),
+                )
+                actual = prompt_builder.deserialize_plan(persisted)
+                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    prompt_builder.serialize_plan(actual),
+                    prompt_builder.serialize_plan(expected),
+                )
+
+    def test_deserialize_plan_rejects_noncanonical_or_incomplete_payloads(self) -> None:
+        valid = {
+            "schema_version": 2,
+            "classification": "front",
+            "selected_references": [{"token": "model", "role": "model"}],
+            "fifth_reference_reason": None,
+            "garment_facts": {"required": [], "forbidden": []},
+            "infographic_inventory": None,
+        }
+        invalid_values = (
+            {**valid, "schema_version": True},
+            {**valid, "unexpected": "field"},
+            {**valid, "selected_references": [{"token": "model"}]},
+            {**valid, "garment_facts": {"required": [], "forbidden": [], "extra": []}},
+            {**valid, "infographic_inventory": {"visible_text": ["FLOWY HEM"]}},
+        )
+
+        for payload in invalid_values:
+            with self.subTest(payload=payload), self.assertRaises(
+                    prompt_builder.PromptPlanError,
+            ):
+                prompt_builder.deserialize_plan(payload)
+
     def test_infographic_plan_requires_a_typed_complete_settled_inventory(self) -> None:
         selected = refs(("model", "model"))
         facts = prompt_builder.GarmentFacts(required=(), forbidden=())

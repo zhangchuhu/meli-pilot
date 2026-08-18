@@ -118,24 +118,19 @@ def run_record(context: RecordContext, services: RecordServices) -> RecordResult
     if state["record_error"] is not None:
         return _finish_result(context, state, services, "failed")
 
-    try:
-        plans = _ensure_target_plans(context, state_file, services)
-    except Exception:
-        state = task_state.load_state(state_file)
-        _record_error(
-            state_file, state, services, code="record-data",
-            message="target planning failed",
-        )
-        return _finish_result(
-            context, task_state.load_state(state_file), services, "failed",
-        )
-
+    plans: dict[int, prompt_builder.TargetPlan] = {}
     state = task_state.load_state(state_file)
     active = state["current_target"]
     if active is not None:
         active_index = state["target_tokens"].index(active)
         if active_index not in context.target_indices:
             raise RecordWorkerError("active target is outside the requested record scope")
+        try:
+            plans[active_index] = _resolve_target_plan(
+                context, state_file, active_index, services,
+            )
+        except Exception:
+            return _planning_failure(context, state_file, services)
         status = _process_active_candidate(
             context, state_file, active_index, plans[active_index], services,
         )
@@ -164,6 +159,13 @@ def run_record(context: RecordContext, services: RecordServices) -> RecordResult
                 continue
             if target["status"] == "failed":
                 return _finish_result(context, state, services, "failed")
+            if target_index not in plans:
+                try:
+                    plans[target_index] = _resolve_target_plan(
+                        context, state_file, target_index, services,
+                    )
+                except Exception:
+                    return _planning_failure(context, state_file, services)
             if target["status"] == "running":
                 status = _process_active_candidate(
                     context, state_file, target_index, plans[target_index], services,
@@ -229,32 +231,45 @@ def _load_bound_state(state_file: Path, context: RecordContext) -> dict[str, Any
     return state
 
 
-def _ensure_target_plans(
-        context: RecordContext, state_file: Path, services: RecordServices,
-) -> dict[int, prompt_builder.TargetPlan]:
-    planner = getattr(services.generator, "plan_target", None)
-    if not callable(planner):
-        raise RecordWorkerError("generator has no target-plan boundary")
-    plans: dict[int, prompt_builder.TargetPlan] = {}
+def _resolve_target_plan(
+        context: RecordContext, state_file: Path, target_index: int,
+        services: RecordServices,
+) -> prompt_builder.TargetPlan:
     state = task_state.load_state(state_file)
-    for target_index in context.target_indices:
-        target_token = state["target_tokens"][target_index]
-        target = state["targets"][target_token]
-        if target["status"] in {"success", "accepted-local", "failed"}:
-            continue
+    target_token = state["target_tokens"][target_index]
+    target = state["targets"][target_token]
+    persisted = target["target_plan"]
+    if persisted is not None:
+        plan = prompt_builder.deserialize_plan(persisted)
+    else:
+        planner = getattr(services.generator, "plan_target", None)
+        if not callable(planner):
+            raise RecordWorkerError("generator has no target-plan boundary")
         plan = planner(context, target_index, target_token)
         if not isinstance(plan, prompt_builder.TargetPlan):
             raise RecordWorkerError("target planner returned an invalid plan")
         serialized = json.loads(prompt_builder.serialize_plan(plan))
         task_state.record_target_plan(state, target_index, serialized)
         task_state.save_state(state_file, state)
-        _event(
-            services, "target_started", record_id=context.record_id,
-            target_id=target_token, run_id=state["run_id"], status="running",
-            reference_count=len(plan.reference_tokens),
-        )
-        plans[target_index] = plan
-    return plans
+    _event(
+        services, "target_started", record_id=context.record_id,
+        target_id=target_token, run_id=state["run_id"], status="running",
+        reference_count=len(plan.reference_tokens),
+    )
+    return plan
+
+
+def _planning_failure(
+        context: RecordContext, state_file: Path, services: RecordServices,
+) -> RecordResult:
+    state = task_state.load_state(state_file)
+    _record_error(
+        state_file, state, services, code="record-data",
+        message="target planning failed",
+    )
+    return _finish_result(
+        context, task_state.load_state(state_file), services, "failed",
+    )
 
 
 def _drain_accepted_local(
@@ -517,8 +532,13 @@ def _request_qc(
         plan: prompt_builder.TargetPlan, history: dict[str, Any],
         candidate: Path, digest: str, services: RecordServices,
 ) -> vision_qc.QCReport | None:
-    state = task_state.load_state(state_file)
-    token = state["target_tokens"][target_index]
+    checkpoint = _qc_checkpoint(
+        context, state_file, target_index, plan, history, candidate, digest,
+        services,
+    )
+    if checkpoint is None:
+        return None
+    token = checkpoint["target_tokens"][target_index]
     _event(
         services, "qc_started", record_id=context.record_id, target_id=token,
         run_id=history["run_id"], attempt=history["attempt"], status="running",
@@ -532,6 +552,26 @@ def _request_qc(
         attempt=history["attempt"], candidate=candidate,
         candidate_sha256=digest, plan=plan,
     )
+    immediate = _qc_checkpoint(
+        context, state_file, target_index, plan, history, candidate, digest,
+        services,
+    )
+    if immediate is None:
+        _event(
+            services, "qc_finished", record_id=context.record_id,
+            target_id=token, run_id=history["run_id"], attempt=history["attempt"],
+            status="stopped", phase="qc", candidate_digest=digest,
+            error_category="stopped",
+        )
+        return None
+    if immediate != checkpoint:
+        _set_stop(services.stop_signal)
+        _event(
+            services, "stop_observed", record_id=context.record_id,
+            target_id=token, attempt=history["attempt"], status="stopped",
+            error_category="stopped",
+        )
+        return None
     try:
         value = reviewer(request)
         report = value.report if isinstance(value, QCReviewResult) else value
@@ -558,6 +598,71 @@ def _request_qc(
     )
     task_state.save_state(state_file, state)
     return report
+
+
+def _qc_checkpoint(
+        context: RecordContext, state_file: Path, target_index: int,
+        plan: prompt_builder.TargetPlan, history: dict[str, Any],
+        candidate: Path, digest: str, services: RecordServices,
+) -> dict[str, Any] | None:
+    """Stop unless durable state still owns this exact current-cycle candidate."""
+    if _stop_requested(services.stop_signal):
+        _event(
+            services, "stop_observed", record_id=context.record_id,
+            attempt=history.get("attempt"), status="stopped",
+            error_category="stopped",
+        )
+        return None
+    try:
+        state = _load_bound_state(state_file, context)
+        token = state["target_tokens"][target_index]
+        target = state["targets"][token]
+        canonical_plan = json.loads(prompt_builder.serialize_plan(plan))
+        if (state["record_error"] is not None
+                or state["current_target"] != token
+                or target["status"] != "running"
+                or target["target_plan"] != canonical_plan):
+            raise RecordWorkerError("QC candidate is no longer active")
+        cycle = task_state.current_attempt_cycle(state, target_index)
+        durable = next(
+            entry for entry in cycle
+            if (
+                entry["run_id"], entry["artifact_name"], entry["attempt"],
+                entry["artifact_ordinal"], entry["prompt_sha256"],
+            ) == (
+                history.get("run_id"), history.get("artifact_name"),
+                history.get("attempt"), history.get("artifact_ordinal"),
+                history.get("prompt_sha256"),
+            )
+        )
+        if (_artifact_path(context, durable, services) != candidate.resolve()
+                or _validate_candidate(candidate, durable, target) != digest):
+            raise RecordWorkerError("QC candidate identity changed")
+    except (
+            IndexError, KeyError, OSError, StopIteration, TypeError,
+            image_qc.ImageQCError, prompt_builder.PromptPlanError,
+            task_state.TaskStateError, RecordWorkerError,
+    ):
+        _set_stop(services.stop_signal)
+        event_fields: dict[str, Any] = {
+            "record_id": context.record_id,
+            "attempt": history.get("attempt"),
+            "status": "stopped",
+            "error_category": "stopped",
+        }
+        if ("state" in locals()
+                and target_index < len(state.get("target_tokens", []))):
+            event_fields["target_id"] = state["target_tokens"][target_index]
+        _event(services, "stop_observed", **event_fields)
+        return None
+    if _stop_requested(services.stop_signal):
+        _event(
+            services, "stop_observed", record_id=context.record_id,
+            target_id=token, attempt=history["attempt"], status="stopped",
+            error_category="stopped",
+        )
+        return None
+    return state
 
 
 def _select_after_third_attempt(

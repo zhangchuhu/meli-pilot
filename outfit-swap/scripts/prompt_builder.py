@@ -185,6 +185,99 @@ def serialize_plan(plan: TargetPlan) -> str:
     )
 
 
+def deserialize_plan(value: object) -> TargetPlan:
+    """Reconstruct one canonical persisted plan through the typed validators."""
+    plan_fields = frozenset({
+        "schema_version", "classification", "selected_references",
+        "fifth_reference_reason", "garment_facts", "infographic_inventory",
+    })
+    inventory_fields = frozenset({
+        "target_token", "visible_text", "panels", "garment_instances",
+        "reading_count", "adjudicated", "settled",
+    })
+    if (not isinstance(value, dict) or set(value) != plan_fields
+            or value.get("schema_version") != 2
+            or isinstance(value.get("schema_version"), bool)):
+        raise PromptPlanError("persisted target plan fields are invalid")
+    references_value = value["selected_references"]
+    facts_value = value["garment_facts"]
+    inventory_value = value["infographic_inventory"]
+    if (not isinstance(references_value, list)
+            or not all(
+                isinstance(reference, dict)
+                and set(reference) == {"token", "role"}
+                for reference in references_value
+            )
+            or not isinstance(facts_value, dict)
+            or set(facts_value) != {"required", "forbidden"}):
+        raise PromptPlanError("persisted target plan structure is invalid")
+
+    def string_list(
+            candidate: object, name: str, *, allow_empty: bool,
+    ) -> tuple[str, ...]:
+        if (not isinstance(candidate, list)
+                or (not allow_empty and not candidate)
+                or not all(isinstance(item, str) and item for item in candidate)):
+            raise PromptPlanError(f"persisted {name} is invalid")
+        return tuple(candidate)
+
+    try:
+        references = tuple(
+            SelectedReference(
+                token=reference["token"], role=reference["role"],
+            )
+            for reference in references_value
+        )
+        facts = GarmentFacts(
+            required=string_list(
+                facts_value["required"], "required garment facts",
+                allow_empty=True,
+            ),
+            forbidden=string_list(
+                facts_value["forbidden"], "forbidden garment facts",
+                allow_empty=True,
+            ),
+        )
+        inventory = None
+        if inventory_value is not None:
+            if (not isinstance(inventory_value, dict)
+                    or set(inventory_value) != inventory_fields):
+                raise PromptPlanError(
+                    "persisted infographic inventory fields are invalid",
+                )
+            inventory = infographic_text.InfographicInventory(
+                target_token=inventory_value["target_token"],
+                visible_text=string_list(
+                    inventory_value["visible_text"], "visible text",
+                    allow_empty=False,
+                ),
+                panels=string_list(
+                    inventory_value["panels"], "panels", allow_empty=False,
+                ),
+                garment_instances=string_list(
+                    inventory_value["garment_instances"], "garment instances",
+                    allow_empty=False,
+                ),
+                reading_count=inventory_value["reading_count"],
+                adjudicated=inventory_value["adjudicated"],
+                settled=inventory_value["settled"],
+            )
+        plan = TargetPlan(
+            classification=value["classification"],
+            selected_references=references,
+            garment_facts=facts,
+            infographic_inventory=inventory,
+            fifth_reference_reason=value["fifth_reference_reason"],
+        )
+    except PromptPlanError:
+        raise
+    except (KeyError, TypeError, infographic_text.InventoryError) as error:
+        raise PromptPlanError("persisted target plan values are invalid") from error
+    if json.loads(serialize_plan(plan)) != value:
+        raise PromptPlanError("persisted target plan is not canonical")
+    return plan
+
+
 def plan_digest(plan: TargetPlan) -> str:
     """Return the SHA-256 identity of the canonical plan."""
     return hashlib.sha256(serialize_plan(plan).encode("utf-8")).hexdigest()

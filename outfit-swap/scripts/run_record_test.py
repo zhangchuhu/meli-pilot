@@ -56,10 +56,18 @@ class FakeStopSignal:
     def __init__(self, stopped: bool = False) -> None:
         self.stopped = stopped
         self.checks = 0
+        self.on_check = None
 
     def is_set(self) -> bool:
         self.checks += 1
+        if self.on_check is not None:
+            callback = self.on_check
+            self.on_check = None
+            callback()
         return self.stopped
+
+    def set(self) -> None:
+        self.stopped = True
 
 
 class RecordingEvents:
@@ -176,6 +184,7 @@ class FakeGenerator:
         self.trace = trace
         self.calls: list[GenerationRequest] = []
         self.plan_calls: list[int] = []
+        self.plan_errors: dict[int, BaseException] = {}
         self.outcomes: dict[tuple[int, int], str] = {}
         self.transport_calls: list[tuple[int, int, int]] = []
 
@@ -185,6 +194,9 @@ class FakeGenerator:
     ) -> prompt_builder.TargetPlan:
         del context, target_token
         self.plan_calls.append(target_index)
+        self.trace.append(("plan", target_index))
+        if target_index in self.plan_errors:
+            raise self.plan_errors[target_index]
         return plan()
 
     def artifact_path(self, context: RecordContext, history: dict) -> Path:
@@ -466,6 +478,52 @@ class RunRecordTest(unittest.TestCase):
         self.assertEqual(len(self.generator.calls), 0)
         self.assertEqual([(call.attempt) for call in self.qc.calls], [1])
 
+    def test_stop_before_pending_qc_preserves_artifact_without_reviewer_call(self) -> None:
+        context = self.initialize()
+        state = task_state.load_state(self.state_file)
+        candidate = self.begin(state)
+        write_png(candidate)
+        self.stop.stopped = True
+
+        result = run_record(context, self.services())
+
+        target = task_state.load_state(self.state_file)["targets"]["box_target_1"]
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual((target["status"], target["attempts"]), ("running", 1))
+        self.assertEqual(len(self.qc.calls), 0)
+        self.assertTrue(candidate.is_file())
+
+    def test_stale_current_cycle_before_final_selection_qc_calls_no_reviewer(self) -> None:
+        context = self.initialize()
+        state = task_state.load_state(self.state_file)
+        for attempt in (1, 2):
+            candidate = self.begin(state, prompt=f"attempt {attempt}")
+            write_png(candidate, 100 + attempt)
+            task_state.record_failure(
+                state, target_token="box_target_1", error="visual rejection",
+                updated_at=self.clock(),
+            )
+        self.begin(state, prompt="attempt 3")
+
+        def stale_current_cycle() -> None:
+            stale = task_state.load_state(self.state_file)
+            task_state.record_error(
+                stale, code="external-call", error="concurrent state change",
+                updated_at=self.clock(),
+            )
+            task_state.save_state(self.state_file, stale)
+
+        self.stop.on_check = stale_current_cycle
+
+        result = run_record(context, self.services())
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(len(self.qc.calls), 0)
+        self.assertEqual(
+            task_state.load_state(self.state_file)["record_error"]["code"],
+            "external-call",
+        )
+
     def test_restart_from_persisted_qc_decision_does_not_repeat_qc(self) -> None:
         context = self.initialize()
         state = task_state.load_state(self.state_file)
@@ -578,6 +636,46 @@ class RunRecordTest(unittest.TestCase):
         self.assertEqual(key_steps[2], ("qc", 1, 1))
         self.assertEqual(key_steps[3][0:2], ("finalize", 1))
         self.assertFalse(any(item[0] == "generate" for item in key_steps))
+
+    def test_later_planning_failure_waits_for_earlier_active_recovery(self) -> None:
+        context = self.initialize(targets=2)
+        state = task_state.load_state(self.state_file)
+        first = self.begin(state, 0)
+        write_png(first)
+        self.generator.plan_errors[1] = RuntimeError("second plan unavailable")
+
+        result = run_record(context, self.services())
+
+        persisted = task_state.load_state(self.state_file)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(persisted["targets"]["box_target_1"]["status"], "success")
+        self.assertEqual(persisted["targets"]["box_target_2"]["status"], "pending")
+        finalize_position = next(
+            index for index, item in enumerate(self.trace)
+            if item[0:2] == ("finalize", 0)
+        )
+        second_plan_position = self.trace.index(("plan", 1))
+        self.assertLess(finalize_position, second_plan_position)
+
+    def test_persisted_plan_recovers_active_artifact_without_planner(self) -> None:
+        context = self.initialize()
+        state = task_state.load_state(self.state_file)
+        candidate = self.begin(state)
+        write_png(candidate)
+        self.generator.plan_calls.clear()
+        self.generator.plan_errors[0] = RuntimeError("planner must not run")
+
+        result = run_record(context, self.services())
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(self.generator.plan_calls, [])
+        self.assertEqual(len(self.qc.calls), 1)
+        self.assertEqual(
+            task_state.load_state(self.state_file)["targets"]["box_target_1"][
+                "status"
+            ],
+            "success",
+        )
 
     def test_missing_active_artifact_spends_attempt_before_new_generation(self) -> None:
         context = self.initialize()
