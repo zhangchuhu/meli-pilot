@@ -32,7 +32,7 @@ Each request has a ten-image cap:
 
 - Image 1 is always the target image and is always passed first.
 - Image 2 is the closest-angle or closest-region primary source reference and is always passed second; visible construction in Image 2 wins any conflict for the current view.
-- Images 3-N are complementary garment references, ending no later than Image 10. Use at most eight complementary sources for non-conflicting color, material, construction, and detail evidence.
+- Images 3-N contain every qualified complementary source, ending no later than Image 10. Include a source only when it adds an unseen angle, construction, closure, full-outfit, hem, garment-instance, or detail role. Exclude size charts, zero-information sources, exact byte duplicates, and same-view/same-role sources with no new garment structure. Use at most eight complementary sources, for at most nine references total.
 
 For ordinary images, match front to front, side to side, and back to back. If there is no exact source angle, use the nearest three-quarter fallback plus complementary references; never skip a target because its exact angle is unavailable. Infer only construction consistent with visible neckline/collar, sleeves, closures, waist, silhouette, material, length, and hem.
 

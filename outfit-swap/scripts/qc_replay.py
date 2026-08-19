@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -730,11 +732,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _live_response_archive() -> Path:
+    raw_root = os.environ.get("OUTFIT_SWAP_RUNS_ROOT")
+    runs_root = (
+        Path(raw_root).expanduser()
+        if isinstance(raw_root, str) and raw_root.strip()
+        else Path.home() / ".codex" / "state" / "outfit-swap" / "runs"
+    ).resolve(strict=False)
+    run = (
+        runs_root / "qc-replay"
+        / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    )
+    return run / "ark-responses"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         manifest = load_manifest(args.manifest)
-        client = ark_vision_qc.ArkVisionClient() if args.live_ark else None
+        client = (
+            ark_vision_qc.ArkVisionClient(
+                response_archive_dir=_live_response_archive(),
+            )
+            if args.live_ark else None
+        )
         result = replay_manifest(
             manifest, live_ark=args.live_ark, client=client,
         )

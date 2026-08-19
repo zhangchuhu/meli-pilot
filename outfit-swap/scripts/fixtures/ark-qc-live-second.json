@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "candidate": "attempt-01-31421aa326f5-01.png",
+  "scores": {
+    "garment_construction": 95,
+    "color_material": 98,
+    "garment_details": 97,
+    "target_preservation": 60,
+    "text_layout": null
+  },
+  "critical_defects": [],
+  "primary_defect": null,
+  "evidence": "The candidate accurately depicts the cream/white linen vest from reference images, including correct V-neckline, five front buttons, four welt pockets, side adjuster buckle, fabric texture, and matching wide-leg trousers. However, the person's pose, background, hair styling, shoes, and hand pose (holding a phone) differ from the target image, and the target's navy pinstriped long vest dress design is not preserved as the candidate shows the white vest pants set.",
+  "confidence": 92,
+  "decision": "reject",
+  "exact_text": null,
+  "added_text": null,
+  "missing_text": null,
+  "instances_exact": null,
+  "panel_count_exact": null,
+  "panel_layout_exact": null
+}

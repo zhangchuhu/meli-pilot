@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {"token": "source_1", "angle": "front", "roles": ["full_outfit_flat_lay", "instance:dress"], "information_score": 85},
+    {"token": "source_2", "angle": "front-close", "roles": ["closure_detail", "collar_detail", "waist_detail", "material_detail", "trim_detail", "instance:dress"], "information_score": 90},
+    {"token": "source_3", "angle": "back", "roles": ["full_outfit_flat_lay", "upper_construction", "skirt_hem", "instance:dress"], "information_score": 80},
+    {"token": "source_4", "angle": "front", "roles": ["model", "instance:dress"], "information_score": 85},
+    {"token": "source_5", "angle": "front", "roles": ["model", "instance:dress"], "information_score": 20},
+    {"token": "source_6", "angle": "front", "roles": ["model", "instance:dress"], "information_score": 20},
+    {"token": "source_7", "angle": "front", "roles": ["model", "instance:dress"], "information_score": 20},
+    {"token": "source_8", "angle": "front", "roles": ["model", "instance:dress"], "information_score": 85}
+  ],
+  "garment_facts": {
+    "required": [
+      "garment_type:dress", "color:pink", "neckline:collar",
+      "collar_shape:pointed", "collar_size:standard", "sleeve_length:short",
+      "sleeves:short", "sleeve_coverage:both", "cuff:absent",
+      "closure_type:buttons", "closure:button", "closure_state:closed",
+      "placket:continuous-to-bottom", "front_style:closed-front",
+      "material:lace", "trim:lace", "trim:ruffle", "waist_detail",
+      "silhouette:a-line", "skirt_hem",
+      "undergarment_visibility:no-exposed-straps"
+    ],
+    "forbidden": [
+      "garment_type:coat", "garment_type:jacket", "garment_type:pants",
+      "garment_type:set", "garment_type:skirt", "garment_type:top",
+      "garment_type:other", "color:beige", "color:black", "color:blue",
+      "color:brown", "color:gray", "color:green", "color:ivory",
+      "color:multicolor", "color:orange", "color:purple", "color:red",
+      "color:yellow", "color:unclear", "color:white", "material:denim",
+      "material:knit", "material:leather", "closure:open-front",
+      "closure:zip", "closure:wrap", "closure_type:zip",
+      "closure_type:pearl-buttons", "collar_shape:rounded",
+      "collar_shape:other", "collar_size:large", "collar_size:small",
+      "sleeve_length:long", "sleeve_length:sleeveless",
+      "sleeve_length:three-quarter", "sleeves:long", "sleeves:sleeveless",
+      "sleeves:three-quarter", "neckline:crew", "neckline:square",
+      "neckline:strapless", "neckline:v-neck", "placket:none",
+      "placket:partial", "silhouette:fitted", "silhouette:flared",
+      "silhouette:oversized", "silhouette:straight", "trim:piping",
+      "trim:none", "undergarment_visibility:exposed-straps"
+    ]
+  },
+  "garment_instances": ["dress"]
+}

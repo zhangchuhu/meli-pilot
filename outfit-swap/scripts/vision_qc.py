@@ -221,8 +221,12 @@ def parse_report(raw: str, *, infographic: bool) -> QCReport:
         raise VisionQCError("primary_defect must be a defect code or null")
     primary = None if raw_primary is None else _defect(raw_primary, "primary_defect")
 
-    if not isinstance(report["evidence"], list):
-        raise VisionQCError("evidence must be a JSON array")
+    if (not isinstance(report["evidence"], list)
+            or not all(
+                isinstance(item, str) and bool(item.strip())
+                for item in report["evidence"]
+            )):
+        raise VisionQCError("evidence must be an array of non-empty strings")
     confidence = report["confidence"]
     if (not isinstance(confidence, (int, float)) or isinstance(confidence, bool)
             or not math.isfinite(confidence) or not 0 <= confidence <= 1):

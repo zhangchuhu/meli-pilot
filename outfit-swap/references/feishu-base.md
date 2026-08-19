@@ -62,19 +62,21 @@ revalidate candidate digest
 → persist accepted-local
 → read current Base fields
 → upload only when not already present
-→ persist success mapping
+→ treat an exit-zero upload command as success
+→ persist a returned file_token or a local command-success receipt
 → write compact detail
-→ exact Base readback
 ```
 
-The exact Base readback must contain both the accepted attachment mapping and the exact compact detail. On mismatch, upload failure, update failure, or readback failure, stop immediately; do not turn a persistence failure into a generation retry.
+Treat an exit-zero upload command as target upload success. Do not read the Base output field after that command and do not require a returned attachment filename. If the command response contains exactly one recognizable `file_token` or `uploaded_file_token`, persist the real token-backed mapping. Otherwise persist a deterministic local `command-success` receipt with the logical output name; never fabricate a remote token. A command-success target remains successful during later reconciliation even when no Base attachment token is available.
+
+Treat an exit-zero target-level `处理明细` update as successful without an immediate readback. A nonzero upload command or target detail-update failure stops immediately; do not turn a persistence failure into a generation retry. The record-level terminal `任务状态` plus `处理明细` write retains its exact readback because it is the authoritative whole-record terminal boundary.
 
 Resume from the durable checkpoint:
 
 - `running`: stage any earlier-run artifact into the current generated directory, then promote and persist `accepted-local` before upload.
 - `accepted-local`: revalidate and finalize the current staged candidate, then reconcile/upload it without generation.
-- uploaded but detail not written: reconcile the deterministic attachment, persist success, and continue the same transaction without duplicate upload.
-- `success`: verify the current mapping and detail; return without duplicate upload when exact.
+- uploaded but detail not written: a token-backed attachment may reconcile by deterministic name; otherwise a persisted command-success receipt resumes detail persistence without another upload.
+- `success`: preserve either a token-backed mapping or command-success receipt and never let a later attachment readback overturn it.
 
 Outputs are append-only. Never delete or overwrite historical Base attachments. Match recovery by the target-token digest independently of current attachment order; the ordered index is display-only.
 

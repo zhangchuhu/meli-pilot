@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -41,7 +42,10 @@ class OrdinaryReferenceSelectionTest(unittest.TestCase):
             tuple(reversed(sources)), classification="front",
         )
 
-        self.assertEqual(forward.tokens, ("front-model", "upper", "flat", "hem"))
+        self.assertEqual(
+            forward.tokens,
+            ("front-model", "back-named-front", "upper", "flat", "hem"),
+        )
         self.assertEqual(reverse, forward)
         self.assertIsNone(forward.fifth_reference_reason)
 
@@ -79,7 +83,10 @@ class OrdinaryReferenceSelectionTest(unittest.TestCase):
                     common, classification=classification,
                 )
                 self.assertEqual(selection.tokens[0], expected_primary)
-                self.assertEqual(selection.tokens[1:], ("upper", "flat", "hem"))
+                self.assertEqual(set(selection.tokens), {
+                    "upper", "flat", "hem", "front", "front-3q",
+                    "side", "back-3q", "back",
+                })
 
     def test_side_and_back_rank_complementary_evidence_by_angle_before_score(self) -> None:
         for classification in ("side", "back"):
@@ -103,59 +110,70 @@ class OrdinaryReferenceSelectionTest(unittest.TestCase):
 
                 self.assertEqual(selection.tokens, (
                     f"{classification}-model", f"{classification}-upper",
-                    f"{classification}-flat", f"{classification}-hem",
+                    f"{classification}-flat", f"{classification}-hem", "front-model",
                 ))
-                self.assertEqual(selection.roles, (
+                self.assertEqual(selection.roles[:4], (
                     "model", "upper_construction", "full_outfit_flat_lay", "skirt_hem",
                 ))
 
-    def test_zero_information_sources_are_excluded_and_missing_evidence_fails(self) -> None:
+    def test_zero_information_sources_are_excluded_without_fixed_role_requirements(self) -> None:
         selection = reference_selector.select_references((
             evidence("zero-side", angle="side", roles=("model",), score=0),
             evidence("front-model", angle="front", roles=("model",), score=10),
-            evidence("upper", angle="side", roles=("upper_construction",), score=10),
-            evidence("flat", angle="side", roles=("full_outfit_flat_lay",), score=10),
         ), classification="side")
-        self.assertEqual(selection.tokens[0], "front-model")
+        self.assertEqual(selection.tokens, ("front-model",))
 
-        with self.assertRaises(reference_selector.ReferenceSelectionError):
-            reference_selector.select_references((
-                evidence("model", angle="front", roles=("model",), score=10),
-                evidence("zero-upper", angle="front", roles=("upper_construction",), score=0),
-                evidence("flat", angle="front", roles=("full_outfit_flat_lay",), score=10),
-            ), classification="front")
-
-    def test_fifth_requires_and_records_nonredundant_unique_evidence(self) -> None:
+    def test_all_novel_evidence_is_sent_without_a_fifth_reference_exception(self) -> None:
         sources = (
             evidence("model", angle="front", roles=("model",)),
             evidence("upper", roles=("upper_construction",)),
             evidence("flat", roles=("full_outfit_flat_lay",)),
             evidence("hem", roles=("skirt_hem",)),
             evidence("waistband", roles=("hidden_waistband",), score=20),
-        )
-        requirement = reference_selector.UniqueEvidenceRequirement(
-            role="hidden_waistband",
-            reason="Only this reference proves the hidden waistband construction.",
+            evidence("back", angle="back", roles=("model",), score=10),
+            evidence("duplicate-front", angle="front", roles=("model",), score=100),
         )
 
         selection = reference_selector.select_references(
-            sources, classification="front", unique_requirement=requirement,
+            sources, classification="front",
         )
 
-        self.assertEqual(selection.tokens, ("model", "upper", "flat", "hem", "waistband"))
-        self.assertEqual(selection.roles, (
-            "model", "upper_construction", "full_outfit_flat_lay", "skirt_hem",
-            "hidden_waistband",
+        self.assertEqual(selection.tokens, (
+            "duplicate-front", "back", "upper", "flat", "hem", "waistband",
         ))
-        self.assertEqual(selection.fifth_reference_reason, requirement.reason)
-        with self.assertRaises(reference_selector.ReferenceSelectionError):
-            reference_selector.select_references(
-                sources,
-                classification="front",
-                unique_requirement=reference_selector.UniqueEvidenceRequirement(
-                    role="hidden_waistband", reason="",
-                ),
-            )
+        self.assertIsNone(selection.fifth_reference_reason)
+
+    def test_exact_duplicate_bytes_are_sent_only_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "primary.png"
+            duplicate = root / "duplicate.png"
+            detail = root / "detail.png"
+            primary.write_bytes(b"same-image")
+            duplicate.write_bytes(b"same-image")
+            detail.write_bytes(b"different-image")
+
+            selection = reference_selector.select_references((
+                evidence("primary", angle="front", roles=("model",), filename=str(primary)),
+                evidence("duplicate", angle="back", roles=("model",), filename=str(duplicate)),
+                evidence("detail", roles=("upper_construction",), filename=str(detail)),
+            ), classification="front")
+
+            self.assertEqual(selection.tokens, ("primary", "detail"))
+
+    def test_reference_input_is_capped_at_nine_after_filtering(self) -> None:
+        sources = [evidence("model", angle="front", roles=("model",), score=100)]
+        sources.extend(
+            evidence(f"detail-{index}", roles=(f"detail:{index}",), score=100 - index)
+            for index in range(1, 12)
+        )
+
+        selection = reference_selector.select_references(
+            tuple(sources), classification="front",
+        )
+
+        self.assertEqual(len(selection.tokens), 9)
+        self.assertEqual(selection.tokens[0], "model")
 
 
 class InfographicReferenceSelectionTest(unittest.TestCase):
@@ -175,9 +193,9 @@ class InfographicReferenceSelectionTest(unittest.TestCase):
         )
 
         self.assertEqual(selection.tokens, ("blouse", "skirt", "lace"))
-        self.assertEqual(selection.covered_roles, (
+        self.assertEqual(set(selection.covered_roles), {
             "instance:blouse", "instance:skirt", "instance:lace detail",
-        ))
+        })
 
     def test_infographic_rejects_an_uncovered_instance(self) -> None:
         with self.assertRaises(reference_selector.ReferenceSelectionError):

@@ -30,7 +30,8 @@ from scripts import (
 )
 from scripts.lark_runner import LarkBaseClient, RecordPage
 from scripts.run_record import (
-    ComparativeQCRequest, QCRequest, RecordContext, RecordResult, RecordServices, run_record,
+    ComparativeQCRequest, PlanningStopped, QCRequest, RecordContext,
+    RecordResult, RecordServices, run_record,
 )
 from scripts.run_table import (
     BaseField,
@@ -55,44 +56,18 @@ _ORDINARY = frozenset({
     "front", "front three-quarter", "side", "back three-quarter", "back",
 })
 _CLASSIFICATIONS = _ORDINARY | frozenset({"detail or flat lay", "infographic"})
+SOURCE_ANGLE_ALIASES = {
+    "front-close": "detail or flat lay",
+    "front close-up": "detail or flat lay",
+    "close-up front": "detail or flat lay",
+}
 _DETAIL_DEFINITION = {
     "name": "处理明细", "type": "text", "style": {"type": "plain"},
 }
-_FACT_CODES = frozenset({
-    "garment_type:dress", "garment_type:top", "garment_type:skirt",
-    "garment_type:pants", "garment_type:set", "garment_type:jacket",
-    "garment_type:coat", "garment_type:other",
-    "sleeves:sleeveless", "sleeves:short", "sleeves:three-quarter",
-    "sleeves:long", "sleeves:not-applicable", "sleeves:unclear",
-    "neckline:crew", "neckline:v-neck", "neckline:square",
-    "neckline:collar", "neckline:strapless", "neckline:other",
-    "neckline:not-applicable", "neckline:unclear",
-    "closure:closed", "closure:button", "closure:zip", "closure:wrap",
-    "closure:open-front", "closure:other", "closure:not-visible",
-    "closure:unclear", "silhouette:fitted", "silhouette:straight",
-    "silhouette:a-line", "silhouette:flared", "silhouette:oversized",
-    "silhouette:other", "silhouette:unclear", "material:woven",
-    "material:knit", "material:denim", "material:leather",
-    "material:lace", "material:sheer", "material:other", "material:unclear",
-    "color:black", "color:white", "color:gray", "color:red", "color:orange",
-    "color:yellow", "color:green", "color:blue", "color:purple",
-    "color:pink", "color:brown", "color:beige", "color:multicolor",
-    "color:ivory", "color:other", "color:unclear",
-    "collar_shape:pointed", "collar_shape:rounded", "collar_shape:other",
-    "collar_size:small", "collar_size:standard", "collar_size:large",
-    "placket:continuous-to-bottom", "placket:partial", "placket:none",
-    "closure_type:pearl-buttons", "closure_type:buttons",
-    "closure_type:zip", "closure_type:other",
-    "closure_state:closed", "closure_state:open",
-    "sleeve_length:sleeveless", "sleeve_length:short",
-    "sleeve_length:three-quarter", "sleeve_length:long",
-    "sleeve_coverage:both", "sleeve_coverage:asymmetric",
-    "cuff:present", "cuff:absent",
-    "front_style:closed-front", "front_style:open-cardigan",
-    "undergarment_visibility:no-exposed-straps",
-    "undergarment_visibility:exposed-straps",
-    "trim:lace", "trim:ruffle", "trim:piping", "trim:none",
-})
+_SAFE_FACT_CODE = re.compile(
+    r"[a-z][a-z0-9_-]{0,47}:[a-z0-9][a-z0-9_-]{0,79}\Z",
+)
+_MAX_GARMENT_FACTS = 64
 _INSTANCE_CODES = {
     "dress": "dress", "top": "upper garment", "skirt": "skirt",
     "pants": "pants", "jacket": "jacket", "coat": "coat",
@@ -101,6 +76,28 @@ _INSTANCE_CODES = {
 
 
 def _qc_schema_contract() -> str:
+    ordinary_example = {
+        "schema_version": 1,
+        "candidate": "COPY_THE_REQUESTED_CANDIDATE_EXACTLY",
+        "scores": {
+            "garment_construction": 90,
+            "color_material": 90,
+            "garment_details": 90,
+            "target_preservation": 90,
+            "text_layout": None,
+        },
+        "critical_defects": [],
+        "primary_defect": None,
+        "evidence": ["One concise visible observation."],
+        "confidence": 0.90,
+        "decision": "accept",
+        "exact_text": None,
+        "added_text": None,
+        "missing_text": None,
+        "instances_exact": None,
+        "panel_count_exact": None,
+        "panel_layout_exact": None,
+    }
     return (
         "Each visual-QC object has exactly schema_version(integer 1), candidate, scores, "
         "critical_defects, primary_defect, evidence, confidence, decision, exact_text, "
@@ -109,8 +106,16 @@ def _qc_schema_contract() -> str:
         "integer 0..100 and text_layout integer 0..100 for infographic or null otherwise. "
         "decision is accept, reject, or retry. Defects use only "
         + json.dumps(sorted(code.value for code in vision_qc.DefectCode), separators=(",", ":"))
-        + ". For infographic exactness booleans are required and added_text/missing_text are "
-          "literal arrays; for ordinary all six exactness fields are null."
+        + ". evidence must be a JSON array of non-empty strings, never one string. "
+          "confidence must be a JSON decimal from 0 through 1, never a percentage. "
+          "For infographic exactness booleans are required and added_text/missing_text are "
+          "literal arrays; for ordinary all six exactness fields are null. "
+          "target_preservation evaluates only the target person's face, identity, body, pose, "
+          "crop, composition, hands, feet, shoes, carried objects, background, lighting, and "
+          "shadows. The target's original clothing is intentionally replaced: never reduce "
+          "target_preservation because the original clothing is absent. Evaluate the replacement "
+          "garment against the ordered garment references. Exact ordinary JSON type example: "
+        + json.dumps(ordinary_example, ensure_ascii=False, separators=(",", ":"))
     )
 _FACT_LABELS = {
     "garment_type": "Garment type evidence",
@@ -229,10 +234,16 @@ def _run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def _directory_from_env(environ: Mapping[str, str], name: str, default: Path) -> Path:
+def _directory_path_from_env(
+        environ: Mapping[str, str], name: str, default: Path,
+) -> Path:
     raw = environ.get(name)
     path = Path(raw).expanduser() if isinstance(raw, str) and raw.strip() else default
-    resolved = path.resolve(strict=False)
+    return path.resolve(strict=False)
+
+
+def _directory_from_env(environ: Mapping[str, str], name: str, default: Path) -> Path:
+    resolved = _directory_path_from_env(environ, name, default)
     if resolved.exists() and (not resolved.is_dir() or resolved.is_symlink()):
         raise TableSchedulerError(f"{name} is not a safe directory")
     resolved.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -276,8 +287,15 @@ def _require_python(version_info: Sequence[int]) -> None:
         raise TableSchedulerError("Python 3.10 or newer is required")
 
 
-def _make_ark_client() -> ark_vision_qc.ArkVisionClient:
-    return ark_vision_qc.ArkVisionClient()
+def _make_ark_client(
+        environ: Mapping[str, str], *, response_archive_dir: Path | None = None,
+) -> ark_vision_qc.ArkVisionClient:
+    try:
+        return ark_vision_qc.ArkVisionClient(
+            environ=environ, response_archive_dir=response_archive_dir,
+        )
+    except ValueError:
+        raise TableSchedulerError("Ark timeout configuration is invalid") from None
 
 
 def _transcode_to_png(source: Path, output: Path) -> Path:
@@ -330,9 +348,23 @@ def _bounded_garment_facts(
         required: tuple[str, ...], forbidden: tuple[str, ...],
 ) -> prompt_builder.GarmentFacts:
     codes = required + forbidden
-    if (not codes or any(code not in _FACT_CODES for code in codes)
+    if (not codes or len(codes) > _MAX_GARMENT_FACTS
+            or any(_SAFE_FACT_CODE.fullmatch(code) is None for code in codes)
             or len(set(codes)) != len(codes)):
-        raise TableSchedulerError("Ark garment facts are not bounded evidence codes")
+        raise TableSchedulerError(
+            "Ark garment facts are not safe category:value codes",
+        )
+
+    def label(category: str) -> str:
+        return _FACT_LABELS.get(
+            category,
+            category.replace("_", " ").replace("-", " ").capitalize()
+            + " evidence",
+        )
+
+    def readable(value: str) -> str:
+        return value.replace("_", " ").replace("-", " ")
+
     def render_required(values: tuple[str, ...]) -> tuple[str, ...]:
         remaining = list(values)
         rendered: list[str] = []
@@ -362,7 +394,7 @@ def _bounded_garment_facts(
             category, value = code.split(":", 1)
             rendered.append(
                 _REQUIRED_FACT_TEMPLATES.get(
-                    code, f"{_FACT_LABELS[category]}: {value}.",
+                    code, f"{label(category)}: {readable(value)}.",
                 )
             )
         return tuple(rendered)
@@ -373,7 +405,8 @@ def _bounded_garment_facts(
             category, value = code.split(":", 1)
             rendered.append(
                 _FORBIDDEN_FACT_TEMPLATES.get(
-                    code, f"Do not use {_FACT_LABELS[category].lower()}: {value}.",
+                    code,
+                    f"Do not use {label(category).lower()}: {readable(value)}.",
                 )
             )
         return tuple(rendered)
@@ -625,43 +658,19 @@ class ArkPlanner:
                     ),
                 )
                 instances = inventory.garment_instances
-            evidence, facts, unique, detected_instances = self._source_evidence(
+            evidence, facts, detected_instances = self._source_evidence(
                 sources, instances=instances, checkpoint=checkpoint,
             )
             if not instances:
                 instances = detected_instances
-            if classification in _ORDINARY or classification == "infographic":
-                selection = reference_selector.select_references(
-                    evidence, classification=classification,
-                    garment_instances=(instances if classification == "infographic" else ()),
-                    unique_requirement=unique,
-                )
-                chosen = list(selection.selected)
-                roles = list(selection.roles)
-                fifth_reason = selection.fifth_reference_reason
-            else:
-                chosen = sorted(
-                    (item for item in evidence if item.information_score > 0
-                     and "size_chart" not in item.roles),
-                    key=lambda item: (-item.information_score, item.token),
-                )[:4]
-                roles = ["garment_evidence"] * len(chosen)
-                fifth_reason = None
-            selected_tokens = {item.token for item in chosen}
-            for item in sorted(
-                    evidence, key=lambda value: (-value.information_score, value.token),
-            ):
-                if len(chosen) >= 3:
-                    break
-                if (item.token not in selected_tokens and item.information_score > 0
-                        and "size_chart" not in item.roles):
-                    chosen.append(item)
-                    roles.append("supporting_evidence")
-                    selected_tokens.add(item.token)
-        if not 3 <= len(chosen) <= 5:
-            raise TableSchedulerError("target planning requires three or four references")
-        if len(chosen) == 5 and fifth_reason is None:
-            raise TableSchedulerError("the fifth reference lacks unique evidence")
+            selection = reference_selector.select_references(
+                evidence, classification=classification,
+                garment_instances=(instances if classification == "infographic" else ()),
+            )
+            chosen = list(selection.selected)
+            roles = list(selection.roles)
+        if not 1 <= len(chosen) <= 9:
+            raise TableSchedulerError("target planning requires one through nine references")
         return prompt_builder.TargetPlan(
             classification=classification,
             selected_references=tuple(
@@ -670,7 +679,7 @@ class ArkPlanner:
             ),
             garment_facts=facts,
             infographic_inventory=inventory,
-            fifth_reference_reason=fifth_reason,
+            fifth_reference_reason=None,
             garment_instances=tuple(instances),
         )
 
@@ -681,20 +690,27 @@ class ArkPlanner:
         complete = getattr(self._adapter, "ark_complete", None)
         if not callable(complete):
             raise TableSchedulerError("shared Ark request gate is unavailable")
-        return _strict_json(complete(
-            system_prompt=system, user_prompt=user, images=tuple(images),
-            checkpoint=checkpoint,
-        ))
+        try:
+            raw = complete(
+                system_prompt=system, user_prompt=user, images=tuple(images),
+                checkpoint=checkpoint,
+            )
+        except (ark_vision_qc.ArkVisionError, PaidCallStopped):
+            raise PlanningStopped("Ark planning transport stopped") from None
+        return _strict_json(raw)
 
     def _classify(self, target: Path, checkpoint: object) -> str:
         value = _object(self._complete(
             system=(
                 "Determine one target classification from visible content. Return "
-                "strict JSON with schema_version and classification only."
+                "strict JSON with schema_version and classification only. "
+                "schema_version must be JSON integer 1, never a quoted string."
             ),
             user=(
                 "Choose exactly one of: front, front three-quarter, side, back "
-                "three-quarter, back, detail or flat lay, infographic."
+                "three-quarter, back, detail or flat lay, infographic. Return the "
+                "same JSON types as this exact example: "
+                '{"schema_version":1,"classification":"front"}'
             ),
             images=(target,),
             checkpoint=checkpoint,
@@ -710,35 +726,69 @@ class ArkPlanner:
     ) -> tuple[
         tuple[reference_selector.SourceEvidence, ...],
         prompt_builder.GarmentFacts,
-        reference_selector.UniqueEvidenceRequirement | None,
         tuple[str, ...],
     ]:
         tokens = [token for token, _path in sources]
+        shape_example = {
+            "schema_version": 1,
+            "sources": [
+                {
+                    "token": token,
+                    "angle": "front",
+                    "roles": ["model"],
+                    "information_score": 90,
+                }
+                for token in tokens
+            ],
+            "garment_facts": {
+                "required": ["garment_type:dress"],
+                "forbidden": [],
+            },
+            "garment_instances": ["dress"],
+        }
         value = _object(self._complete(
             system=(
                 "Extract source garment evidence from visible content. Return strict "
-                "JSON for every supplied opaque token and garment facts."
+                "JSON with exactly four top-level keys: schema_version, sources, "
+                "garment_facts, and garment_instances. Each "
+                "source item must have exactly token, angle, roles, and "
+                "information_score. garment_facts must have exactly required and "
+                "forbidden. Do not add keys or wrap the object. "
+                "schema_version must be JSON integer 1, never a quoted string."
             ),
             user=(
                 "Tokens in image order: " + json.dumps(tokens, separators=(",", ":"))
-                + ". Roles may include model, upper_construction, "
-                  "full_outfit_flat_lay, skirt_hem, size_chart, and instance:<literal>. "
+                + ". Each angle must be copied exactly from this closed list: "
+                + json.dumps(sorted(_CLASSIFICATIONS), separators=(",", ":"))
+                + ". Never invent angle aliases such as front-close, front close-up, "
+                  "or close-up front. "
+                + "Roles may include model, upper_construction, "
+                  "collar_detail, closure_detail, sleeve_detail, waist_detail, "
+                  "material_detail, trim_detail, full_outfit_flat_lay, skirt_hem, "
+                  "size_chart, and instance:<literal>. "
                 + "Return garment_instances in visible dressing order using only: "
                 + json.dumps(sorted(_INSTANCE_CODES), separators=(",", ":")) + ". "
-                + "Garment facts must use only these enumerated codes. Multiple "
-                  "compatible codes are allowed; list each exact code at most once "
-                  "across required and forbidden: "
-                + json.dumps(sorted(_FACT_CODES), separators=(",", ":"))
-                + ". "
+                + "Each garment_facts value must be one concise lowercase "
+                  "category:value code. Category and value may contain only ASCII "
+                  "letters, digits, underscore, and hyphen; neither side may contain "
+                  "spaces, prose, punctuation, or instructions. Use no more than 64 "
+                  "unique codes total across required and forbidden. "
                 + "Required infographic instances: "
                 + json.dumps(list(instances), ensure_ascii=False, separators=(",", ":"))
-                + "."
+                + ". Set information_score to 0 for a size chart, unusable image, "
+                  "exact duplicate, or same-view image that adds no visible garment "
+                  "structure. Use a positive score only for usable new evidence"
+                + ". The example demonstrates the required shape and JSON types, "
+                  "not the evidence values. Inspect the supplied images and replace "
+                  "the example angle, roles, score, facts, and "
+                  "garment instances while preserving every opaque token in exact "
+                  "input order. Exact output shape example: "
+                + json.dumps(shape_example, separators=(",", ":"))
             ),
             images=tuple(path for _token, path in sources),
             checkpoint=checkpoint,
         ), frozenset({
-            "schema_version", "sources", "garment_facts", "unique_requirement",
-            "garment_instances",
+            "schema_version", "sources", "garment_facts", "garment_instances",
         }), "source garment evidence")
         if value["schema_version"] != 1 or not isinstance(value["sources"], list):
             raise TableSchedulerError("Ark source garment evidence response is invalid")
@@ -752,13 +802,18 @@ class ArkPlanner:
             token = item["token"]
             score = item["information_score"]
             roles = _string_list(item["roles"], "source roles", allow_empty=False)
-            if (token not in paths or item["angle"] not in _CLASSIFICATIONS
+            raw_angle = item["angle"]
+            angle = (
+                SOURCE_ANGLE_ALIASES.get(raw_angle, raw_angle)
+                if isinstance(raw_angle, str) else raw_angle
+            )
+            if (token not in paths or angle not in _CLASSIFICATIONS
                     or not isinstance(score, int) or isinstance(score, bool)
                     or not 0 <= score <= 100):
                 raise TableSchedulerError("Ark source evidence item is invalid")
             returned.append(token)
             evidence.append(reference_selector.SourceEvidence(
-                token=token, path=paths[token], angle=item["angle"],
+                token=token, path=paths[token], angle=angle,
                 roles=frozenset(roles), information_score=score,
             ))
         if returned != tokens:
@@ -779,16 +834,9 @@ class ArkPlanner:
         )
         if len(instance_codes) > 12 or any(code not in _INSTANCE_CODES for code in instance_codes):
             raise TableSchedulerError("Ark garment instances are not bounded codes")
-        unique_value = value["unique_requirement"]
-        unique = None
-        if unique_value is not None:
-            unique_object = _object(
-                unique_value, frozenset({"role", "reason"}), "unique requirement",
-            )
-            unique = reference_selector.UniqueEvidenceRequirement(
-                role=unique_object["role"], reason=unique_object["reason"],
-            )
-        return tuple(evidence), facts, unique, tuple(_INSTANCE_CODES[code] for code in instance_codes)
+        return tuple(evidence), facts, tuple(
+            _INSTANCE_CODES[code] for code in instance_codes
+        )
 
     def _read_inventory(
             self, target_token: str, target: Path, checkpoint: object,
@@ -906,7 +954,7 @@ class ArkQCAdapter:
             ), images=images, checkpoint=lambda: self._comparative_checkpoint(request),
         )
         return vision_qc.parse_comparative_report(
-            raw, aliases=request.aliases,
+            ark_vision_qc.normalize_comparative_report(raw), aliases=request.aliases,
             infographic=request.plan.classification == "infographic",
         )
 
@@ -1068,7 +1116,7 @@ class ProductionTableAdapter:
                 app_token=scope.app_token, table_id=scope.table_id,
                 limit=200, offset=offset,
             )
-            items, has_more = _page_items(response)
+            items, has_more = _page_items(response, offset=offset)
             fields.extend(_base_field(item) for item in items)
             if not has_more:
                 return fields
@@ -1106,6 +1154,7 @@ class ProductionTableAdapter:
             if len(records) != page.records_count:
                 raise PreflightError("Base record page count does not match its artifact")
             for record in records:
+                record = _canonical_record(record)
                 fields = record.get("fields")
                 record_id = record.get("record_id")
                 if (not isinstance(record_id, str)
@@ -1368,14 +1417,28 @@ class ProductionTableAdapter:
         )
 
 
-def _page_items(response: object) -> tuple[list[dict[str, Any]], bool]:
+def _page_items(
+        response: object, *, offset: int = 0,
+) -> tuple[list[dict[str, Any]], bool]:
     value = response.get("data", response) if isinstance(response, dict) else None
-    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+    if not isinstance(value, dict) or not isinstance(offset, int) or offset < 0:
         raise PreflightError("Base field page is invalid")
-    items = value["items"]
+    item_keys = tuple(key for key in ("items", "fields") if key in value)
+    if len(item_keys) != 1 or not isinstance(value[item_keys[0]], list):
+        raise PreflightError("Base field page is invalid")
+    items = value[item_keys[0]]
     if not all(isinstance(item, dict) for item in items):
         raise PreflightError("Base field page is invalid")
-    has_more = value.get("has_more", len(items) == 200)
+    if "has_more" in value:
+        has_more = value["has_more"]
+    elif "total" in value:
+        total = value["total"]
+        if (not isinstance(total, int) or isinstance(total, bool)
+                or total < offset + len(items)):
+            raise PreflightError("Base field page is invalid")
+        has_more = offset + len(items) < total
+    else:
+        has_more = len(items) == 200
     if not isinstance(has_more, bool):
         raise PreflightError("Base field page is invalid")
     return items, has_more
@@ -1393,8 +1456,10 @@ def _contains_key(value: object, target: str) -> bool:
 
 def _base_field(value: dict[str, Any]) -> BaseField:
     name = value.get("field_name", value.get("name"))
-    field_id = value.get("field_id")
+    field_id = value.get("field_id", value.get("id"))
     kind = value.get("type")
+    if kind == "select" and value.get("multiple") is False:
+        kind = "single_select"
     options_value = value.get("options", ())
     if isinstance(options_value, list):
         options = tuple(
@@ -1422,6 +1487,21 @@ def _read_records(path: Path) -> list[dict[str, Any]]:
     except (OSError, UnicodeError, ValueError):
         raise PreflightError("Base record artifact is invalid") from None
     return records
+
+
+_PROJECTED_RECORD_FIELDS = ("原图", "爆款图", "输出图", "任务状态", "处理明细")
+
+
+def _canonical_record(record: dict[str, Any]) -> dict[str, Any]:
+    if "fields" in record:
+        return record
+    expected = {"record_id", *_PROJECTED_RECORD_FIELDS}
+    if set(record) != expected:
+        raise PreflightError("Base record identity or fields are invalid")
+    return {
+        "record_id": record["record_id"],
+        "fields": {name: record[name] for name in _PROJECTED_RECORD_FIELDS},
+    }
 
 
 def _attachments(value: Any) -> tuple[dict[str, str], ...]:
@@ -1531,6 +1611,15 @@ def execute(
     env = os.environ if environ is None else environ
     _require_python(sys.version_info if version_info is None else version_info)
     executable = _require_dependencies(env)
+    run_id = _run_id()
+    planned_runs_root = _directory_path_from_env(
+        env, "OUTFIT_SWAP_RUNS_ROOT",
+        Path.home() / ".codex" / "state" / "outfit-swap" / "runs",
+    )
+    ark = _make_ark_client(
+        env,
+        response_archive_dir=planned_runs_root / run_id / "ark-responses",
+    )
     state_root = _directory_from_env(
         env, "OUTFIT_SWAP_STATE_ROOT",
         Path.home() / ".codex" / "state" / "outfit-swap" / "tables",
@@ -1539,7 +1628,6 @@ def execute(
         env, "OUTFIT_SWAP_RUNS_ROOT",
         Path.home() / ".codex" / "state" / "outfit-swap" / "runs",
     )
-    run_id = _run_id()
     run_dir = runs_root / run_id
     run_dir.mkdir(mode=0o700)
     table_started = time.monotonic_ns()
@@ -1557,7 +1645,6 @@ def execute(
                 / "doubao-imagegen" / "scripts" / "doubao_imagegen.py"),
         )
         base = ProductionLarkService(run_dir=run_dir, executable=executable)
-        ark = _make_ark_client()
         adapter = ProductionTableAdapter(
             run_id=run_id, run_dir=run_dir, runs_root=runs_root,
             state_root=state_root, base_service=base, ark_client=ark,

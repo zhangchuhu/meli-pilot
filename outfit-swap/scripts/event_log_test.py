@@ -27,6 +27,20 @@ def _append_events_from_process(path: str, run: int, worker: int) -> None:
 
 
 class EventLogTest(unittest.TestCase):
+    def test_target_event_accepts_nine_references_but_not_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = EventLog(Path(temporary) / "events.ndjson", clock_ms=lambda: 1)
+            event = log.append(
+                "target_started", record_id="rec-1", target_id="target-1",
+                reference_count=9,
+            )
+            self.assertEqual(event["reference_count"], 9)
+            with self.assertRaises(EventLogError):
+                log.append(
+                    "target_started", record_id="rec-1", target_id="target-2",
+                    reference_count=10,
+                )
+
     def test_append_writes_one_durable_stable_schema_ndjson_event(self) -> None:
         """Removing append/fsync or adding an unapproved field breaks the contract."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -112,7 +126,7 @@ class EventLogTest(unittest.TestCase):
             )
 
     def test_append_rejects_unknown_and_sensitive_fields_before_writing(self) -> None:
-        """Accepting prompts, tokens, headers, or diagnostic prose would leak data."""
+        """Metrics remain a bounded closed schema; payloads use diagnostic output."""
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "events.ndjson"
             event_log = EventLog(path, clock_ms=lambda: 1)

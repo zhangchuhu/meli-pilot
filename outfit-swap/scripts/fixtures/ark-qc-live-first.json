@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "candidate": "attempt-01-3141aa326f5-01.png",
+  "scores": {
+    "garment_construction": 90,
+    "color_material": 95,
+    "garment_details": 90,
+    "target_preservation": 90,
+    "text_layout": null
+  },
+  "critical_defects": [],
+  "primary_defect": null,
+  "evidence": "The candidate cream linen V-neck button-front tailored vest with pockets, matching wide-leg trousers, and rear waist buckle detail matches the reference garments. Minor detail differences in pocket count/placement do not impact core identity; material, color, silhouette, button styling, and overall set design are consistent with references.",
+  "confidence": 90,
+  "decision": "accept",
+  "exact_text": null,
+  "added_text": null,
+  "missing_text": null,
+  "instances_exact": null,
+  "panel_count_exact": null,
+  "panel_layout_exact": null
+}

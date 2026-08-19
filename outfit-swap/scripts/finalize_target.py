@@ -31,7 +31,7 @@ class FinalizeError(RuntimeError):
 
 
 class BaseClient(Protocol):
-    def upload_attachment(self, **kwargs: object) -> dict: ...
+    def upload_attachment(self, **kwargs: object) -> object: ...
     def update_record(self, **kwargs: object) -> dict: ...
     def get_record(self, **kwargs: object) -> dict: ...
 
@@ -49,7 +49,7 @@ class FinalizeRequest:
 @dataclass(frozen=True)
 class FinalizeResult:
     output_path: Path
-    attachment_token: str
+    attachment_token: str | None
     resumed_from: str
 
 
@@ -132,11 +132,11 @@ class TargetFinalizer:
         target = state["targets"][target_token]
         if target["status"] == "success":
             mapping = target["output"]
-            if mapping not in outputs:
-                raise FinalizeError("successful attachment is absent from Base readback")
             detail = task_state.compact_detail(state)
             if fields.get(DETAIL_FIELD) == detail:
-                return FinalizeResult(output_path, mapping["file_token"], "verified")
+                return FinalizeResult(
+                    output_path, mapping.get("file_token"), "verified",
+                )
             resumed_from = "success"
         else:
             try:
@@ -153,24 +153,31 @@ class TargetFinalizer:
                 except task_state.TaskStateError as error:
                     raise FinalizeError("cannot persist reconciled attachment") from error
             else:
-                mapping = self._upload(request.record_id, output_path)
+                response = self._upload(request.record_id, output_path)
+                file_token = _response_file_token(response)
                 try:
-                    task_state.record_success(
-                        state, target_token=target_token,
-                        file_token=mapping["file_token"], name=output_name,
-                        updated_at=self._timestamp(),
-                    )
+                    if file_token is not None:
+                        task_state.record_success(
+                            state, target_token=target_token,
+                            file_token=file_token, name=output_name,
+                            updated_at=self._timestamp(),
+                        )
+                    else:
+                        task_state.record_command_success(
+                            state, target_token=target_token,
+                            receipt_sha256=_command_success_receipt(
+                                request, output_name,
+                            ),
+                            name=output_name, updated_at=self._timestamp(),
+                        )
                     task_state.save_state(request.state_file, state)
                 except task_state.TaskStateError as error:
                     raise FinalizeError("cannot persist successful attachment mapping") from error
+                mapping = state["targets"][target_token]["output"]
 
         detail = task_state.compact_detail(state)
         self._write_detail(root, request.record_id, detail)
-        readback = self._read_fields(request.record_id, "Base readback failed")
-        if (mapping not in self._outputs(readback)
-                or readback.get(DETAIL_FIELD) != detail):
-            raise FinalizeError("Base readback mismatch")
-        return FinalizeResult(output_path, mapping["file_token"], resumed_from)
+        return FinalizeResult(output_path, mapping.get("file_token"), resumed_from)
 
     @staticmethod
     def _validate_request(request: FinalizeRequest) -> tuple[Path, Path]:
@@ -242,15 +249,12 @@ class TargetFinalizer:
         if _sha256(output) != candidate_sha256:
             raise FinalizeError("promoted output identity mismatch")
 
-    def _upload(self, record_id: str, output: Path) -> dict[str, str]:
+    def _upload(self, record_id: str, output: Path) -> object:
         try:
-            response = self._base.upload_attachment(
+            return self._base.upload_attachment(
                 file=Path(output.name), app_token=self._app_token,
                 table_id=self._table_id, record_id=record_id,
                 field_id=self._output_field_id,
-            )
-            return _upload_mapping(
-                response, output.name, record_id, self._output_field_id,
             )
         except Exception:
             raise FinalizeError("attachment upload failed") from None
@@ -329,38 +333,35 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _upload_mapping(
-        response: Any, expected_name: str, record_id: str, field_id: str,
-) -> dict[str, str]:
-    candidates = [response]
-    if isinstance(response, dict):
-        candidates.extend(response.get(key) for key in ("data", "file", "attachment"))
-        data = response.get("data")
-        if isinstance(data, dict):
-            candidates.extend(data.get(key) for key in ("file", "attachment"))
-    for value in candidates:
-        if not isinstance(value, dict):
-            continue
-        token = value.get("file_token")
-        name = value.get("name", expected_name)
-        if isinstance(token, str) and token and name == expected_name:
-            return {"file_token": token, "name": expected_name}
-    envelopes = [response]
-    if isinstance(response, dict):
-        envelopes.append(response.get("data"))
-    for envelope in envelopes:
-        attachments = envelope.get("attachments") if isinstance(envelope, dict) else None
-        record = attachments.get(record_id) if isinstance(attachments, dict) else None
-        values = record.get(field_id) if isinstance(record, dict) else None
-        if not isinstance(values, list) or len(values) != 1:
-            continue
-        value = values[0]
-        if (isinstance(value, dict)
-                and isinstance(value.get("file_token"), str)
-                and value["file_token"]
-                and value.get("name") == expected_name):
-            return {"file_token": value["file_token"], "name": expected_name}
-    raise FinalizeError("attachment upload returned an invalid mapping")
+def _response_file_token(response: Any) -> str | None:
+    tokens: set[str] = set()
+    stack = [response]
+    seen: set[int] = set()
+    while stack and len(seen) < 10_000:
+        value = stack.pop()
+        if isinstance(value, (dict, list)):
+            identity = id(value)
+            if identity in seen:
+                continue
+            seen.add(identity)
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if (key in {"file_token", "uploaded_file_token"}
+                        and isinstance(item, str) and item):
+                    tokens.add(item)
+                elif isinstance(item, (dict, list)):
+                    stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return next(iter(tokens)) if len(tokens) == 1 else None
+
+
+def _command_success_receipt(request: FinalizeRequest, output_name: str) -> str:
+    value = "\0".join((
+        "outfit-swap-command-success-v1", request.record_id,
+        str(request.target_index), output_name, request.candidate_sha256,
+    ))
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 def _record_fields(response: Any, record_id: str) -> dict[str, Any]:

@@ -40,18 +40,20 @@ class FakeBase:
         self.fail_upload = False
         self.fail_update = False
         self.drop_update = False
+        self.drop_upload = False
+        self.upload_response: object = {"file_token": "box_uploaded_1"}
 
     def upload_attachment(self, **kwargs: object) -> dict:
         self.upload_calls += 1
         if self.fail_upload:
             raise RuntimeError("upload unavailable")
-        attachment = {
-            "file_token": "box_uploaded_1", "name": Path(kwargs["file"]).name,
-        }
-        self.outputs.append(attachment)
-        return {"data": {"attachments": {
-            "rec_1": {"fld_output": [{**attachment, "size": 123}]},
-        }}}
+        if not self.drop_upload:
+            attachment = {
+                "file_token": "box_uploaded_1",
+                "name": Path(kwargs["file"]).name,
+            }
+            self.outputs.append(attachment)
+        return self.upload_response
 
     def update_record(self, **kwargs: object) -> dict:
         self.update_calls += 1
@@ -146,7 +148,43 @@ class FinalizeTargetTest(unittest.TestCase):
         self.assertEqual(self.base.detail, task_state.compact_detail(persisted))
         self.assertEqual(
             self.base.get_field_ids,
-            [("fld_output", "fld_detail"), ("fld_output", "fld_detail")],
+            [("fld_output", "fld_detail")],
+        )
+
+    def test_upload_command_success_without_token_needs_no_readback(self) -> None:
+        self.base.upload_response = {
+            "ok": True, "identity": "user", "data": {"uploaded": 1},
+        }
+        self.base.drop_upload = True
+
+        result = self.finalizer.finalize(self.request())
+
+        persisted = task_state.load_state(self.state_file)
+        self.assertIsNone(result.attachment_token)
+        self.assertEqual(self.base.get_calls, 1)
+        self.assertEqual(
+            persisted["targets"][self.target_token]["output"]["confirmation"],
+            "command-success",
+        )
+        self.assertRegex(
+            persisted["targets"][self.target_token]["output"]["receipt_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_upload_response_token_is_saved_without_readback(self) -> None:
+        self.base.upload_response = {
+            "ok": True, "data": {"result": {"uploaded_file_token": "box_real"}},
+        }
+        self.base.drop_upload = True
+
+        result = self.finalizer.finalize(self.request())
+
+        self.assertEqual(result.attachment_token, "box_real")
+        self.assertEqual(self.base.get_calls, 1)
+        persisted = task_state.load_state(self.state_file)
+        self.assertEqual(
+            persisted["targets"][self.target_token]["output"],
+            {"file_token": "box_real", "name": self.output_path().name},
         )
 
     def test_accepted_local_checkpoint_does_not_reaccept_or_regenerate(self) -> None:
@@ -240,14 +278,15 @@ class FinalizeTargetTest(unittest.TestCase):
         self.assertEqual(self.base.upload_calls, 1)
         self.assertEqual(self.base.update_calls, 2)
 
-    def test_readback_mismatch_stops_with_success_mapping_intact(self) -> None:
+    def test_detail_command_success_needs_no_readback(self) -> None:
         self.base.drop_update = True
-        with self.assertRaisesRegex(FinalizeError, "Base readback mismatch"):
-            self.finalizer.finalize(self.request())
+        result = self.finalizer.finalize(self.request())
         persisted = task_state.load_state(self.state_file)
         self.assertEqual(persisted["targets"][self.target_token]["status"], "success")
+        self.assertEqual(result.attachment_token, "box_uploaded_1")
         self.assertEqual(self.base.upload_calls, 1)
         self.assertEqual(self.base.update_calls, 1)
+        self.assertEqual(self.base.get_calls, 1)
 
     def test_duplicate_invocation_is_a_verified_noop(self) -> None:
         first = self.finalizer.finalize(self.request())

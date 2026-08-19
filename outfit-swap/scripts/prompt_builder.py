@@ -68,13 +68,13 @@ class TargetPlan:
             raise PromptPlanError("classification is not supported")
         if (not isinstance(self.selected_references, tuple)
                 or not self.selected_references
-                or len(self.selected_references) > 5
+                or len(self.selected_references) > 9
                 or not all(
                     isinstance(reference, SelectedReference)
                     for reference in self.selected_references
                 )):
             raise PromptPlanError(
-                "selected references must be one through five typed entries",
+                "selected references must be one through nine typed entries",
             )
         tokens = tuple(reference.token for reference in self.selected_references)
         if len(set(tokens)) != len(tokens):
@@ -104,11 +104,12 @@ class TargetPlan:
             raise PromptPlanError(
                 "ordinary targets cannot carry an infographic inventory",
             )
-        if len(self.selected_references) == 5:
+        if self.fifth_reference_reason is not None:
             if (not isinstance(self.fifth_reference_reason, str)
-                    or not self.fifth_reference_reason.strip()):
+                    or not self.fifth_reference_reason.strip()
+                    or len(self.selected_references) != 5):
                 raise PromptPlanError(
-                    "a fifth reference requires a recorded reason",
+                    "a legacy fifth reference reason requires exactly five entries",
                 )
             first_roles = {
                 reference.role for reference in self.selected_references[:4]
@@ -117,10 +118,6 @@ class TargetPlan:
                 raise PromptPlanError(
                     "the fifth reference must provide a unique evidence role",
                 )
-        elif self.fifth_reference_reason is not None:
-            raise PromptPlanError(
-                "a fifth reference reason must be bound to an actual fifth entry",
-            )
 
     @property
     def reference_tokens(self) -> tuple[str, ...]:

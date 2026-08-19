@@ -7,7 +7,10 @@ import json
 import math
 import mimetypes
 import os
+import secrets
 import socket
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -15,8 +18,9 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 try:
-    from . import vision_qc
+    from . import payload_security, vision_qc
 except ImportError:  # pragma: no cover - direct script-directory import
+    import payload_security
     import vision_qc
 
 
@@ -26,6 +30,12 @@ _SUPPORTED_IMAGE_MIME = frozenset({
 })
 _MAX_RESPONSE_BYTES = 1_000_000
 _MINIMUM_CONFIDENCE = 0.85
+_DEFAULT_TIMEOUT_SECONDS = 120.0
+_TIMEOUT_ENVIRONMENT = "OUTFIT_SWAP_ARK_TIMEOUT_SECONDS"
+_QC_DIAGNOSTIC_CODES = frozenset({
+    "candidate_mismatch", "evidence_wrong_type",
+    "confidence_wrong_scale", "schema_invalid",
+})
 
 
 class ArkVisionError(RuntimeError):
@@ -62,11 +72,147 @@ class _ReviewOutcome:
     error: str | None
 
 
+class ArkResponseArchive:
+    """Persist exact bounded response bytes with sanitized private metadata."""
+
+    def __init__(self, directory: Path) -> None:
+        self._directory = Path(directory).resolve(strict=False)
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+    def record(
+            self, body: bytes, *, http_status: int | None,
+            response_headers: Mapping[str, str],
+            forbidden_values: Sequence[str] = (),
+    ) -> None:
+        if not isinstance(body, bytes) or len(body) > _MAX_RESPONSE_BYTES + 1:
+            raise ArkVisionError("Ark response archive payload is invalid")
+        forbidden = tuple(
+            value for value in forbidden_values
+            if isinstance(value, str) and value
+        )
+        if any(value.encode("utf-8") in body for value in forbidden):
+            raise ArkVisionError("Ark response contained a request credential")
+        sanitized_headers = payload_security.redact_credentials(
+            dict(response_headers),
+        )
+        sanitized_headers = {
+            self._redact_exact_values(name, forbidden):
+                self._redact_exact_values(value, forbidden)
+            for name, value in sanitized_headers.items()
+        }
+        with self._lock:
+            directory_fd = self._prepare_directory()
+            self._sequence += 1
+            stem = f"{self._sequence:06d}"
+            body_name = f"{stem}.body"
+            metadata_name = f"{stem}.json"
+            metadata = json.dumps({
+                "schema_version": 1,
+                "captured_at_ns": time.time_ns(),
+                "endpoint": ARK_CHAT_ENDPOINT,
+                "http_status": http_status,
+                "response_headers": sanitized_headers,
+                "body_file": body_name,
+                "body_bytes": len(body),
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8",
+            ) + b"\n"
+            self._active_directory_fd = directory_fd
+            body_committed = False
+            try:
+                self._atomic_write(self._directory / body_name, body)
+                body_committed = True
+                self._atomic_write(self._directory / metadata_name, metadata)
+            except Exception:
+                if body_committed:
+                    try:
+                        os.unlink(body_name, dir_fd=directory_fd)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                del self._active_directory_fd
+                os.close(directory_fd)
+
+    @staticmethod
+    def _redact_exact_values(value: Any, forbidden: Sequence[str]) -> Any:
+        if not isinstance(value, str):
+            return value
+        for secret in forbidden:
+            value = value.replace(secret, payload_security.REDACTED)
+        return value
+
+    def _prepare_directory(self) -> int:
+        descriptor = -1
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(os.path.sep, flags)
+            for component in self._directory.parts[1:]:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                child = os.open(component, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            os.fchmod(descriptor, 0o700)
+            return descriptor
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise ArkVisionError("Ark response archive is unavailable") from None
+
+    def _atomic_write(self, path: Path, data: bytes) -> None:
+        directory_fd = self._active_directory_fd
+        descriptor = -1
+        temporary = f".{path.name}.{secrets.token_hex(12)}.tmp"
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                temporary, flags, 0o600, dir_fd=directory_fd,
+            )
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(
+                temporary, path.name,
+                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            )
+        except OSError:
+            raise ArkVisionError("Ark response archive is unavailable") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+
 def _nonempty_environment(environ: Mapping[str, str], name: str) -> str:
     value = environ.get(name)
     if not isinstance(value, str) or not value.strip():
         raise ArkVisionError(f"missing required environment variable: {name}")
     return value.strip()
+
+
+def _timeout_from_environment(environ: Mapping[str, str]) -> float:
+    raw = environ.get(_TIMEOUT_ENVIRONMENT)
+    if raw is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(raw.strip()) if isinstance(raw, str) else math.nan
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("Ark timeout must be a positive finite number")
+    return value
 
 
 def _data_url(path: Path) -> str:
@@ -141,10 +287,30 @@ def _build_rejecting_opener(*handlers: Any) -> Callable[..., Any]:
     return urllib.request.build_opener(_RejectRedirects(), *handlers).open
 
 
+def _response_metadata(response: Any) -> tuple[int | None, dict[str, str]]:
+    status = getattr(response, "status", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        getcode = getattr(response, "getcode", None)
+        candidate = getcode() if callable(getcode) else None
+        status = (
+            candidate
+            if isinstance(candidate, int) and not isinstance(candidate, bool)
+            else None
+        )
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        info = getattr(response, "info", None)
+        headers = info() if callable(info) else None
+    items = getattr(headers, "items", None)
+    if not callable(items):
+        return status, {}
+    return status, {str(name): str(value) for name, value in items()}
+
+
 def _complete_json_outcome(
         *, environ: Mapping[str, str], opener: Callable[..., Any],
         timeout_seconds: float, system_prompt: str, user_prompt: str,
-        images: Sequence[Path],
+        images: Sequence[Path], response_archive: ArkResponseArchive | None,
 ) -> _CompletionOutcome:
     try:
         api_key = _nonempty_environment(environ, "ARK_API_KEY")
@@ -158,13 +324,19 @@ def _complete_json_outcome(
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": [
-                    {"type": "text", "text": user_prompt},
                     *image_content,
+                    {
+                        "type": "text",
+                        "text": (
+                            "Instructions:\n" + system_prompt
+                            + "\n\nTask:\n" + user_prompt
+                        ),
+                    },
                 ]},
             ],
             "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
             "stream": False,
         }
         request_body = json.dumps(
@@ -186,11 +358,45 @@ def _complete_json_outcome(
                     error="Ark vision response came from an unapproved endpoint",
                 )
             body = response.read(_MAX_RESPONSE_BYTES + 1)
+            if response_archive is not None:
+                status, headers = _response_metadata(response)
+                response_archive.record(
+                    body, http_status=status, response_headers=headers,
+                    forbidden_values=(api_key,),
+                )
         content = _extract_content(body)
         return _CompletionOutcome(content=content, error=None)
     except (TimeoutError, socket.timeout):
         return _CompletionOutcome(
             content=None, error="Ark vision request timed out",
+        )
+    except urllib.error.HTTPError as exc:
+        archive_error: str | None = None
+        try:
+            body = exc.read(_MAX_RESPONSE_BYTES + 1)
+        except Exception:
+            body = None
+        if (
+                body is not None and response_archive is not None
+                and exc.geturl() == ARK_CHAT_ENDPOINT
+        ):
+            try:
+                status, headers = _response_metadata(exc)
+                response_archive.record(
+                    body, http_status=status, response_headers=headers,
+                    forbidden_values=(api_key,),
+                )
+            except ArkVisionError as archive_exception:
+                archive_error = str(archive_exception)
+        close = getattr(exc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return _CompletionOutcome(
+            content=None,
+            error=archive_error or "Ark vision request failed",
         )
     except urllib.error.URLError as exc:
         timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
@@ -221,16 +427,26 @@ class ArkVisionClient:
     def __init__(
             self, *, environ: Mapping[str, str] | None = None,
             opener: Callable[..., Any] | None = None,
-            timeout_seconds: float = 30.0,
+            timeout_seconds: float | None = None,
+            response_archive_dir: Path | None = None,
     ) -> None:
+        resolved_environ = os.environ if environ is None else environ
+        if timeout_seconds is None:
+            timeout_seconds = _timeout_from_environment(resolved_environ)
         if (not isinstance(timeout_seconds, (int, float))
                 or isinstance(timeout_seconds, bool)
                 or not math.isfinite(timeout_seconds)
                 or timeout_seconds <= 0):
             raise ValueError("timeout_seconds must be a positive finite number")
-        self._environ = os.environ if environ is None else environ
+        self._environ = resolved_environ
+        if opener is None and response_archive_dir is None:
+            raise ValueError("Ark network client requires a response archive")
         self._opener = _build_rejecting_opener() if opener is None else opener
         self._timeout_seconds = float(timeout_seconds)
+        self._response_archive = (
+            None if response_archive_dir is None
+            else ArkResponseArchive(Path(response_archive_dir))
+        )
 
     def complete_json(
             self, *, system_prompt: str, user_prompt: str,
@@ -243,6 +459,7 @@ class ArkVisionClient:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             images=images,
+            response_archive=self._response_archive,
         )
         del self, system_prompt, user_prompt, images
         content = outcome.content
@@ -258,6 +475,7 @@ class ArkVisionClient:
 def _valid_report(
         client: VisionClient, *, system_prompt: str, user_prompt: str,
         images: tuple[Path, ...], candidate: str, infographic: bool,
+        diagnostics: list[str] | None = None,
 ) -> vision_qc.QCReport | None:
     try:
         raw = client.complete_json(
@@ -265,12 +483,88 @@ def _valid_report(
             user_prompt=user_prompt,
             images=images,
         )
-        report = vision_qc.parse_report(raw, infographic=infographic)
-    except (ArkVisionError, vision_qc.VisionQCError):
+        report = vision_qc.parse_report(
+            _normalize_qc_report(raw), infographic=infographic,
+        )
+    except ArkVisionError:
+        return None
+    except vision_qc.VisionQCError as error:
+        code = str(error)
+        if diagnostics is not None:
+            diagnostics.append(
+                code if code in _QC_DIAGNOSTIC_CODES else "schema_invalid",
+            )
         return None
     if report.candidate != candidate:
+        if diagnostics is not None:
+            diagnostics.append("candidate_mismatch")
         return None
     return report
+
+
+def _normalize_qc_report(raw: str) -> str:
+    """Normalize only two observed, bounded Ark schema deviations."""
+    if not isinstance(raw, str):
+        raise vision_qc.VisionQCError("schema_invalid")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise vision_qc.VisionQCError("schema_invalid") from None
+    if not isinstance(value, dict):
+        raise vision_qc.VisionQCError("schema_invalid")
+
+    evidence = value.get("evidence")
+    if isinstance(evidence, str) and evidence.strip():
+        value["evidence"] = [evidence]
+    elif not isinstance(evidence, list):
+        raise vision_qc.VisionQCError("evidence_wrong_type")
+
+    confidence = value.get("confidence")
+    if (isinstance(confidence, (int, float))
+            and not isinstance(confidence, bool)
+            and math.isfinite(confidence)
+            and 1 < confidence <= 100):
+        value["confidence"] = confidence / 100
+    elif (not isinstance(confidence, (int, float))
+          or isinstance(confidence, bool)
+          or not math.isfinite(confidence)
+          or not 0 <= confidence <= 1):
+        raise vision_qc.VisionQCError("confidence_wrong_scale")
+
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+
+
+def normalize_comparative_report(raw: str) -> str:
+    """Apply the same bounded compatibility rules to comparative candidates."""
+    if not isinstance(raw, str):
+        raise vision_qc.VisionQCError("schema_invalid")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise vision_qc.VisionQCError("schema_invalid") from None
+    if not isinstance(value, dict) or not isinstance(value.get("candidates"), list):
+        raise vision_qc.VisionQCError("schema_invalid")
+    normalized: list[dict[str, Any]] = []
+    for candidate in value["candidates"]:
+        candidate_raw = json.dumps(
+            candidate, ensure_ascii=False, separators=(",", ":"),
+        )
+        candidate_value = json.loads(_normalize_qc_report(candidate_raw))
+        normalized.append(candidate_value)
+    value["candidates"] = normalized
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
 
 
 def _report_summary(report: vision_qc.QCReport) -> dict[str, Any]:
@@ -314,6 +608,7 @@ def _review_candidate_outcome(
         images: Sequence[Path], candidate: str, infographic: bool,
 ) -> _ReviewOutcome:
     adjudicating = False
+    diagnostics: list[str] = []
     try:
         same_images = tuple(Path(path) for path in images)
         first = _valid_report(
@@ -323,6 +618,7 @@ def _review_candidate_outcome(
             images=same_images,
             candidate=candidate,
             infographic=infographic,
+            diagnostics=diagnostics,
         )
         if first is not None and first.confidence >= _MINIMUM_CONFIDENCE:
             return _ReviewOutcome(
@@ -339,6 +635,7 @@ def _review_candidate_outcome(
             images=same_images,
             candidate=candidate,
             infographic=infographic,
+            diagnostics=diagnostics,
         )
         if (
                 first is not None
@@ -353,6 +650,7 @@ def _review_candidate_outcome(
                 images=same_images,
                 candidate=candidate,
                 infographic=infographic,
+                diagnostics=diagnostics,
             )
             if (
                     adjudicated is not None
@@ -369,6 +667,7 @@ def _review_candidate_outcome(
                 error=(
                     "Ark vision QC failed after same-candidate review "
                     "and adjudication"
+                    + _diagnostic_suffix(diagnostics)
                 ),
             )
         if second is not None and second.confidence >= _MINIMUM_CONFIDENCE:
@@ -380,7 +679,10 @@ def _review_candidate_outcome(
             )
         return _ReviewOutcome(
             result=None,
-            error="Ark vision QC failed after same-candidate review",
+            error=(
+                "Ark vision QC failed after same-candidate review"
+                + _diagnostic_suffix(diagnostics)
+            ),
         )
     except Exception:
         return _ReviewOutcome(
@@ -391,6 +693,13 @@ def _review_candidate_outcome(
                 else "Ark vision QC failed after same-candidate review"
             ),
         )
+
+
+def _diagnostic_suffix(diagnostics: Sequence[str]) -> str:
+    codes = tuple(dict.fromkeys(
+        code for code in diagnostics if code in _QC_DIAGNOSTIC_CODES
+    ))
+    return "" if not codes else " [diagnostic=" + ",".join(codes) + "]"
 
 
 def review_candidate(

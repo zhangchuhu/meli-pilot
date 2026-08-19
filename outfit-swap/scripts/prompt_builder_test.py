@@ -190,7 +190,7 @@ class TargetPlanTest(unittest.TestCase):
                 infographic_inventory=settled,
             )
 
-    def test_fifth_reference_reason_is_bound_to_a_unique_fifth_entry(self) -> None:
+    def test_five_through_nine_references_need_no_special_exception(self) -> None:
         entries = refs(
             ("model", "model"), ("upper", "upper_construction"),
             ("flat", "full_outfit_flat_lay"), ("hem", "skirt_hem"),
@@ -200,19 +200,18 @@ class TargetPlanTest(unittest.TestCase):
         plan = prompt_builder.TargetPlan(
             classification="front", selected_references=entries,
             garment_facts=facts, infographic_inventory=None,
-            fifth_reference_reason="Only the fifth image proves the hidden waistband.",
         )
         self.assertEqual(plan.selected_references[4].role, "hidden_waistband")
-        self.assertIn(
-            '"fifth_reference_reason":"Only the fifth image proves the hidden waistband."',
-            prompt_builder.serialize_plan(plan),
-        )
+        self.assertIn('"fifth_reference_reason":null', prompt_builder.serialize_plan(plan))
 
-        with self.assertRaises(prompt_builder.PromptPlanError):
-            prompt_builder.TargetPlan(
-                classification="front", selected_references=entries,
-                garment_facts=facts, infographic_inventory=None,
-            )
+        nine = entries + refs(
+            ("six", "detail:six"), ("seven", "detail:seven"),
+            ("eight", "detail:eight"), ("nine", "detail:nine"),
+        )
+        self.assertEqual(len(prompt_builder.TargetPlan(
+            classification="front", selected_references=nine,
+            garment_facts=facts, infographic_inventory=None,
+        ).selected_references), 9)
         with self.assertRaises(prompt_builder.PromptPlanError):
             prompt_builder.TargetPlan(
                 classification="front", selected_references=entries[:4],

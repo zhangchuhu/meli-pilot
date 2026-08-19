@@ -147,6 +147,15 @@ class ParseReportTest(unittest.TestCase):
                 with self.assertRaises(vision_qc.VisionQCError):
                     self.parse(payload)
 
+    def test_evidence_requires_nonempty_string_items(self) -> None:
+        for evidence in (["visible seam", 7], [""], [{}]):
+            with self.subTest(evidence=evidence):
+                with self.assertRaisesRegex(
+                        vision_qc.VisionQCError,
+                        "evidence must be an array of non-empty strings",
+                ):
+                    self.parse(report_payload(evidence=evidence))
+
     def test_schema_version_must_be_a_true_integer(self) -> None:
         with self.assertRaises(vision_qc.VisionQCError):
             self.parse(report_payload(schema_version=1.0))

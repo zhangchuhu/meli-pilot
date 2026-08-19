@@ -583,7 +583,7 @@ class TaskStateTest(unittest.TestCase):
             target_tokens=["box_t1", "box_t2"],
             started_at="2026-08-15T10:00:00+08:00",
         )
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], 4)
         self.assertEqual(state["target_tokens"], ["box_t1", "box_t2"])
         self.assertEqual(state["targets"]["box_t1"]["status"], "pending")
 
@@ -631,7 +631,7 @@ class TaskStateTest(unittest.TestCase):
             reloaded = task_state.load_state(path)
 
         migrated_target = migrated["targets"]["box_t1"]
-        self.assertEqual(migrated["schema_version"], 3)
+        self.assertEqual(migrated["schema_version"], 4)
         self.assertEqual(migrated_target["attempt_history"], history)
         self.assertIsNone(migrated_target["target_plan"])
         self.assertEqual(migrated_target["qc_reports"], [])
@@ -1449,6 +1449,61 @@ class TaskStateTest(unittest.TestCase):
                 updated_at="2026-08-15T10:02:00+08:00",
             )
 
+    def test_record_command_success_persists_receipt_without_file_token(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        name = task_state.output_name(1, "box_t1")
+
+        task_state.record_command_success(
+            state, target_token="box_t1", receipt_sha256="a" * 64,
+            name=name, updated_at="2026-08-15T10:02:00+08:00",
+        )
+
+        self.assertEqual(state["targets"]["box_t1"]["status"], "success")
+        self.assertEqual(state["targets"]["box_t1"]["output"], {
+            "confirmation": "command-success",
+            "receipt_sha256": "a" * 64,
+            "name": name,
+        })
+        self.assertEqual(task_state.aggregate_status(state), "成功")
+
+    def test_reconcile_does_not_overturn_command_success_without_base_output(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        task_state.record_command_success(
+            state, target_token="box_t1", receipt_sha256="b" * 64,
+            name=task_state.output_name(1, "box_t1"),
+            updated_at="2026-08-15T10:02:00+08:00",
+        )
+        expected = json.loads(json.dumps(state["targets"]["box_t1"]["output"]))
+
+        self.reconcile(
+            state, target_tokens=["box_t1"], outputs=[],
+            updated_at="2026-08-15T10:03:00+08:00",
+        )
+
+        self.assertEqual(state["targets"]["box_t1"]["status"], "success")
+        self.assertEqual(state["targets"]["box_t1"]["output"], expected)
+        replayed = task_state.reconcile_target_output(
+            state, target_index=0, outputs=[],
+            updated_at="2026-08-15T10:04:00+08:00",
+        )
+        self.assertEqual(replayed, expected)
+
+    def test_command_success_receipt_rejects_malformed_digest(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+
+        with self.assertRaises(task_state.TaskStateError):
+            task_state.record_command_success(
+                state, target_token="box_t1", receipt_sha256="not-a-digest",
+                name=task_state.output_name(1, "box_t1"),
+                updated_at="2026-08-15T10:02:00+08:00",
+            )
+
     def test_persisted_success_requires_matching_output_identity(self) -> None:
         for output in (
             {"file_token": "box_out", "name": "unrelated.png"},
@@ -1678,6 +1733,50 @@ class TaskStateTest(unittest.TestCase):
         self.assertEqual(
             [entry["outcome"] for entry in state["targets"]["box_t1"]["attempt_history"]],
             ["success"],
+        )
+
+    def test_reconcile_success_uses_file_token_when_remote_name_differs(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        logical = {
+            "file_token": "box_uploaded",
+            "name": task_state.output_name(1, "box_t1"),
+        }
+        task_state.record_success(
+            state, target_token="box_t1", file_token=logical["file_token"],
+            name=logical["name"], updated_at="2026-08-18T10:02:00+08:00",
+        )
+
+        replayed = task_state.reconcile_target_output(
+            state, target_index=0,
+            outputs=[{"file_token": "box_uploaded", "name": "server-name.png"}],
+            updated_at="2026-08-18T10:03:00+08:00",
+        )
+
+        self.assertEqual(replayed, logical)
+        self.assertEqual(state["targets"]["box_t1"]["output"], logical)
+
+    def test_table_reconcile_preserves_success_by_file_token(self) -> None:
+        state = self.make_state()
+        self.begin(state)
+        self.accept_local(state)
+        logical_name = task_state.output_name(1, "box_t1")
+        task_state.record_success(
+            state, target_token="box_t1", file_token="box_uploaded",
+            name=logical_name, updated_at="2026-08-18T10:02:00+08:00",
+        )
+
+        self.reconcile(
+            state, target_tokens=["box_t1"],
+            outputs=[{"file_token": "box_uploaded", "name": "server-name.png"}],
+            updated_at="2026-08-18T10:03:00+08:00",
+        )
+
+        self.assertEqual(state["targets"]["box_t1"]["status"], "success")
+        self.assertEqual(
+            state["targets"]["box_t1"]["output"],
+            {"file_token": "box_uploaded", "name": logical_name},
         )
 
     def test_reconcile_target_output_without_match_does_not_mutate(self) -> None:
@@ -2096,7 +2195,7 @@ class TaskStateTest(unittest.TestCase):
             path = Path(directory) / "legacy.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
             migrated = task_state.load_state(path)
-        self.assertEqual(migrated["schema_version"], 3)
+        self.assertEqual(migrated["schema_version"], 4)
         self.assertEqual(migrated["targets"]["box_t1"]["status"], "success")
         self.assertEqual(migrated["targets"]["box_t1"]["output"]["file_token"], "box_out")
         self.assertEqual(migrated["targets"]["box_t1"]["attempt_history"], [])

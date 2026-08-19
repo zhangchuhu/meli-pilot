@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MAX_ATTEMPTS = 3
 MAX_RECORDED_ATTEMPT = 5
 CLASSIFICATIONS = frozenset({
@@ -231,6 +231,29 @@ def _outputs_iterable(value: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(output.get("name"), str) or not output["name"]:
             raise TaskStateError("each output requires a non-empty name")
     return outputs
+
+
+def _is_command_success_output(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"confirmation", "receipt_sha256", "name"}
+        and value.get("confirmation") == "command-success"
+        and isinstance(value.get("receipt_sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", value["receipt_sha256"]) is not None
+        and isinstance(value.get("name"), str)
+        and bool(value["name"])
+    )
+
+
+def _state_output(value: Any) -> dict[str, Any]:
+    if _is_command_success_output(value):
+        return value
+    _outputs_list([value])
+    return value
+
+
+def _output_file_token(value: Any) -> str | None:
+    return value.get("file_token") if isinstance(value, dict) else None
 
 
 def _artifact_identities_iterable(
@@ -532,8 +555,9 @@ def _validate_state(state: Any) -> dict[str, Any]:
                 or target["error"] is not None and not isinstance(target["error"], str)):
             raise TaskStateError(f"target entry has invalid fields: {token}")
         if target["output"] is not None:
-            _outputs_list([target["output"]])
-            if target["output"]["file_token"] in target["stale_output_tokens"]:
+            _state_output(target["output"])
+            output_token = _output_file_token(target["output"])
+            if output_token is not None and output_token in target["stale_output_tokens"]:
                 raise TaskStateError(f"target output is stale: {token}")
         if target["status"] != "success" and target["output"] is not None:
             raise TaskStateError(f"non-successful target has output: {token}")
@@ -752,7 +776,7 @@ def _migrate_v2_state(value: Any) -> Any:
     if not isinstance(value, dict) or value.get("schema_version") != 2:
         return value
     state = copy.deepcopy(value)
-    state["schema_version"] = SCHEMA_VERSION
+    state["schema_version"] = 3
     targets = state.get("targets")
     if not isinstance(targets, dict):
         return state
@@ -767,10 +791,11 @@ def _migrate_v2_state(value: Any) -> Any:
 
 
 def _migrate_v3_state(value: Any) -> Any:
-    """Add append-only selection history to schema-three manifests."""
+    """Add command-success receipts and selection history to schema-three manifests."""
     if not isinstance(value, dict) or value.get("schema_version") != 3:
         return value
     state = copy.deepcopy(value)
+    state["schema_version"] = SCHEMA_VERSION
     targets = state.get("targets")
     if isinstance(targets, dict):
         for target in targets.values():
@@ -841,7 +866,7 @@ def save_state(path: str | Path, state: dict[str, Any]) -> None:
 
 def _finish_running_history(
         target: dict[str, Any], *, outcome: str, error: str | None, updated_at: str,
-        output: dict[str, str] | None = None,
+        output: dict[str, Any] | None = None,
 ) -> None:
     if not target["attempt_history"]:
         raise TaskStateError("running target is missing attempt history")
@@ -890,8 +915,9 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
                 )
             stale_tokens = list(target["stale_output_tokens"])
             existing = target.get("output")
-            if existing is not None and existing["file_token"] not in stale_tokens:
-                stale_tokens.append(existing["file_token"])
+            existing_token = _output_file_token(existing)
+            if existing_token is not None and existing_token not in stale_tokens:
+                stale_tokens.append(existing_token)
             for output in current_outputs:
                 if (_output_name_matches_target(output["name"], token)
                         and output["file_token"] not in stale_tokens):
@@ -934,8 +960,13 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
         ]
         recovered = (
             existing
-            if existing in valid_outputs
-            and _output_name_matches_target(existing["name"], token)
+            if _is_command_success_output(existing)
+            else existing
+            if existing is not None
+            and any(
+                output["file_token"] == _output_file_token(existing)
+                for output in valid_outputs
+            )
             else next(
                 (output for output in valid_outputs
                  if _output_name_matches_target(output["name"], token)),
@@ -943,9 +974,13 @@ def reconcile(state: dict[str, Any], *, source_tokens: Iterable[str],
             )
         )
         if recovered is not None:
-            uploaded = {
-                "file_token": recovered["file_token"], "name": recovered["name"],
-            }
+            uploaded = (
+                copy.deepcopy(recovered)
+                if _is_command_success_output(recovered)
+                else {
+                    "file_token": recovered["file_token"], "name": recovered["name"],
+                }
+            )
             if target["status"] == "running":
                 _finish_running_history(
                     target, outcome="success", error=None, updated_at=updated_at,
@@ -1052,9 +1087,10 @@ def reconcile_error(
         for token, target in list(candidate["targets"].items()):
             existing = target.get("output")
             stale_output_tokens = list(target["stale_output_tokens"])
-            if (existing is not None
-                    and existing["file_token"] not in stale_output_tokens):
-                stale_output_tokens.append(existing["file_token"])
+            existing_token = _output_file_token(existing)
+            if (existing_token is not None
+                    and existing_token not in stale_output_tokens):
+                stale_output_tokens.append(existing_token)
             for output in current_outputs:
                 if (_output_name_matches_target(output["name"], token)
                         and output["file_token"] not in stale_output_tokens):
@@ -1250,19 +1286,18 @@ def record_local_acceptance(
     return state
 
 
-def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
-                   name: str, updated_at: str) -> dict[str, Any]:
-    """Record upload success only after durable local QC acceptance."""
+def _record_success_output(
+        state: dict[str, Any], *, target_token: str,
+        uploaded: dict[str, Any], updated_at: str,
+) -> dict[str, Any]:
     _validate_state(state)
     target = _require_target(state, target_token)
     if target["status"] != "accepted-local" or target["local_acceptance"] is None:
         raise TaskStateError(f"target has no durable local acceptance: {target_token}")
     if not 1 <= target["attempts"] <= MAX_RECORDED_ATTEMPT:
         raise TaskStateError(f"target has no accepted attempt: {target_token}")
-    if not isinstance(file_token, str) or not file_token:
-        raise TaskStateError("file_token must not be empty")
-    if file_token in target["stale_output_tokens"]:
-        raise TaskStateError("file_token belongs to a stale source output")
+    _state_output(uploaded)
+    name = uploaded["name"]
     if not _output_name_matches_target(name, target_token):
         raise TaskStateError("output name does not match target token")
     if name != target["local_acceptance"]["name"]:
@@ -1270,14 +1305,13 @@ def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
     updated_at = _nonempty_string(updated_at, "updated_at")
     candidate = copy.deepcopy(state)
     successful = candidate["targets"][target_token]
-    uploaded = {"file_token": file_token, "name": name}
     successful["status"] = "success"
-    successful["output"] = uploaded
+    successful["output"] = copy.deepcopy(uploaded)
     history = _accepted_history_entry(successful)
     history["outcome"] = "success"
     history["finished_at"] = updated_at
     history["error"] = None
-    history["output"] = uploaded
+    history["output"] = copy.deepcopy(uploaded)
     successful["local_acceptance"] = None
     successful["error"] = None
     successful["updated_at"] = updated_at
@@ -1287,10 +1321,44 @@ def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
     return state
 
 
+def record_success(state: dict[str, Any], *, target_token: str, file_token: str,
+                   name: str, updated_at: str) -> dict[str, Any]:
+    """Record a token-backed upload after durable local QC acceptance."""
+    _validate_state(state)
+    target = _require_target(state, target_token)
+    if not isinstance(file_token, str) or not file_token:
+        raise TaskStateError("file_token must not be empty")
+    if file_token in target["stale_output_tokens"]:
+        raise TaskStateError("file_token belongs to a stale source output")
+    return _record_success_output(
+        state, target_token=target_token,
+        uploaded={"file_token": file_token, "name": name},
+        updated_at=updated_at,
+    )
+
+
+def record_command_success(
+        state: dict[str, Any], *, target_token: str, receipt_sha256: str,
+        name: str, updated_at: str,
+) -> dict[str, Any]:
+    """Record exit-zero upload success when no remote token is available."""
+    uploaded = {
+        "confirmation": "command-success",
+        "receipt_sha256": receipt_sha256,
+        "name": name,
+    }
+    if not _is_command_success_output(uploaded):
+        raise TaskStateError("command-success receipt is invalid")
+    return _record_success_output(
+        state, target_token=target_token, uploaded=uploaded,
+        updated_at=updated_at,
+    )
+
+
 def reconcile_target_output(
         state: dict[str, Any], *, target_index: int,
         outputs: Iterable[dict[str, Any]], updated_at: str,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Reconcile one accepted target with its append-only Base attachment.
 
     A successful mapping is replay-safe. An accepted-local target advances only
@@ -1308,9 +1376,10 @@ def reconcile_target_output(
     target = state["targets"][target_token]
     if target["status"] == "success":
         mapped = target["output"]
+        if _is_command_success_output(mapped):
+            return copy.deepcopy(mapped)
         present = any(
             output["file_token"] == mapped["file_token"]
-            and output["name"] == mapped["name"]
             for output in current_outputs
         )
         return copy.deepcopy(mapped) if present else None

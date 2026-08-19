@@ -25,7 +25,7 @@ Treat invocation of this skill with an exact table URL as authorization for this
 
 ## Before running
 
-Require Python 3.10 or newer, `lark-cli`, `ffmpeg`, `ffprobe`, `ARK_API_KEY`, `ARK_VISION_MODEL`, and the active installed `doubao-imagegen` skill. The production entry uses the normal installed skill location; set `OUTFIT_SWAP_DOUBAO_SCRIPT` to the resolved script path only when the active catalog uses another location. `OUTFIT_SWAP_LARK_CLI`, `OUTFIT_SWAP_STATE_ROOT`, and `OUTFIT_SWAP_RUNS_ROOT` are optional non-secret executable/state discovery overrides. Do not use these variables for credentials or endpoint overrides.
+Require Python 3.10 or newer, `lark-cli`, `ffmpeg`, `ffprobe`, `ARK_API_KEY`, `ARK_VISION_MODEL`, and the active installed `doubao-imagegen` skill. The production entry uses the normal installed skill location; set `OUTFIT_SWAP_DOUBAO_SCRIPT` to the resolved script path only when the active catalog uses another location. `OUTFIT_SWAP_LARK_CLI`, `OUTFIT_SWAP_STATE_ROOT`, and `OUTFIT_SWAP_RUNS_ROOT` are optional non-secret executable/state discovery overrides. `OUTFIT_SWAP_ARK_TIMEOUT_SECONDS` is an optional positive finite Ark request timeout and defaults to `120` seconds. Do not use these variables for credentials or endpoint overrides.
 
 Read these contracts before execution:
 
@@ -40,13 +40,13 @@ Stop before creating run/state directories when Python or required global config
 1. Run the table entry once with the requested flags. Let it complete one global preflight, validate every page and record envelope in the exact view, then apply any `--record-limit` and materialize the stable record queue. Do not launch a second independent invocation for the same table.
 2. Let records run concurrently at the configured limit. Keep targets within each record serial in original attachment order. Do not create a persistent run lock or parallelize targets.
 3. Let the pipeline reconcile state and Base first, drain accepted local uploads, inspect active artifacts, create immutable target plans, generate with fixed `--size 2K`, obtain automatic Ark decisions, select within the three-attempt budget, and call the idempotent finalizer.
-4. Read the backward-compatible `metrics_path` added to the command's four-count JSON result, then report its sanitized `metrics.json` summary. Never expose secrets, prompts, raw Base64, raw data URLs, authorization headers, or unsanitized external diagnostics.
+4. Read the backward-compatible `metrics_path` added to the command's four-count JSON result, then report its `metrics.json` summary. Every approved-endpoint Ark HTTP response is archived before parsing under the private per-run `ark-responses/` directory as an exact bounded `.body` plus sanitized metadata; refuse persistence if a response echoes an exact request credential. Ordinary runs may emit complete prompts, request bodies, raw Base64, and raw data URLs to terminal output, diagnostic logs, or error reports. Before any such output, pass the structured payload through [`scripts/payload_security.py`](scripts/payload_security.py). Never output credentials, API keys, access or refresh tokens, cookies, signatures, or `Authorization` headers or values.
 
 Do not substitute direct Feishu HTTP, another image-generation path, `generate-batch`, manual per-image approval, or a sequence of target-level shell commands for the normal entry.
 
 ## Recovery and diagnosis
 
-Re-run the same table entry to resume. Recovery always reconciles Base, stages and digest-checks an earlier run's active artifact into the current record directory, drains `accepted-local` work, and checks an active candidate before starting another paid generation. An upload failure resumes through `uploads`; a later Base detail-write failure resumes through output reconciliation. Neither repeats a paid edit or duplicate upload.
+Re-run the same table entry to resume. Recovery always reconciles Base, stages and digest-checks an earlier run's active artifact into the current record directory, drains `accepted-local` work, and checks an active candidate before starting another paid generation. An upload command failure resumes through `uploads`; an exit-zero upload persists either its real returned token or a local command-success receipt without post-upload readback. A later Base detail-write failure resumes from that success checkpoint. Neither repeats a paid edit or duplicate upload.
 
 Keep these component CLIs for diagnosis and recovery, not as the normal workflow:
 
@@ -65,7 +65,7 @@ Use these modules through `run_table.py`; read their source only for diagnosis o
 - [`scripts/run_table.py`](scripts/run_table.py): preflight, bounded record scheduling, service limits, and global stop
 - [`scripts/production_runtime.py`](scripts/production_runtime.py): concrete Lark/Seedream/Ark materialization and service assembly used by bare `run_table.py`
 - [`scripts/run_record.py`](scripts/run_record.py): serial target orchestration and recovery
-- [`scripts/reference_selector.py`](scripts/reference_selector.py): deterministic three/four-reference selection and evidenced fifth exception
+- [`scripts/reference_selector.py`](scripts/reference_selector.py): deterministic closest-angle primary ordering and all-qualified reference filtering
 - [`scripts/prompt_builder.py`](scripts/prompt_builder.py): immutable target plans and controlled corrections
 - [`scripts/infographic_text.py`](scripts/infographic_text.py): literal text/panel/instance inventory gate
 - [`scripts/safe_edit.py`](scripts/safe_edit.py): installed Seedream edit transport
@@ -76,6 +76,7 @@ Use these modules through `run_table.py`; read their source only for diagnosis o
 - [`scripts/lark_runner.py`](scripts/lark_runner.py): typed relative-file `lark-cli` transport
 - [`scripts/task_state.py`](scripts/task_state.py): canonical schema-versioned state and compatibility migration
 - [`scripts/event_log.py`](scripts/event_log.py): sanitized NDJSON events and metrics
+- [`scripts/payload_security.py`](scripts/payload_security.py): credential-only redaction for diagnostic payload output
 - [`scripts/qc_replay.py`](scripts/qc_replay.py): offline/live opt-in shadow validation
 
 Initialize local record state before attachment validation can fail. Validate every image only after the state is bound. Use `scripts/task_state.py bind` for the canonical state under `~/.codex/state/outfit-swap/tables`; use `reconcile-error`, not `init-error`, for an existing record with missing required attachment lists, and preserve its target entries and attempt histories. A source attachment identity changes invalidates current mappings and resets the working budget while preserving append-only history.

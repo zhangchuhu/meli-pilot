@@ -293,7 +293,7 @@ def _validated_event(value: Mapping[str, Any]) -> dict[str, Any]:
     if "error_category" in event and event["error_category"] not in ERROR_CATEGORIES:
         raise EventLogError("error category is invalid")
     if "reference_count" in event:
-        _bounded_integer(event["reference_count"], "reference_count", minimum=0, maximum=5)
+        _bounded_integer(event["reference_count"], "reference_count", minimum=0, maximum=9)
     if "input_bytes" in event:
         _bounded_integer(event["input_bytes"], "input_bytes", minimum=0, maximum=512_000_000)
     if "ark_request_count" in event:

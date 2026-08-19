@@ -28,6 +28,10 @@ class RecordWorkerError(RuntimeError):
     """Raised when the injected record boundary is incomplete or inconsistent."""
 
 
+class PlanningStopped(RuntimeError):
+    """Raised when external target planning stops before a plan is available."""
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -141,6 +145,10 @@ def run_record(context: RecordContext, services: RecordServices) -> RecordResult
             plans[active_index] = _resolve_target_plan(
                 context, state_file, active_index, services,
             )
+        except PlanningStopped:
+            return _planning_stopped(
+                context, state_file, active_index, services,
+            )
         except Exception:
             return _planning_failure(context, state_file, services)
         status = _process_active_candidate(
@@ -174,6 +182,10 @@ def run_record(context: RecordContext, services: RecordServices) -> RecordResult
             if target_index not in plans:
                 try:
                     plans[target_index] = _resolve_target_plan(
+                        context, state_file, target_index, services,
+                    )
+                except PlanningStopped:
+                    return _planning_stopped(
                         context, state_file, target_index, services,
                     )
                 except Exception:
@@ -288,6 +300,20 @@ def _planning_failure(
     return _finish_result(
         context, task_state.load_state(state_file), services, "failed",
     )
+
+
+def _planning_stopped(
+        context: RecordContext, state_file: Path, target_index: int,
+        services: RecordServices,
+) -> RecordResult:
+    state = task_state.load_state(state_file)
+    _set_stop(services.stop_signal)
+    _event(
+        services, "stop_observed", record_id=context.record_id,
+        target_id=state["target_tokens"][target_index],
+        status="stopped",
+    )
+    return _finish_result(context, state, services, "stopped")
 
 
 def _drain_accepted_local(

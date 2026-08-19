@@ -1,14 +1,19 @@
 import base64
 import io
 import json
+import os
+import stat
 import sys
 import tempfile
+import threading
 import traceback
 import unittest
+import urllib.error
 import urllib.response
 from email.message import Message
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -174,6 +179,269 @@ class _SanitizedErrorAssertions:
 
 
 class ArkVisionClientTest(_SanitizedErrorAssertions, unittest.TestCase):
+    def test_archives_exact_success_and_malformed_response_bodies_privately(self) -> None:
+        bodies = (
+            response_body("{\"result\":\"ok\"}"),
+            b'{"choices":["malformed-response-sentinel"',
+        )
+        for body in bodies:
+            with self.subTest(body=body[:20]), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                archive = root / "ark-responses"
+                image = root / "candidate.png"
+                image.write_bytes(b"image")
+                client = ark_vision_qc.ArkVisionClient(
+                    environ={"ARK_API_KEY": "secret-key", "ARK_VISION_MODEL": "model"},
+                    opener=RecordingOpener(body),
+                    response_archive_dir=archive,
+                )
+
+                try:
+                    client.complete_json(
+                        system_prompt="system", user_prompt="user", images=(image,),
+                    )
+                except ark_vision_qc.ArkVisionError:
+                    pass
+
+                body_files = sorted(archive.glob("*.body"))
+                metadata_files = sorted(archive.glob("*.json"))
+                self.assertEqual(len(body_files), 1)
+                self.assertEqual(len(metadata_files), 1)
+                self.assertEqual(body_files[0].read_bytes(), body)
+                metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+                self.assertEqual(metadata["body_file"], body_files[0].name)
+                self.assertEqual(metadata["body_bytes"], len(body))
+                serialized = metadata_files[0].read_text(encoding="utf-8")
+                self.assertNotIn("secret-key", serialized)
+                self.assertNotIn("Authorization", serialized)
+                self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(body_files[0].stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(metadata_files[0].stat().st_mode), 0o600)
+
+    def test_archives_http_error_body_and_redacts_credential_response_headers(self) -> None:
+        body = b'{"error":{"message":"invalid model"}}'
+        headers = Message()
+        headers["Content-Type"] = "application/json"
+        headers["Set-Cookie"] = "session=remote-secret"
+
+        def opener(request: Any, *, timeout: float) -> FakeResponse:
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "Bad Request", headers, io.BytesIO(body),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "ark-responses"
+            image = root / "candidate.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": "request-secret", "ARK_VISION_MODEL": "model"},
+                opener=opener,
+                response_archive_dir=archive,
+            )
+            with self.assertRaises(ark_vision_qc.ArkVisionError):
+                client.complete_json(
+                    system_prompt="system", user_prompt="user", images=(image,),
+                )
+
+            self.assertEqual(next(archive.glob("*.body")).read_bytes(), body)
+            metadata_text = next(archive.glob("*.json")).read_text(encoding="utf-8")
+            metadata = json.loads(metadata_text)
+            self.assertEqual(metadata["http_status"], 400)
+            self.assertEqual(metadata["response_headers"]["Set-Cookie"], "[REDACTED]")
+            self.assertNotIn("request-secret", metadata_text)
+            self.assertNotIn("remote-secret", metadata_text)
+
+    def test_archive_never_persists_api_key_echoed_in_unrelated_header_or_body(self) -> None:
+        api_key = "exact-request-api-key-sentinel"
+        headers = Message()
+        headers["X-Debug"] = f"upstream echoed {api_key}"
+        headers[f"X-{api_key}"] = "safe-value"
+        safe_body = response_body("{\"result\":\"ok\"}")
+
+        class HeaderResponse(FakeResponse):
+            status = 200
+
+            def __init__(self) -> None:
+                super().__init__(safe_body)
+                self.headers = headers
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "ark-responses"
+            image = root / "candidate.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": api_key, "ARK_VISION_MODEL": "model"},
+                opener=lambda _request, *, timeout: HeaderResponse(),
+                response_archive_dir=archive,
+            )
+            client.complete_json(
+                system_prompt="system", user_prompt="user", images=(image,),
+            )
+            metadata = next(archive.glob("*.json")).read_text(encoding="utf-8")
+            self.assertNotIn(api_key, metadata)
+            self.assertIn("[REDACTED]", metadata)
+
+        echoed_body = response_body(api_key)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "ark-responses"
+            image = root / "candidate.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": api_key, "ARK_VISION_MODEL": "model"},
+                opener=RecordingOpener(echoed_body),
+                response_archive_dir=archive,
+            )
+            with self.assertRaisesRegex(
+                    ark_vision_qc.ArkVisionError, "contained a request credential",
+            ):
+                client.complete_json(
+                    system_prompt="system", user_prompt="user", images=(image,),
+                )
+            self.assertFalse(archive.exists())
+
+    def test_network_client_requires_a_response_archive(self) -> None:
+        with self.assertRaisesRegex(ValueError, "response archive"):
+            ark_vision_qc.ArkVisionClient(environ={
+                "ARK_API_KEY": "key", "ARK_VISION_MODEL": "model",
+            })
+
+    def test_http_error_does_not_hide_response_archive_failure(self) -> None:
+        body = b'{"error":"invalid model"}'
+
+        def opener(request: Any, *, timeout: float) -> FakeResponse:
+            raise urllib.error.HTTPError(
+                request.full_url, 400, "Bad Request", Message(), io.BytesIO(body),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blocked_archive = root / "ark-responses"
+            blocked_archive.write_text("not a directory", encoding="utf-8")
+            image = root / "candidate.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+                opener=opener,
+                response_archive_dir=blocked_archive,
+            )
+
+            with self.assertRaisesRegex(
+                    ark_vision_qc.ArkVisionError, "archive is unavailable",
+            ):
+                client.complete_json(
+                    system_prompt="system", user_prompt="user", images=(image,),
+                )
+
+    def test_sidecar_failure_removes_committed_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            archive_dir = Path(directory) / "ark-responses"
+            archive = ark_vision_qc.ArkResponseArchive(archive_dir)
+            original = archive._atomic_write
+            calls = 0
+
+            def fail_second(path: Path, data: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise ark_vision_qc.ArkVisionError(
+                        "Ark response archive is unavailable",
+                    )
+                original(path, data)
+
+            archive._atomic_write = fail_second
+            with self.assertRaises(ark_vision_qc.ArkVisionError):
+                archive.record(
+                    b"raw response", http_status=200, response_headers={},
+                )
+            self.assertEqual(list(archive_dir.glob("*.body")), [])
+
+    def test_directory_swap_cannot_redirect_archive_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_dir = root / "ark-responses"
+            displaced = root / "original-archive"
+            escape = root / "escape"
+            escape.mkdir()
+            archive = ark_vision_qc.ArkResponseArchive(archive_dir)
+            original = archive._prepare_directory
+
+            def swap_after_validation() -> object:
+                result = original()
+                archive_dir.rename(displaced)
+                archive_dir.symlink_to(escape, target_is_directory=True)
+                return result
+
+            archive._prepare_directory = swap_after_validation
+            archive.record(
+                b"raw response", http_status=200, response_headers={},
+            )
+
+            self.assertEqual(list(escape.iterdir()), [])
+            self.assertEqual(len(list(displaced.glob("*.body"))), 1)
+            self.assertEqual(len(list(displaced.glob("*.json"))), 1)
+
+    def test_parent_directory_swap_cannot_redirect_archive_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            run = root / "run"
+            archive_dir = run / "ark-responses"
+            displaced = root / "original-run"
+            escape = root / "escape"
+            run.mkdir()
+            escape.mkdir()
+            archive = ark_vision_qc.ArkResponseArchive(archive_dir)
+            original_open = os.open
+            swapped = False
+
+            def racing_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal swapped
+                if not swapped and Path(path).name == "ark-responses":
+                    swapped = True
+                    run.rename(displaced)
+                    run.symlink_to(escape, target_is_directory=True)
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(ark_vision_qc.os, "open", side_effect=racing_open):
+                archive.record(
+                    b"raw response", http_status=200, response_headers={},
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual(list(escape.iterdir()), [])
+            self.assertEqual(len(list((displaced / "ark-responses").glob("*.body"))), 1)
+            self.assertEqual(len(list((displaced / "ark-responses").glob("*.json"))), 1)
+
+    def test_concurrent_responses_use_distinct_archive_files(self) -> None:
+        body = response_body("{\"result\":\"ok\"}")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "ark-responses"
+            image = root / "candidate.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+                opener=RecordingOpener(body),
+                response_archive_dir=archive,
+            )
+            threads = [threading.Thread(target=lambda: client.complete_json(
+                system_prompt="system", user_prompt="user", images=(image,),
+            )) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(len(list(archive.glob("*.body"))), 8)
+            self.assertEqual(len(list(archive.glob("*.json"))), 8)
+            self.assertEqual(
+                {path.name for path in archive.glob("*.body")},
+                {f"{index:06d}.body" for index in range(1, 9)},
+            )
+
     def test_posts_exact_multimodal_request_with_env_model_and_credentials(self) -> None:
         opener = RecordingOpener(response_body("{\"result\":\"ok\"}"))
         with tempfile.TemporaryDirectory() as directory:
@@ -205,26 +473,74 @@ class ArkVisionClientTest(_SanitizedErrorAssertions, unittest.TestCase):
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], "ep-vision")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertIn("thinking", payload)
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
         self.assertIs(payload["stream"], False)
-        self.assertEqual(payload["messages"][0], {
-            "role": "system", "content": "Return strict JSON.",
-        })
-        user_content = payload["messages"][1]["content"]
+        self.assertEqual(len(payload["messages"]), 1)
+        self.assertEqual(payload["messages"][0]["role"], "user")
+        user_content = payload["messages"][0]["content"]
         self.assertEqual(user_content[0], {
-            "type": "text", "text": "Review this candidate.",
-        })
-        self.assertEqual(user_content[1], {
             "type": "image_url",
             "image_url": {
                 "url": "data:image/png;base64," + base64.b64encode(b"png-bytes").decode("ascii"),
             },
         })
-        self.assertEqual(user_content[2], {
+        self.assertEqual(user_content[1], {
             "type": "image_url",
             "image_url": {
                 "url": "data:image/jpeg;base64," + base64.b64encode(b"jpeg-bytes").decode("ascii"),
             },
         })
+        self.assertEqual(user_content[2], {
+            "type": "text",
+            "text": (
+                "Instructions:\nReturn strict JSON.\n\n"
+                "Task:\nReview this candidate."
+            ),
+        })
+
+    def test_timeout_defaults_to_120_seconds(self) -> None:
+        opener = RecordingOpener(response_body("{\"result\":\"ok\"}"))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "target.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={"ARK_API_KEY": "key", "ARK_VISION_MODEL": "model"},
+                opener=opener,
+            )
+            client.complete_json(
+                system_prompt="system", user_prompt="user", images=(image,),
+            )
+
+        self.assertEqual(opener.calls[0][1], 120.0)
+
+    def test_timeout_accepts_positive_environment_override(self) -> None:
+        opener = RecordingOpener(response_body("{\"result\":\"ok\"}"))
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "target.png"
+            image.write_bytes(b"image")
+            client = ark_vision_qc.ArkVisionClient(
+                environ={
+                    "ARK_API_KEY": "key", "ARK_VISION_MODEL": "model",
+                    "OUTFIT_SWAP_ARK_TIMEOUT_SECONDS": "75.5",
+                },
+                opener=opener,
+            )
+            client.complete_json(
+                system_prompt="system", user_prompt="user", images=(image,),
+            )
+
+        self.assertEqual(opener.calls[0][1], 75.5)
+
+    def test_timeout_rejects_invalid_environment_values(self) -> None:
+        for value in ("", "0", "-1", "nan", "inf", "not-a-number"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "Ark timeout",
+            ):
+                ark_vision_qc.ArkVisionClient(environ={
+                    "ARK_API_KEY": "key", "ARK_VISION_MODEL": "model",
+                    "OUTFIT_SWAP_ARK_TIMEOUT_SECONDS": value,
+                })
 
     def test_missing_or_blank_environment_fails_before_file_or_network_io(self) -> None:
         for environ in (
@@ -655,6 +971,84 @@ class ReviewCandidateTest(unittest.TestCase):
         self.assertEqual(result.report.candidate, "candidate.png")
         self.assertFalse(result.adjudicated)
         self.assertEqual(result.request_count, 2)
+
+    def test_persistent_wrong_candidate_reports_bounded_diagnostic_code(self) -> None:
+        client = FakeVisionClient([
+            report_json(candidate="other-a.png"),
+            report_json(candidate="other-b.png"),
+        ])
+
+        with self.assertRaisesRegex(
+                ark_vision_qc.ArkVisionError, "diagnostic=candidate_mismatch",
+        ):
+            self.review(client)
+
+    def test_live_percent_confidence_and_string_evidence_are_normalized_once(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "ark-qc-live-second.json"
+        client = FakeVisionClient([fixture.read_text(encoding="utf-8")])
+
+        result = ark_vision_qc.review_candidate(
+            client,
+            system_prompt="strict QC system prompt",
+            user_prompt="review candidate against reference",
+            images=self.images,
+            candidate="attempt-01-31421aa326f5-01.png",
+            infographic=False,
+        )
+
+        self.assertEqual(
+            result.report.candidate, "attempt-01-31421aa326f5-01.png",
+        )
+        self.assertEqual(result.report.confidence, 0.92)
+        self.assertEqual(result.report.decision, "reject")
+        self.assertEqual(result.request_count, 1)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_live_first_response_normalizes_structure_but_not_candidate(self) -> None:
+        first = json.loads((
+            Path(__file__).parent / "fixtures" / "ark-qc-live-first.json"
+        ).read_text(encoding="utf-8"))
+        second = json.loads(report_json())
+        first["candidate"] = "attempt-01-3141aa326f5-01.png"
+        second["candidate"] = "candidate.png"
+        client = FakeVisionClient([
+            json.dumps(first), json.dumps(second),
+        ])
+
+        result = self.review(client)
+
+        self.assertEqual(result.report.candidate, "candidate.png")
+        self.assertEqual(result.request_count, 2)
+
+    def test_compatibility_layer_does_not_accept_arbitrary_values(self) -> None:
+        invalid = json.loads(report_json())
+        invalid["evidence"] = {"summary": "visible"}
+        invalid["confidence"] = 101
+        client = FakeVisionClient([json.dumps(invalid), report_json()])
+
+        result = self.review(client)
+
+        self.assertEqual(result.request_count, 2)
+        self.assertEqual(result.report.confidence, 0.94)
+
+    def test_comparative_candidates_use_the_same_bounded_normalization(self) -> None:
+        candidate = json.loads(report_json(candidate="candidate_1"))
+        candidate["evidence"] = "Visible garment construction."
+        candidate["confidence"] = 93
+        raw = json.dumps({
+            "schema_version": 1,
+            "candidates": [candidate],
+            "ranking": ["candidate_1"],
+            "selected_alias": "candidate_1",
+        })
+
+        normalized = json.loads(ark_vision_qc.normalize_comparative_report(raw))
+
+        self.assertEqual(
+            normalized["candidates"][0]["evidence"],
+            ["Visible garment construction."],
+        )
+        self.assertEqual(normalized["candidates"][0]["confidence"], 0.93)
 
 
 class ReviewCandidateTracebackTest(_SanitizedErrorAssertions, unittest.TestCase):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -592,6 +593,39 @@ class OfflineReplayTest(unittest.TestCase):
         )
         self.assertNotIn("images", stdout.getvalue())
         self.assertNotIn("prompt", stdout.getvalue())
+
+    def test_live_cli_wires_a_private_retained_response_archive(self) -> None:
+        fixture = (
+            Path(__file__).parents[1]
+            / "tests" / "fixtures" / "qc-replay" / "manifest.example.json"
+        )
+
+        class Result:
+            class Gates:
+                passed = True
+
+            gates = Gates()
+
+            @staticmethod
+            def to_dict() -> dict[str, object]:
+                return {"mode": "live-ark"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            runs_root = Path(directory) / "runs"
+            with patch.dict(os.environ, {
+                "OUTFIT_SWAP_RUNS_ROOT": str(runs_root),
+            }, clear=False), patch(
+                "scripts.qc_replay.ark_vision_qc.ArkVisionClient",
+            ) as client_type, patch(
+                "scripts.qc_replay.replay_manifest", return_value=Result(),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                exit_code = qc_replay.main([str(fixture), "--live-ark"])
+
+            self.assertEqual(exit_code, 0)
+            archive = client_type.call_args.kwargs["response_archive_dir"]
+            self.assertEqual(archive.name, "ark-responses")
+            archive.relative_to((runs_root / "qc-replay").resolve())
+            self.assertFalse(archive.exists())
 
     def test_live_ark_requires_the_explicit_flag_and_can_use_an_injected_client(self) -> None:
         payload = manifest(target(

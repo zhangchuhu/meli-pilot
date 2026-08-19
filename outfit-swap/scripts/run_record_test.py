@@ -838,6 +838,26 @@ class RunRecordTest(unittest.TestCase):
         self.assertEqual(target["status"], "pending")
         self.assertEqual(target["attempts"], 0)
         self.assertEqual(len(self.generator.calls), 0)
+
+    def test_planning_transport_stop_preserves_recoverable_pending_state(self) -> None:
+        from scripts import run_record as run_record_module
+
+        self.assertTrue(hasattr(run_record_module, "PlanningStopped"))
+        context = self.initialize()
+        self.generator.plan_errors[0] = run_record_module.PlanningStopped(
+            "Ark planning transport stopped",
+        )
+
+        result = run_record(context, self.services())
+
+        state = task_state.load_state(self.state_file)
+        target = state["targets"]["box_target_1"]
+        self.assertEqual(result.status, "stopped")
+        self.assertTrue(self.stop.stopped)
+        self.assertIsNone(state["record_error"])
+        self.assertEqual(target["status"], "pending")
+        self.assertEqual(target["attempts"], 0)
+        self.assertEqual(self.generator.calls, [])
         self.assertTrue(any(item["event"] == "stop_observed" for item in self.events.items))
 
     def test_persistent_qc_failure_preserves_candidate_and_starts_no_generation(self) -> None:

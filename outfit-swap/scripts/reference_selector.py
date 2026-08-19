@@ -1,7 +1,8 @@
-"""Deterministic, evidence-based garment reference selection."""
+"""Deterministic closest-angle ordering and all-qualified reference filtering."""
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -38,18 +39,6 @@ class SourceEvidence:
 
 
 @dataclass(frozen=True)
-class UniqueEvidenceRequirement:
-    role: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.role, str) or not self.role:
-            raise ReferenceSelectionError("unique evidence role must not be empty")
-        if not isinstance(self.reason, str) or not self.reason.strip():
-            raise ReferenceSelectionError("unique evidence requires a recorded reason")
-
-
-@dataclass(frozen=True)
 class ReferenceSelection:
     selected: tuple[SourceEvidence, ...]
     roles: tuple[str, ...]
@@ -67,9 +56,7 @@ _ORDINARY_CLASSIFICATIONS = frozenset({
 _ANGLE_ORDER = (
     "front", "front three-quarter", "side", "back three-quarter", "back",
 )
-_COMPLEMENTARY_ROLES = (
-    "upper_construction", "full_outfit_flat_lay", "skirt_hem",
-)
+_MAX_REFERENCES = 9
 
 
 def _source_key(source: SourceEvidence) -> tuple[int, str, str]:
@@ -116,45 +103,23 @@ def _best_for_role(
     )
 
 
-def _select_ordinary(
+def _primary_ordinary(
         sources: tuple[SourceEvidence, ...], classification: str,
-) -> tuple[list[SourceEvidence], list[str], list[str]]:
+) -> SourceEvidence:
     models = [source for source in sources if "model" in source.roles]
     if not models:
         raise ReferenceSelectionError("ordinary targets require model evidence")
-    primary = min(
+    return min(
         models,
         key=lambda source: (
             _angle_distance(classification, source.angle), *_source_key(source),
         ),
     )
-    selected = [primary]
-    selected_roles = ["model"]
-    covered = ["model"]
-    roles_present = set(primary.roles)
-    for role in _COMPLEMENTARY_ROLES:
-        if role in roles_present:
-            covered.append(role)
-            continue
-        candidate = _best_for_role(
-            sources, role, selected, target_angle=classification,
-        )
-        if candidate is None:
-            if role == "skirt_hem":
-                continue
-            raise ReferenceSelectionError(
-                f"ordinary targets require evidence for role: {role}",
-            )
-        selected.append(candidate)
-        selected_roles.append(role)
-        covered.append(role)
-        roles_present.update(candidate.roles)
-    return selected, selected_roles, covered
 
 
-def _select_infographic(
+def _required_infographic(
         sources: tuple[SourceEvidence, ...], garment_instances: Sequence[str],
-) -> tuple[list[SourceEvidence], list[str], list[str]]:
+) -> tuple[list[SourceEvidence], list[str]]:
     if (not garment_instances
             or not all(isinstance(instance, str) and instance for instance in garment_instances)
             or len(set(garment_instances)) != len(garment_instances)):
@@ -163,12 +128,10 @@ def _select_infographic(
         )
     selected: list[SourceEvidence] = []
     selected_roles: list[str] = []
-    covered: list[str] = []
     roles_present: set[str] = set()
     for instance in garment_instances:
         role = f"instance:{instance}"
         if role in roles_present:
-            covered.append(role)
             continue
         candidate = _best_for_role(sources, role, selected)
         if candidate is None:
@@ -177,19 +140,93 @@ def _select_infographic(
             )
         selected.append(candidate)
         selected_roles.append(role)
-        covered.append(role)
         roles_present.update(candidate.roles)
-        if len(selected) > 4:
-            raise ReferenceSelectionError(
-                "infographic evidence exceeds the normal four-reference budget",
-            )
-    return selected, selected_roles, covered
+    return selected, selected_roles
+
+
+def _content_digest(source: SourceEvidence) -> str | None:
+    if not source.path.is_file():
+        return None
+    digest = hashlib.sha256()
+    try:
+        with source.path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise ReferenceSelectionError("source evidence could not be read") from error
+    return digest.hexdigest()
+
+
+def _features(source: SourceEvidence) -> set[str]:
+    features = {f"role:{role}" for role in source.roles if role != "size_chart"}
+    if source.angle in _ANGLE_ORDER:
+        features.add(f"angle:{source.angle}")
+    return features
+
+
+def _selection_role(source: SourceEvidence, new_features: set[str]) -> str:
+    roles = sorted(feature.removeprefix("role:") for feature in new_features
+                   if feature.startswith("role:") and feature != "role:model")
+    if roles:
+        return roles[0]
+    angles = sorted(feature.removeprefix("angle:") for feature in new_features
+                    if feature.startswith("angle:"))
+    return f"angle:{angles[0]}" if angles else "garment_evidence"
+
+
+def _role_priority(source: SourceEvidence) -> int:
+    for index, role in enumerate((
+            "model", "upper_construction", "full_outfit_flat_lay", "skirt_hem",
+    )):
+        if role in source.roles:
+            return index
+    return 4
+
+
+def _all_qualified(
+        sources: tuple[SourceEvidence, ...], selected: list[SourceEvidence],
+        selected_roles: list[str], classification: str,
+) -> tuple[list[SourceEvidence], list[str], list[str]]:
+    covered_features = {
+        feature for source in selected for feature in _features(source)
+    }
+    covered_roles = {
+        role for source in selected for role in source.roles if role != "size_chart"
+    }
+    selected_tokens = {source.token for source in selected}
+    digests = {
+        digest for source in selected if (digest := _content_digest(source)) is not None
+    }
+    for source in sorted(
+            sources,
+            key=lambda item: (
+                _angle_distance(classification, item.angle),
+                -item.information_score,
+                _role_priority(item),
+                item.token,
+            ),
+    ):
+        if source.token in selected_tokens or len(selected) >= _MAX_REFERENCES:
+            continue
+        digest = _content_digest(source)
+        if digest is not None and digest in digests:
+            continue
+        new_features = _features(source) - covered_features
+        if not new_features:
+            continue
+        selected.append(source)
+        selected_tokens.add(source.token)
+        selected_roles.append(_selection_role(source, new_features))
+        covered_features.update(new_features)
+        covered_roles.update(source.roles - {"size_chart"})
+        if digest is not None:
+            digests.add(digest)
+    return selected, selected_roles, sorted(covered_roles)
 
 
 def select_references(
         sources: Sequence[SourceEvidence], *, classification: str,
         garment_instances: Sequence[str] = (),
-        unique_requirement: UniqueEvidenceRequirement | None = None,
 ) -> ReferenceSelection:
     """Select stable complementary evidence without consulting filenames."""
     if isinstance(sources, (str, bytes)) or not isinstance(classification, str):
@@ -207,44 +244,42 @@ def select_references(
             raise ReferenceSelectionError(
                 "garment instances apply only to infographic targets",
             )
-        selected, selected_roles, covered = _select_ordinary(
-            eligible, classification,
-        )
+        primary = _primary_ordinary(eligible, classification)
+        selected = [primary]
+        selected_roles = ["model"]
     elif classification == "infographic":
-        selected, selected_roles, covered = _select_infographic(
+        selected, selected_roles = _required_infographic(
             eligible, garment_instances,
         )
+    elif classification == "detail or flat lay":
+        if garment_instances:
+            raise ReferenceSelectionError(
+                "garment instances apply only to infographic targets",
+            )
+        if not eligible:
+            raise ReferenceSelectionError("detail targets require garment evidence")
+        primary = min(eligible, key=_source_key)
+        selected = [primary]
+        selected_roles = ["garment_evidence"]
     else:
         raise ReferenceSelectionError(f"unsupported target classification: {classification}")
-
-    fifth_reason = None
-    if unique_requirement is not None:
-        if not isinstance(unique_requirement, UniqueEvidenceRequirement):
-            raise ReferenceSelectionError("unique requirement is invalid")
-        roles_present = {role for source in selected for role in source.roles}
-        if unique_requirement.role not in roles_present:
-            unique_source = _best_for_role(
-                eligible, unique_requirement.role, selected,
+    if len(selected) > _MAX_REFERENCES:
+        raise ReferenceSelectionError("required evidence exceeds the nine-reference cap")
+    selected, selected_roles, covered = _all_qualified(
+        eligible, selected, selected_roles, classification,
+    )
+    if classification == "infographic":
+        missing = [
+            instance for instance in garment_instances
+            if f"instance:{instance}" not in covered
+        ]
+        if missing:
+            raise ReferenceSelectionError(
+                f"infographic instance has no reference evidence: {missing[0]}",
             )
-            if unique_source is None:
-                raise ReferenceSelectionError(
-                    "the recorded unique evidence role has no supporting source",
-                )
-            if len(selected) >= 5:
-                raise ReferenceSelectionError("reference selection cannot exceed five")
-            selected.append(unique_source)
-            selected_roles.append(unique_requirement.role)
-            covered.append(unique_requirement.role)
-            if len(selected) == 5:
-                fifth_reason = unique_requirement.reason
-
-    if len(selected) > 4 and fifth_reason is None:
-        raise ReferenceSelectionError(
-            "a fifth reference requires a recorded unique-evidence reason",
-        )
     return ReferenceSelection(
         selected=tuple(selected),
         roles=tuple(selected_roles),
         covered_roles=tuple(covered),
-        fifth_reference_reason=fifth_reason,
+        fifth_reference_reason=None,
     )

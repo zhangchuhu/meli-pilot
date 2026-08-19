@@ -30,6 +30,7 @@ RUNTIME_SCRIPTS = (
     "scripts/infographic_text.py",
     "scripts/lark_runner.py",
     "scripts/prompt_builder.py",
+    "scripts/payload_security.py",
     "scripts/production_runtime.py",
     "scripts/qc_replay.py",
     "scripts/reference_selector.py",
@@ -551,9 +552,10 @@ class SkillContractTest(unittest.TestCase):
 
     def test_reference_and_infographic_planning_contract_precedes_generation(self) -> None:
         state = self.references["task-state.md"]
-        self.assertIn("normally use three or four garment references", state)
-        self.assertIn("fifth reference", state)
-        self.assertIn("recorded unique-evidence reason", state)
+        self.assertIn("send every other qualified source", state)
+        self.assertIn("Do not impose a three/four-reference quota", state)
+        self.assertIn("at most nine references", state)
+        self.assertIn("exact byte duplicates", state)
         self.assertIn("literal visible-text inventory", state)
         self.assertIn("before any paid generation", state.lower())
 
@@ -593,15 +595,20 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("does not let that observation reject or retry", qc)
         self.assertNotIn("direct inspection by the operating agent", qc)
 
-    def test_events_and_errors_exclude_sensitive_payloads(self) -> None:
+    def test_runtime_output_allows_payloads_but_never_credentials(self) -> None:
         state = self.references["task-state.md"]
-        for forbidden_payload in (
-            "credentials", "authorization headers", "raw Base64",
-            "raw data URLs", "prompts", "unsanitized external diagnostics",
+        for allowed_payload in (
+            "raw Base64", "raw data URLs", "complete prompts", "request bodies",
         ):
-            self.assertIn(forbidden_payload, state)
+            self.assertIn(allowed_payload, state)
+        self.assertIn("ordinary runs", state.lower())
+        self.assertIn("payload_security.py", state)
+        self.assertIn("credentials", state)
+        self.assertIn("authorization headers", state)
         with tempfile.TemporaryDirectory() as directory:
             log = event_log.EventLog(Path(directory) / "events.ndjson", clock_ms=lambda: 1)
+            # Metrics events remain a closed schema; full payloads use an ordinary
+            # diagnostic log, error report, or terminal after credential redaction.
             for field in ("secret", "api_key", "base64", "error", "prompt"):
                 with self.subTest(field=field), self.assertRaises(event_log.EventLogError):
                     log.append("record_started", record_id="record-1", **{field: "value"})
@@ -647,7 +654,7 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("retry the same target", qc)
         self.assertIn("no visual prompt correction", qc)
         self.assertIn("upload and critical base-write/readback failures", qc.lower())
-        self.assertIn("stop immediately", base)
+        self.assertIn("stops immediately", base)
 
     def test_restarted_exhausted_attempt_selects_or_records_terminal_external_call(self) -> None:
         qc = self.references["qc-and-failures.md"]
@@ -704,9 +711,9 @@ class SkillContractTest(unittest.TestCase):
         self.assertIn("scripts/task_state.py accept-local", combined)
         self.assertIn("before any new edit", combined)
         self.assertIn("owning `run_id`", combined)
-        self.assertIn("An upload failure resumes", combined)
+        self.assertIn("upload command failure resumes", combined)
         self.assertIn(
-            "A later Base detail-write failure resumes through output reconciliation",
+            "A later Base detail-write failure resumes from that success checkpoint",
             self.skill,
         )
 
@@ -790,7 +797,8 @@ class SkillContractTest(unittest.TestCase):
             base,
         )
         self.assertIn("one idempotent finalization transaction", base)
-        self.assertIn("exact Base readback", base)
+        self.assertIn("without an immediate readback", base)
+        self.assertIn("record-level terminal", base)
         self.assertNotIn("After visual acceptance, upload exactly one", base)
 
     def test_early_record_stops_always_persist_terminal_failure(self) -> None:
@@ -841,6 +849,22 @@ class SkillContractTest(unittest.TestCase):
             "External call failure",
         ):
             self.assertIn(failure_class, qc)
+
+    def test_ark_multimodal_contract_pins_api_order_and_numeric_version(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        self.assertIn("one `user` multimodal message", qc)
+        self.assertIn("image items before the final text item", qc)
+        self.assertIn("unquoted JSON integer `1`", qc)
+
+    def test_source_evidence_uses_only_finite_alias_normalization(self) -> None:
+        qc = self.references["qc-and-failures.md"]
+        for phrase in (
+            "front-close", "detail or flat lay", "category:value",
+            "finite alias", "No second Ark repair request",
+        ):
+            self.assertIn(phrase, qc)
+        self.assertIn("unknown angle", qc)
+        self.assertIn("not use a garment-fact enumeration whitelist", qc)
 
     def test_forbidden_implementations_and_placeholders_are_absent(self) -> None:
         self.assertEqual(forbidden_source_findings(self.documents), [])
